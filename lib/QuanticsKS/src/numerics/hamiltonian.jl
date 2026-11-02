@@ -58,10 +58,10 @@ function h_residual(H, x, energy, cfg, rec;
           initial_zero_fallback = () -> h_core_fallback(H, x, energy; tol, cap))
 end
 
-function h_action(H, x, cfg, rec; label = "", work_tol = 0.0)
+function h_action(H, x, cfg, rec; label = "", work_tol = 0.0, potential = nothing)
     isfinite(work_tol) && work_tol >= 0 || throw(ArgumentError("Invalid H-action tolerance"))
     tol = work_tol > 0 ? work_tol : cfg.round_tol
-    h_residual(H, x, 0.0, cfg, rec; tol,
+    h_residual(H, x, 0.0, cfg, rec; tol, potential,
                label = (work_tol > 0 ? "Hpsi_native_" : "Hpsi_") * label)
 end
 function h_project(f, x, H)

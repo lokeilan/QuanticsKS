@@ -1,7 +1,10 @@
-# Keep the endpoint scalar fast path; use the library's matrix contractions for slices.
+# Use endpoint dot products when both ends cover the grid; contract larger-grid slices.
 abstract type SampledFunction <: TCI.BatchEvaluator{ComplexF64} end
 (f::SampledFunction)(q::AbstractVector{Int}) = f(indexof(q))
 native_batch(::SampledFunction) = false
+scalar_fastpath(::SampledFunction) = false
+sampling_method(f::SampledFunction) = scalar_fastpath(f) ? "cached_scalar" :
+    native_batch(f) ? "tt_slices" : "coordinate"
 
 struct CoordinateSamples{F} <: SampledFunction
     f::F
@@ -12,6 +15,7 @@ sampled(f, R::Int) = CoordinateSamples(f, R)
 sampled(f::SampledFunction, R::Int) =
     sample_length(f) == R ? f : throw(DimensionMismatch("Sample grid"))
 sample_length(f::CoordinateSamples) = f.R
+scalar_fastpath(::CoordinateSamples) = true
 function (f::CoordinateSamples)(left, right, middle::Val)
     map(f, slice_indices(f.R, left, right, middle))
 end
@@ -27,6 +31,8 @@ sampled(x::QTT, rec) = TensorSamples(evaluate(x, rec);
     frame_capacity = get(rec.options, :slice_cache_capacity, 2048))
 sample_length(f::TensorSamples) = length(f.evaluator.x)
 native_batch(::TensorSamples) = true
+scalar_fastpath(f::TensorSamples) =
+    f.evaluator.prefix + f.evaluator.suffix == sample_length(f)
 (f::TensorSamples)(j::Int) = f.evaluator(j)
 
 function trim_frames!(frames, capacity)
@@ -43,6 +49,7 @@ function trim_frames!(frames, capacity)
     end
 end
 function (f::TensorSamples)(left, right, middle::Val)
+    scalar_fastpath(f) && return map(f.evaluator, slice_indices(sample_length(f), left, right, middle))
     result = TCI.batchevaluate(f.frames, left, right, middle)
     trim_frames!(f.frames, f.frame_capacity)
     result
@@ -60,6 +67,7 @@ function pointwise(f, args::SampledFunction...)
 end
 sample_length(f::PointwiseSamples) = sample_length(first(f.arguments))
 native_batch(f::PointwiseSamples) = any(native_batch, f.arguments)
+scalar_fastpath(f::PointwiseSamples) = all(scalar_fastpath, f.arguments)
 (f::PointwiseSamples)(j::Int) = ComplexF64(f.f(map(a -> a(j), f.arguments)...))
 function (f::PointwiseSamples)(left, right, middle::Val)
     values = map(a -> a(left, right, middle), f.arguments)
@@ -73,6 +81,7 @@ end
 shifted(f::SampledFunction, offset::Int) = ShiftedSamples(f, offset)
 sample_length(f::ShiftedSamples) = sample_length(f.input)
 native_batch(f::ShiftedSamples) = native_batch(f.input)
+scalar_fastpath(f::ShiftedSamples) = scalar_fastpath(f.input)
 (f::ShiftedSamples)(j::Int) = f.input(mod(j + f.offset, 1 << sample_length(f)))
 function (f::ShiftedSamples)(left, right, ::Val{M}) where M
     if isempty(left) || isempty(right)
@@ -117,6 +126,7 @@ function RecordedSamples(f::SampledFunction, options)
 end
 sample_length(f::RecordedSamples) = f.R
 native_batch(f::RecordedSamples) = native_batch(f.input)
+scalar_fastpath(f::RecordedSamples) = scalar_fastpath(f.input)
 function (f::RecordedSamples)(j::Int)
     0 <= j < (1 << f.R) || throw(BoundsError(f, j))
     f.requests += 1
@@ -131,6 +141,16 @@ function (f::RecordedSamples)(j::Int)
 end
 function (f::RecordedSamples)(left, right, middle::Val{M}) where M
     f.batches += 1
+    if scalar_fastpath(f)
+        # Endpoint dot products are cheaper than grouping sparse misses and
+        # building TTCache environments for every cross cut on small grids.
+        before = f.evaluations
+        result = map(f, slice_indices(f.R, left, right, middle))
+        evaluated = f.evaluations - before
+        f.batch_evaluations += evaluated
+        f.computed_batches += Int(evaluated > 0)
+        return result
+    end
     f.requests += length(left) * (1 << M) * length(right)
     result, evaluations, batches = cached_slice!(f.cache, f.R, left, right, middle) do l, r, m
         values = f.input(l, r, m)
@@ -144,23 +164,40 @@ function (f::RecordedSamples)(left, right, middle::Val{M}) where M
 end
 memoized_sample(x::QTT, rec) = RecordedSamples(sampled(x, rec), rec.options)
 
-struct BlockOracle
+mutable struct BlockOracle
     evals::Vector{Evaluator}
     samples::Vector{TensorSamples}
     cache::SampleCache{Vector{ComplexF64}}
     cap::Int
+    requests::Int
+    evaluations::Int
 end
-function BlockOracle(xs; cap = 8192, cachebits = 10, frame_capacity = 2048)
+function BlockOracle(xs; cap = 8192, cachebits = 10, frame_capacity = 2048,
+                     dense_limit = 0, max_bytes = 64 * 1024^2)
     evals = [Evaluator(x; cachebits) for x in xs]
     samples = [TensorSamples(e; frame_capacity) for e in evals]
-    BlockOracle(evals, samples, SampleCache{Vector{ComplexF64}}(length(first(xs)); capacity = cap), cap)
+    R = length(first(xs))
+    # Include vector headers and references; values are populated only on demand.
+    bytes_per_point = sizeof(ComplexF64) * length(evals) + 64
+    limit = min(dense_limit, max_bytes ÷ bytes_per_point)
+    cache = SampleCache{Vector{ComplexF64}}(R; capacity = cap, dense_limit = limit)
+    BlockOracle(evals, samples, cache, isempty(cache.values) ? cap : length(cache.values), 0, 0)
 end
+scalar_fastpath(o::BlockOracle) = all(scalar_fastpath, o.samples)
 function (o::BlockOracle)(j::Int)
+    o.requests += 1
     value = cache_get(o.cache, j)
-    value === nothing ? cache_put!(o.cache, j, [e(j) for e in o.evals]) : value
+    if value === nothing
+        value = cache_put!(o.cache, j, [e(j) for e in o.evals])
+        o.evaluations += 1
+    end
+    value
 end
-function (o::BlockOracle)(left, right, middle::Val)
-    result, _, _ = cached_slice!(o.cache, sample_length(first(o.samples)), left, right, middle) do l, r, m
+function (o::BlockOracle)(left, right, middle::Val{M}) where M
+    R = sample_length(first(o.samples))
+    scalar_fastpath(o) && return map(o, slice_indices(R, left, right, middle))
+    o.requests += length(left) * (1 << M) * length(right)
+    result, evaluations, _ = cached_slice!(o.cache, R, left, right, middle) do l, r, m
         columns = [s(l, r, m) for s in o.samples]
         out = Array{Vector{ComplexF64}}(undef, size(first(columns)))
         for i in eachindex(out)
@@ -168,8 +205,13 @@ function (o::BlockOracle)(left, right, middle::Val)
         end
         out
     end
+    o.evaluations += evaluations
     result
 end
+block_cache_stats(o::BlockOracle) = (;
+    block_cache_mode = isempty(o.cache.values) ? "bounded_clock" : "dense_addressed",
+    block_cache_capacity = o.cap, block_cache_evictions = o.cache.evictions,
+    block_sample_requests = o.requests, block_sample_evaluations = o.evaluations)
 
 struct LinearSamples <: SampledFunction
     oracle::BlockOracle
@@ -177,13 +219,19 @@ struct LinearSamples <: SampledFunction
 end
 sample_length(f::LinearSamples) = sample_length(first(f.oracle.samples))
 native_batch(::LinearSamples) = true
-(f::LinearSamples)(j::Int) = sum(f.weights .* f.oracle(j))
+scalar_fastpath(f::LinearSamples) = scalar_fastpath(f.oracle)
+function weighted_value(weights, values)
+    z = zero(ComplexF64)
+    @inbounds @simd for i in eachindex(weights, values)
+        z += weights[i] * values[i]
+    end
+    z
+end
+(f::LinearSamples)(j::Int) = weighted_value(f.weights, f.oracle(j))
 function (f::LinearSamples)(left, right, middle::Val)
     values = f.oracle(left, right, middle)
     isempty(values) && return zeros(ComplexF64, size(values))
-    # Columns of A are the input orbitals; ordinary transpose preserves complex amplitudes.
-    A = permutedims(reduce(hcat, vec(values)))
-    reshape(A * f.weights, size(values))
+    map(v -> weighted_value(f.weights, v), values)
 end
 
 struct DensitySamples <: SampledFunction
@@ -192,7 +240,9 @@ struct DensitySamples <: SampledFunction
 end
 sample_length(f::DensitySamples) = sample_length(first(f.oracle.samples))
 native_batch(::DensitySamples) = true
-(f::DensitySamples)(j::Int) = ComplexF64(sum(f.weights .* abs2.(f.oracle(j))))
+scalar_fastpath(f::DensitySamples) = scalar_fastpath(f.oracle)
+weighted_density(weights, values) = ComplexF64(sum(weights[i] * abs2(values[i]) for i in eachindex(weights, values)))
+(f::DensitySamples)(j::Int) = weighted_density(f.weights, f.oracle(j))
 function (f::DensitySamples)(left, right, middle::Val)
-    map(v -> ComplexF64(sum(f.weights .* abs2.(v))), f.oracle(left, right, middle))
+    map(v -> weighted_density(f.weights, v), f.oracle(left, right, middle))
 end

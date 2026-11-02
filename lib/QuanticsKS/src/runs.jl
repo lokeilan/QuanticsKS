@@ -14,6 +14,7 @@ function validate(t::TCIOptions)
         t.zero_check_limit,
     ) > 0 || throw(ArgumentError("Invalid TCI counts"))
     t.dense_cache_max_points >= 0 || throw(ArgumentError("Negative dense cache limit"))
+    t.orbital_cache_max_bytes >= 0 || throw(ArgumentError("Negative orbital cache budget"))
     min(t.global_pivot_search, t.max_global_pivots, t.initial_random_pivots) >= 0 ||
         throw(ArgumentError("Negative pivot count"))
     0 <= t.environment_cache_bits <= 16 ||

@@ -146,6 +146,7 @@ function cross(
             computed_batches = oracle.computed_batches,
             batch_evaluations = oracle.batch_evaluations,
             native_batch = native_batch(oracle),
+            sampling_method = sampling_method(oracle),
             pivot_reused = reused,
             pivot_source = reused ? reuse_source : "cold",
             search_ranks = rs,

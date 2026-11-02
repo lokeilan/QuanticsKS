@@ -115,6 +115,8 @@ block_oracle(xs, r::Recorder) = BlockOracle(
     cap = r.options.orbital_cache_capacity,
     cachebits = r.options.environment_cache_bits,
     frame_capacity = get(r.options, :slice_cache_capacity, 2048),
+    dense_limit = get(r.options, :dense_cache_max_points, 262144),
+    max_bytes = get(r.options, :orbital_cache_max_bytes, 64 * 1024^2),
 )
 
 include("cross.jl")

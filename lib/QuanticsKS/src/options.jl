@@ -33,6 +33,7 @@ Base.@kwdef struct TCIOptions
     scalar_cache_capacity::Int = 16384
     dense_cache_max_points::Int = 262144
     orbital_cache_capacity::Int = 8192
+    orbital_cache_max_bytes::Int = 64 * 1024^2
     slice_cache_capacity::Int = 2048
     reuse_pivots::Bool = true
     pivot_cache_capacity::Int = 512

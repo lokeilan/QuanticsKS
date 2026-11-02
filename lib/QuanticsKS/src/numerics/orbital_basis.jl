@@ -27,12 +27,22 @@ function orthogonalize_coefficients!(x::OrbitalTransform, cfg; force = false)
     true
 end
 
-function ritz_coefficients!(x::OrbitalTransform, H, cfg, rec; force = false)
-    # H is fixed during this sequence. Contract its projected matrix once;
-    # coefficient transforms never require sampled H*psi intermediates.
-    projected = timed(rec, "ritz_direct_projection") do
-        h_gram(x.basis, H)
+function ritz_projection(xs, H, cfg, rec; work_tol = 0.0)
+    stage = work_tol > 0 ? "ritz_sampled_projection" : "ritz_direct_projection"
+    timed(rec, stage) do
+        work_tol > 0 || return h_gram(xs, H)
+        # Apply H once per input column, at the existing work tolerance/cap.
+        # The following coefficient transforms reuse this fixed-basis matrix.
+        potential = memoized_sample(H.potential, rec)
+        hx = [h_action(H, x, cfg, rec; label = "ritz_$i", work_tol, potential)
+              for (i, x) in enumerate(xs)]
+        A = gram(xs, hx)
+        require_finite(A, "nonfinite_sampled_ritz_projection")
+        (A + A') / 2
     end
+end
+function ritz_coefficients!(x::OrbitalTransform, H, cfg, rec; force = false, work_tol = 0.0)
+    projected = ritz_projection(x.basis, H, cfg, rec; work_tol)
     A = x.coefficients' * projected * x.coefficients
     A = (A + A') / 2
     require_finite(A, "nonfinite_orbital_transform_hamiltonian")
@@ -60,13 +70,13 @@ function materialize_orbitals(x::OrbitalTransform, cfg, rec; label)
             shared_pivots = "orbital_basis_group_$(cld(i, group_size))")
         push!(ys, x.rotated ? normalize(y) : y)
     end
-    ys
+    ys, block_cache_stats(oracle)
 end
 
 function finish_orbital_transform(x::OrbitalTransform, original, cfg, rec)
     x.transforms == 0 && return original, norm(x.metric - I)
     label = x.rotated ? "ritz_rotate" : "orthogonalize"
-    ys = materialize_orbitals(x, cfg, rec; label)
+    ys, cache_stats = materialize_orbitals(x, cfg, rec; label)
     defect = norm(gram(ys) - I)
     repaired = false
     # Compression is nonlinear: a coefficient-space identity does not certify
@@ -80,7 +90,7 @@ function finish_orbital_transform(x::OrbitalTransform, original, cfg, rec)
         tci_calls = 0, tci_samples = 0, tci_seconds = 0.0,
         event = "orbital_transform", basis_columns = length(x.basis),
         coefficient_transforms = x.transforms, materialization_passes = 1 + Int(repaired),
-        post_fit_orthogonalization = repaired, gram_defect = defect))
+        post_fit_orthogonalization = repaired, gram_defect = defect, cache_stats...))
     ys, defect
 end
 
@@ -93,7 +103,7 @@ end
 function ritz_rotate(xs, H, cfg, rec; work_tol = 0.0, force = false)
     isfinite(work_tol) && work_tol >= 0 || throw(ArgumentError("Invalid Ritz work tolerance"))
     transform = OrbitalTransform(xs)
-    offdiag = ritz_coefficients!(transform, H, cfg, rec; force)
+    offdiag = ritz_coefficients!(transform, H, cfg, rec; force, work_tol)
     transform.rotated && orthogonalize_coefficients!(transform, cfg)
     ys, _ = finish_orbital_transform(transform, xs, cfg, rec)
     ys, offdiag
@@ -104,7 +114,7 @@ function orthogonalize_ritz(xs, H, cfg, rec; ritz = true, work_tol = 0.0)
     isfinite(work_tol) && work_tol >= 0 || throw(ArgumentError("Invalid Ritz work tolerance"))
     transform = OrbitalTransform(xs)
     orthogonalize_coefficients!(transform, cfg)
-    offdiag = ritz ? ritz_coefficients!(transform, H, cfg, rec) : 0.0
+    offdiag = ritz ? ritz_coefficients!(transform, H, cfg, rec; work_tol) : 0.0
     transform.rotated && orthogonalize_coefficients!(transform, cfg)
     ys, defect = finish_orbital_transform(transform, xs, cfg, rec)
     ys, defect, offdiag

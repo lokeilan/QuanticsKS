@@ -126,6 +126,34 @@ end
     end
 end
 
+@testset "Endpoint batches retain fast evaluation and shared samples within budget" begin
+    R = 16
+    x, y = random_train(R, 3), random_train(R, 2)
+    rec = K.recorder(nothing, TCIOptions(environment_cache_bits = 8))
+    oracle = Q.block_oracle([x, y], rec)
+    f = Q.LinearSamples(oracle, ComplexF64[2, -im])
+    cached = Q.RecordedSamples(f, rec.options)
+    left, right = Q.bits.(0:31, 7), Q.bits.(0:31, 7)
+    indices = Q.slice_indices(R, left, right, Val(2))
+    ex, ey = Q.Evaluator(x; cachebits=0), Q.Evaluator(y; cachebits=0)
+    expected = map(j -> 2ex(j) - im*ey(j), indices)
+    @test Q.scalar_fastpath(f)
+    @test cached(left, right, Val(2)) ≈ expected atol = 2e-13
+    @test cached.evaluations == oracle.evaluations == length(indices)
+    @test cached.requests == length(indices)
+    before = oracle.evaluations
+    other = Q.RecordedSamples(Q.LinearSamples(oracle, ComplexF64[im, 0.5]), rec.options)
+    other(left, right, Val(2))
+    @test oracle.evaluations == before
+    @test Q.block_cache_stats(oracle).block_cache_evictions == 0
+    @test all(s -> all(isempty, s.frames.cacheleft) && all(isempty, s.frames.cacheright), oracle.samples)
+    bounded = Q.BlockOracle([x, y]; cap=7, cachebits=8, dense_limit=1<<18, max_bytes=1)
+    foreach(bounded, 0:15)
+    @test isempty(bounded.cache.values)
+    @test bounded.cache.evictions == 9
+    @test_throws ArgumentError K.validate(TCIOptions(orbital_cache_max_bytes=-1))
+end
+
 @testset "Orthogonalization and Ritz materialize once and preserve the occupied space" begin
     mktempdir() do dir
         R = 6
@@ -157,6 +185,15 @@ end
         @test real.(diag(Y' * A * Y)) ≈ eigvals(Hermitian(B' * A * B)) atol = 2e-8
         @test norm(Y' * A * Y - Diagonal(diag(Y' * A * Y))) < 2e-8
         @test [x.c for x in xs] == saved
+        sampled_rec = K.recorder(nothing, TCIOptions(environment_cache_bits=3))
+        projected = Q.ritz_projection(xs, H, cfg, sampled_rec; work_tol=1e-12)
+        @test projected ≈ X' * A * X atol=2e-8
+        @test sampled_rec.calls == length(xs)
+        sampled_result, sampled_defect, _ = Q.orthogonalize_ritz(xs, H, cfg, sampled_rec; work_tol=1e-12)
+        sampled_values = hcat(values.(sampled_result)...)
+        @test sampled_defect < 1e-9
+        @test sampled_values * sampled_values' ≈ B * B' atol=2e-10
+        @test eigvals(Hermitian(sampled_values' * A * sampled_values)) ≈ eigvals(Hermitian(B' * A * B)) atol=2e-8
         close(rec)
         events = JSON3.read.(readlines(joinpath(dir, "stages.jsonl")))
         event = only(filter(e -> get(e, :event, "") == "orbital_transform", events))
