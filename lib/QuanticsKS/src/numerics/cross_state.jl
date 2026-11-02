@@ -9,18 +9,27 @@ struct CrossState
 end
 const CrossKey = Tuple{String,Int}
 
-function remember_cross!(rec, key::CrossKey, ci, ranks, errors)
+function remember_cross!(rec, keys::Tuple{Vararg{CrossKey}}, ci, ranks, errors)
     get(rec.options, :reuse_pivots, true) || return
-    isempty(first(key)) && return
-    old = get(rec.cross_states, key, nothing)
-    rec.cross_states[key] = CrossState(length(ci.localdims), deepcopy(ci.Iset), deepcopy(ci.Jset),
-                                      copy(ranks), copy(errors), old === nothing ? 1 : old.uses + 1)
-    filter!(!=(key), rec.cross_order)
-    push!(rec.cross_order, key)
+    all(key -> isempty(first(key)), keys) && return
+    # One read-only snapshot per fit. Each label retains its own usage count;
+    # cross() copies the geometry before TCI is allowed to modify it.
+    left, right = deepcopy(ci.Iset), deepcopy(ci.Jset)
+    saved_ranks, saved_errors = copy(ranks), copy(errors)
+    for key in unique(keys)
+        isempty(first(key)) && continue
+        old = get(rec.cross_states, key, nothing)
+        rec.cross_states[key] = CrossState(length(ci.localdims), left, right,
+            saved_ranks, saved_errors, old === nothing ? 1 : old.uses + 1)
+        filter!(!=(key), rec.cross_order)
+        push!(rec.cross_order, key)
+    end
     while length(rec.cross_order) > get(rec.options, :pivot_cache_capacity, 512)
         delete!(rec.cross_states, popfirst!(rec.cross_order))
     end
 end
+remember_cross!(rec, key::CrossKey, ci, ranks, errors) =
+    remember_cross!(rec, (key,), ci, ranks, errors)
 
 function cross_state_data(rec)
     rows = [Dict("label" => key[1], "R" => s.R, "left" => s.left,

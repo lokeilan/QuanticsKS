@@ -42,25 +42,29 @@ function materialize_density(n::QTTExpression, cfg, rec)
 end
 
 "Compress stored orbitals at their requested accuracy; internal operator algebra keeps its tighter tolerance."
-function pack_orbitals(xs, cfg; tol = cfg.tci_tol)
+function pack_orbitals(xs, cfg; tol = cfg.tci_tol, input_gram_defect = nothing)
     isfinite(tol) && tol >= 0 || throw(ArgumentError("orbital_tol must be finite and nonnegative"))
     before = sum(storage, xs)
+    input_defect = input_gram_defect === nothing ? norm(gram(xs) - I) : input_gram_defect
     tol == 0 && return xs,
     (
         orbital_storage_tolerance = 0.0,
         orbital_bytes_before_pack = before,
         orbital_pack_attempts = 0,
+        packed_gram_defect = input_defect,
     )
     for attempt = 1:(cfg.pack_attempts)
         actual = tol / 10^(attempt - 1)
         ys = [normalize(rounded(x; tol = actual, cap = cfg.rankcap)) for x in xs]
         # Compression must not sacrifice occupied-space orthogonality.
-        if norm(gram(ys) - I) <= max(cfg.pack_gram_tolerance, 2norm(gram(xs) - I))
+        defect = norm(gram(ys) - I)
+        if defect <= max(cfg.pack_gram_tolerance, 2input_defect)
             return ys,
             (
                 orbital_storage_tolerance = actual,
                 orbital_bytes_before_pack = before,
                 orbital_pack_attempts = attempt,
+                packed_gram_defect = defect,
             )
         end
     end

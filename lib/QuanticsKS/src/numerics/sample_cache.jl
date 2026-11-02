@@ -63,48 +63,55 @@ end
 
 Base.length(c::SampleCache) = isempty(c.values) ? length(c.entries) : count(c.valid)
 
-function slice_indices(R, left, right, ::Val{M}) where M
+function map_slice(f, ::Type{T}, R, left, right, ::Val{M}) where {T,M}
     if isempty(left) || isempty(right)
-        return Array{Int,M + 2}(undef, ntuple(_ -> 0, M + 2))
+        return Array{T,M + 2}(undef, ntuple(_ -> 0, M + 2))
     end
     nl = length(first(left))
     nl + M + length(first(right)) == R || throw(DimensionMismatch("Cross slice length"))
-    lp, rp = indexof.(left), indexof.(right)
-    out = Array{Int}(undef, length(left), 1 << M, length(right))
-    for j in eachindex(right), m = 0:((1 << M) - 1), i in eachindex(left)
-        out[i, m + 1, j] = lp[i] | (m << nl) | (rp[j] << (nl + M))
+    lp = indexof.(left)
+    out = Array{T}(undef, length(left), 1 << M, length(right))
+    for j in eachindex(right)
+        high = indexof(right[j]) << (nl + M)
+        for m = 0:((1 << M) - 1), i in eachindex(left)
+            out[i, m + 1, j] = f(lp[i] | (m << nl) | high)
+        end
     end
     reshape(out, length(left), ntuple(_ -> 2, M)..., length(right))
 end
+slice_indices(R, left, right, middle::Val) = map_slice(identity, Int, R, left, right, middle)
 
 "Fill missing entries in rectangular batches without reevaluating cached points."
 function cached_slice!(compute, cache::SampleCache{T}, R, left, right, middle::Val{M}) where {T,M}
     if isempty(left) || isempty(right)
         return Array{T,M + 2}(undef, ntuple(_ -> 0, M + 2)), 0, 0
     end
-    indices = slice_indices(R, left, right, middle)
-    result = Array{T}(undef, size(indices))
-    missing = falses(size(indices))
-    for k in eachindex(indices)
-        value = cache_get(cache, indices[k])
-        missing[k] = value === nothing
-        value === nothing || (result[k] = value)
+    nl = length(first(left))
+    nl + M + length(first(right)) == R || throw(DimensionMismatch("Cross slice length"))
+    lp, rp = indexof.(left), indexof.(right)
+    result = Array{T}(undef, length(left), ntuple(_ -> 2, M)..., length(right))
+    missing = falses(size(result))
+    out = reshape(result, length(left), 1 << M, length(right))
+    mask = reshape(missing, size(out))
+    for j in eachindex(right), m = 0:((1 << M) - 1), i in eachindex(left)
+        value = cache_get(cache, lp[i] | (m << nl) | (rp[j] << (nl + M)))
+        mask[i, m + 1, j] = value === nothing
+        value === nothing || (out[i, m + 1, j] = value)
     end
     nmissing = count(missing)
     nmissing == 0 && return result, 0, 0
     if nmissing == length(result)
         values = compute(left, right, middle)
         size(values) == size(result) || throw(DimensionMismatch("Batch result shape"))
-        for k in eachindex(result)
-            result[k] = cache_put!(cache, indices[k], values[k])
+        vals = reshape(values, size(out))
+        for j in eachindex(right), m = 0:((1 << M) - 1), i in eachindex(left)
+            index = lp[i] | (m << nl) | (rp[j] << (nl + M))
+            out[i, m + 1, j] = cache_put!(cache, index, vals[i, m + 1, j])
         end
         return result, nmissing, 1
     end
     # For each central configuration, combine columns having the same missing
     # row set. Each subproblem is still a matrix contraction, with M=0.
-    mask = reshape(missing, length(left), 1 << M, length(right))
-    out = reshape(result, size(mask))
-    ix = reshape(indices, size(mask))
     batches = 0
     for m = 1:(1 << M)
         groups = Dict{Tuple{Vararg{Int}},Vector{Int}}()
@@ -116,7 +123,8 @@ function cached_slice!(compute, cache::SampleCache{T}, R, left, right, middle::V
             extended = [vcat(left[i], bits(m - 1, M)) for i in rows]
             values = compute(extended, right[columns], Val(0))
             for (jj, j) in enumerate(columns), (ii, i) in enumerate(rows)
-                out[i, m, j] = cache_put!(cache, ix[i, m, j], values[ii, jj])
+                index = lp[i] | ((m - 1) << nl) | (rp[j] << (nl + M))
+                out[i, m, j] = cache_put!(cache, index, values[ii, jj])
             end
             batches += 1
         end

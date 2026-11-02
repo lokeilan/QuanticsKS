@@ -96,10 +96,18 @@ end
         firstfit = Q.cross(rec, 6, Q.sampled(x, rec); tol = 1e-11, cap = 16,
                            label = "persistent", shared_pivots = "group")
         @test values(firstfit) ≈ vx atol = 1e-10
+        firststate = rec.cross_states[("persistent", 6)]
+        groupstate = rec.cross_states[("group", 6)]
+        @test firststate.left === groupstate.left
+        @test firststate.right === groupstate.right
+        saved_geometry = deepcopy((groupstate.left, groupstate.right))
         rec.scf = 2
         changed = Q.pointwise((a, b) -> 2a + im*b, Q.sampled(x, rec), Q.sampled(y, rec))
         secondfit = Q.cross(rec, 6, changed; tol = 1e-11, cap = 16, label = "persistent")
         @test values(secondfit) ≈ 2vx + im*vy atol = 1e-10
+        @test (groupstate.left, groupstate.right) == saved_geometry
+        @test rec.cross_states[("group", 6)].uses == 1
+        @test rec.cross_states[("persistent", 6)].left !== groupstate.left
         grouped = Q.cross(rec, 6, Q.sampled(y, rec); tol = 1e-11, cap = 16,
                           label = "another_orbital", shared_pivots = "group")
         @test values(grouped) ≈ vy atol = 1e-10
@@ -146,7 +154,7 @@ end
     other(left, right, Val(2))
     @test oracle.evaluations == before
     @test Q.block_cache_stats(oracle).block_cache_evictions == 0
-    @test all(s -> all(isempty, s.frames.cacheleft) && all(isempty, s.frames.cacheright), oracle.samples)
+    @test all(s -> s.frames === nothing, oracle.samples)
     bounded = Q.BlockOracle([x, y]; cap=7, cachebits=8, dense_limit=1<<18, max_bytes=1)
     foreach(bounded, 0:15)
     @test isempty(bounded.cache.values)
@@ -189,6 +197,14 @@ end
         projected = Q.ritz_projection(xs, H, cfg, sampled_rec; work_tol=1e-12)
         @test projected ≈ X' * A * X atol=2e-8
         @test sampled_rec.calls == length(xs)
+        field = Q.memoized_sample(H.potential, sampled_rec)
+        Q.ritz_projection(xs, H, cfg, sampled_rec; work_tol=1e-12, potential=field)
+        before = field.evaluations
+        Q.ritz_projection(xs, H, cfg, sampled_rec; work_tol=1e-12, potential=field)
+        @test field.evaluations == before
+        other_field = Q.memoized_sample(Q.scale(H.potential, 2), sampled_rec)
+        @test other_field.evaluations == 0
+        @test other_field(3) ≈ 2field(3)
         sampled_result, sampled_defect, _ = Q.orthogonalize_ritz(xs, H, cfg, sampled_rec; work_tol=1e-12)
         sampled_values = hcat(values.(sampled_result)...)
         @test sampled_defect < 1e-9
@@ -201,5 +217,40 @@ end
         @test event.materialization_passes == 1
         @test !event.post_fit_orthogonalization
     end
+end
+
+@testset "Streamed slices preserve shapes, warm-start maxima and counters" begin
+    options = K.option_tuple(TCIOptions(environment_cache_bits=8))
+    for dense in (0, 1 << 18), M in (0, 1, 2)
+        opts = merge(options, (; dense_cache_max_points=dense, scalar_cache_capacity=7))
+        f = Q.sampled(j -> complex(j - 12, j % 3), 6)
+        a, b = Q.RecordedSamples(f, opts), Q.RecordedSamples(f, opts)
+        l, r = Q.bits.(0:3, 2), Q.bits.(0:((1 << (4-M))-1), 4-M)
+        expected = expected_slice(complex.(collect(0:63) .- 12, collect(0:63) .% 3), 6, l, r, Val(M))
+        @test a(l, r, Val(M)) == expected
+        @test size(a(l, r, Val(M))) == size(expected)
+        for _ = 1:2
+            @test Q.maximum_slice(b, l, r, Val(M)) == maximum(abs, expected)
+        end
+        @test (a.requests, a.evaluations, a.batches, a.computed_batches, a.batch_evaluations) ==
+              (b.requests, b.evaluations, b.batches, b.computed_batches, b.batch_evaluations)
+        @test isempty(a(Vector{Int}[], [Int[]], Val(M)))
+        @test Q.maximum_slice(b, Vector{Int}[], [Int[]], Val(M)) == 0
+    end
+end
+
+@testset "Self Gram and packing metadata describe the actual stored orbitals" begin
+    xs, ys = [random_train(6, 2) for _=1:3], [random_train(6, 2) for _=1:2]
+    X, Y = hcat(values.(xs)...), hcat(values.(ys)...)
+    @test Q.gram(xs) ≈ X'X atol=2e-13
+    @test Q.gram(xs, ys) ≈ X'Y atol=2e-13
+    p = Problem(PeriodicGrid1D(6, 8.0), LocalPotential1D(0.0), ones(3))
+    cfg = K.solver_config(p, Accuracy(orbital_cap=32), SCFOptions())
+    defect = norm(Q.gram(xs)-I)
+    packed, metadata = Q.pack_orbitals(xs, cfg; tol=1e-10, input_gram_defect=defect)
+    @test metadata.packed_gram_defect ≈ norm(hcat(values.(packed)...)' * hcat(values.(packed)...) - I) atol=2e-13
+    unchanged, zero_metadata = Q.pack_orbitals(xs, cfg; tol=0.0, input_gram_defect=defect)
+    @test unchanged === xs
+    @test zero_metadata.packed_gram_defect == defect
 end
 end

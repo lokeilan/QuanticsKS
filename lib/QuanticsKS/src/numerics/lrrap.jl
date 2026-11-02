@@ -5,8 +5,8 @@ include("orbital_basis.jl")
 include("coefficients.jl")
 
 "tensorchem-style Block-Green correction; no differentiated TCI error in the RHS."
-function block_green(xs, energies, H, green, cfg, rec)
-    ev = memoized_sample(H.potential, rec)
+function block_green(xs, energies, H, green, cfg, rec; potential = nothing)
+    ev = potential === nothing ? memoized_sample(H.potential, rec) : potential
     ys = QTT[]
     for (i, x) in enumerate(xs)
         ex = sampled(x, rec)
@@ -22,17 +22,18 @@ function block_green(xs, energies, H, green, cfg, rec)
     end
     ys
 end
-function lrrap_step(xs, previous, H, green, cfg, rec; work_tol = 0.0)
+function lrrap_step(xs, previous, H, green, cfg, rec; work_tol = 0.0, potential = nothing)
     isfinite(work_tol) && work_tol >= 0 ||
         throw(ArgumentError("work_tol must be finite and nonnegative"))
     algebra_tol = work_tol > 0 ? work_tol : cfg.round_tol
     state_tol = min(algebra_tol, cfg.tci_tol)
     b = length(xs)
+    field = potential === nothing ? memoized_sample(H.potential, rec) : potential
     # L1: contract Rayleigh energies and sample only the final residuals.
     eps, residuals = timed(rec, "L1") do
         eps = Float64[]
         rs = QTT[]
-        ev = memoized_sample(H.potential, rec)
+        ev = field
         for i = 1:b
             e = h_expectation(H, xs[i]) / real(inner(xs[i], xs[i]))
             push!(eps, e)
@@ -164,12 +165,12 @@ function lrrap_step(xs, previous, H, green, cfg, rec; work_tol = 0.0)
         # Accepted orbitals keep the original tight Green output accuracy;
         # the looser work budget applies to search directions, not this state.
         ys = timed(rec, "L6G") do
-            block_green(ys, eps, H, green, cfg, rec)
+            block_green(ys, eps, H, green, cfg, rec; potential = field)
         end
         ps = [constant_tt(cfg.R, 0.0) for i = 1:b]
     end
     ys, gramdef, ritz_offdiag = timed(rec, "L7") do
-        orthogonalize_ritz(ys, H, cfg, rec; ritz = polish, work_tol)
+        orthogonalize_ritz(ys, H, cfg, rec; ritz = polish, work_tol, potential = field)
     end
     metrics = (
         anchor = anchor,

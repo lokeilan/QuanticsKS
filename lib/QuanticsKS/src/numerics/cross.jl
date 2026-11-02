@@ -36,7 +36,7 @@ function cross(
     tic = time_ns()
     initial_max = maximum(j -> abs(oracle(j)), pts; init = 0.0)
     old_max = saved === nothing ? 0.0 : maximum(1:R) do k
-        maximum(abs, oracle(saved.left[k], saved.right[k], Val(1)); init = 0.0)
+        maximum_slice(oracle, saved.left[k], saved.right[k], Val(1))
     end
     if iszero(max(initial_max, old_max))
         if initial_zero_fallback !== nothing
@@ -167,8 +167,7 @@ function cross(
         (isempty(err) || last(err) > tol) &&
         error("TCI did not meet tolerance: $label")
     if tci !== nothing
-        remember_cross!(r, key, tci, rs, err)
-        isempty(shared_pivots) || remember_cross!(r, shared_key, tci, rs, err)
+        remember_cross!(r, isempty(shared_pivots) ? (key,) : (key, shared_key), tci, rs, err)
     end
     x
 end

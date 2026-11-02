@@ -76,16 +76,29 @@ function ground_state(
             # Hartree is the first consumer requiring independent density cores.
             n = Q.materialize_density(n, cfg, rec)
             H = effective_hamiltonian(p, n, ops, a, rec)
+            # Only the fixed potential survives all inner stages. Orbitals get
+            # new evaluators after every update; a new SCF H gets a new cache.
+            potential = Q.timed(rec, "fixed_potential_setup") do
+                Q.memoized_sample(H.potential, rec)
+            end
             metrics = nothing
             for j = 1:(scf.inner_steps)
                 rec.inner = j
                 xs, previous, metrics =
-                    Q.lrrap_step(xs, previous, H, green, cfg, rec; work_tol = a.work_tolerance)
+                    Q.lrrap_step(xs, previous, H, green, cfg, rec; work_tol = a.work_tolerance, potential)
                 Q.event!(lio, merge((scf = k, inner = j), metrics))
             end
+            Q.event!(rec.stage_io, (; scf = k, inner = 0, stage = "fixed_potential_cache",
+                parent_stage = rec.stage, seconds = 0.0, gc_seconds = 0.0, allocated_bytes = 0,
+                sampling_method = Q.sampling_method(potential),
+                requests = potential.requests, evaluations = potential.evaluations,
+                cache_evictions = potential.cache.evictions,
+                tt_frames_constructed = potential.input.frames !== nothing))
             # Compress to storage accuracy and recompute the density from the stored orbitals.
             rec.inner = 0
-            xs, pack = Q.pack_orbitals(xs, cfg; tol = a.storage_tolerance)
+            xs, pack = Q.pack_orbitals(xs, cfg; tol = a.storage_tolerance,
+                                       input_gram_defect = metrics.gram_defect)
+            stored_gram_defect = pack.packed_gram_defect
             state = OrbitalState(p, xs)
             nout = density(p, xs, a, rec; renormalize = true, label = "output_density")
             canonical = (final_output_ritz = false,)
@@ -93,6 +106,7 @@ function ground_state(
             if scf.criterion == :strict
                 xs, nout, canonical = canonicalize_output_orbitals(p, xs, ops, a, cfg, rec)
                 state = OrbitalState(p, xs)
+                stored_gram_defect = canonical.canonical_gram_defect
                 # Search directions belonged to the pre-Ritz orbital basis.
                 previous = nothing
             end
@@ -132,7 +146,7 @@ function ground_state(
                 pack,
                 canonical,
                 (
-                    gram_defect = norm(Q.gram(xs) - I),
+                    gram_defect = stored_gram_defect,
                     max_rank = maximum(Q.rank.(xs)),
                     orbital_bytes = sum(Q.storage, xs),
                 ),

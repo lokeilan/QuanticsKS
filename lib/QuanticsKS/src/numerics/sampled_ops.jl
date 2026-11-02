@@ -17,16 +17,18 @@ sampled(f::SampledFunction, R::Int) =
 sample_length(f::CoordinateSamples) = f.R
 scalar_fastpath(::CoordinateSamples) = true
 function (f::CoordinateSamples)(left, right, middle::Val)
-    map(f, slice_indices(f.R, left, right, middle))
+    map_slice(f, ComplexF64, f.R, left, right, middle)
 end
 
 struct TensorSamples <: SampledFunction
     evaluator::Evaluator
-    frames::TCI.TTCache{ComplexF64}
+    frames::Union{Nothing,TCI.TTCache{ComplexF64}}
     frame_capacity::Int
 end
-TensorSamples(e::Evaluator; frame_capacity = 2048) =
-    TensorSamples(e, TCI.TTCache(e.x.c), frame_capacity)
+function TensorSamples(e::Evaluator; frame_capacity = 2048)
+    frames = e.prefix + e.suffix == length(e.x) ? nothing : TCI.TTCache(e.x.c)
+    TensorSamples(e, frames, frame_capacity)
+end
 sampled(x::QTT, rec) = TensorSamples(evaluate(x, rec);
     frame_capacity = get(rec.options, :slice_cache_capacity, 2048))
 sample_length(f::TensorSamples) = length(f.evaluator.x)
@@ -49,9 +51,10 @@ function trim_frames!(frames, capacity)
     end
 end
 function (f::TensorSamples)(left, right, middle::Val)
-    scalar_fastpath(f) && return map(f.evaluator, slice_indices(sample_length(f), left, right, middle))
-    result = TCI.batchevaluate(f.frames, left, right, middle)
-    trim_frames!(f.frames, f.frame_capacity)
+    frames = f.frames
+    frames === nothing && return map_slice(f.evaluator, ComplexF64, sample_length(f), left, right, middle)
+    result = TCI.batchevaluate(frames, left, right, middle)
+    trim_frames!(frames, f.frame_capacity)
     result
 end
 
@@ -145,7 +148,7 @@ function (f::RecordedSamples)(left, right, middle::Val{M}) where M
         # Endpoint dot products are cheaper than grouping sparse misses and
         # building TTCache environments for every cross cut on small grids.
         before = f.evaluations
-        result = map(f, slice_indices(f.R, left, right, middle))
+        result = map_slice(f, ComplexF64, f.R, left, right, middle)
         evaluated = f.evaluations - before
         f.batch_evaluations += evaluated
         f.computed_batches += Int(evaluated > 0)
@@ -164,6 +167,30 @@ function (f::RecordedSamples)(left, right, middle::Val{M}) where M
 end
 memoized_sample(x::QTT, rec) = RecordedSamples(sampled(x, rec), rec.options)
 
+# The warm-start scale must see the current function on every old slice before
+# optimize! starts. Stream endpoint values without allocating a result tensor.
+function maximum_slice(f::RecordedSamples, left, right, middle::Val{M}) where M
+    scalar_fastpath(f) || return maximum(abs, f(left, right, middle); init = 0.0)
+    f.batches += 1
+    before = f.evaluations
+    result = 0.0
+    if !isempty(left) && !isempty(right)
+        nl = length(first(left))
+        nl + M + length(first(right)) == f.R || throw(DimensionMismatch("Cross slice length"))
+        lp = indexof.(left)
+        for q in right
+            high = indexof(q) << (nl + M)
+            for m = 0:((1 << M) - 1), low in lp
+                result = max(result, abs(f(low | (m << nl) | high)))
+            end
+        end
+    end
+    evaluated = f.evaluations - before
+    f.batch_evaluations += evaluated
+    f.computed_batches += Int(evaluated > 0)
+    result
+end
+
 mutable struct BlockOracle
     evals::Vector{Evaluator}
     samples::Vector{TensorSamples}
@@ -171,6 +198,7 @@ mutable struct BlockOracle
     cap::Int
     requests::Int
     evaluations::Int
+    endpoint_fastpath::Bool
 end
 function BlockOracle(xs; cap = 8192, cachebits = 10, frame_capacity = 2048,
                      dense_limit = 0, max_bytes = 64 * 1024^2)
@@ -181,9 +209,10 @@ function BlockOracle(xs; cap = 8192, cachebits = 10, frame_capacity = 2048,
     bytes_per_point = sizeof(ComplexF64) * length(evals) + 64
     limit = min(dense_limit, max_bytes ÷ bytes_per_point)
     cache = SampleCache{Vector{ComplexF64}}(R; capacity = cap, dense_limit = limit)
-    BlockOracle(evals, samples, cache, isempty(cache.values) ? cap : length(cache.values), 0, 0)
+    BlockOracle(evals, samples, cache, isempty(cache.values) ? cap : length(cache.values), 0, 0,
+                all(scalar_fastpath, samples))
 end
-scalar_fastpath(o::BlockOracle) = all(scalar_fastpath, o.samples)
+scalar_fastpath(o::BlockOracle) = o.endpoint_fastpath
 function (o::BlockOracle)(j::Int)
     o.requests += 1
     value = cache_get(o.cache, j)
@@ -195,7 +224,7 @@ function (o::BlockOracle)(j::Int)
 end
 function (o::BlockOracle)(left, right, middle::Val{M}) where M
     R = sample_length(first(o.samples))
-    scalar_fastpath(o) && return map(o, slice_indices(R, left, right, middle))
+    scalar_fastpath(o) && return map_slice(o, Vector{ComplexF64}, R, left, right, middle)
     o.requests += length(left) * (1 << M) * length(right)
     result, evaluations, _ = cached_slice!(o.cache, R, left, right, middle) do l, r, m
         columns = [s(l, r, m) for s in o.samples]

@@ -104,7 +104,16 @@ function phase_tt(x::QTT, k::Int)
     end
     QTT(c)
 end
-function gram(xs, ys = xs)
+function gram(xs)
+    g = zeros(ComplexF64, length(xs), length(xs))
+    for j in eachindex(xs), i in firstindex(xs):j
+        value = inner(xs[i], xs[j])
+        g[i, j] = value
+        i == j || (g[j, i] = conj(value))
+    end
+    g
+end
+function gram(xs, ys)
     g = zeros(ComplexF64, length(xs), length(ys))
     for j in eachindex(ys), i in eachindex(xs)
         g[i, j] = inner(xs[i], ys[j])
