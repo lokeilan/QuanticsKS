@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "baseline_id": "evaluate-work-tensors-20261102-v1",
+  "selected_utc": "2026-11-01T22:29:53.807215+00:00",
+  "selection": "User selected completed evaluate-work-tensors optimizations from the other side conversation as the new baseline.",
+  "parent_code_baseline": "r16-lazy-density-20261102-v1",
+  "source_files": 87,
+  "input_sha256": "7f2ad4ae1ca5293429cb82122c299ca42298e0a938b81243dc862aa0c34ea7ca",
+  "validation": {
+    "focused_test": "lib/QuanticsKS/test/evaluate_work_tensors.jl",
+    "library_suite": "lib/QuanticsKS/test/runtests.jl",
+    "library_suite_exit_code": 0,
+    "forced_ritz": "test/h100_ritz_only.jl",
+    "forced_ritz_exit_code": 0,
+    "forced_ritz_checks": 7,
+    "production_run_started": false,
+    "focused_exit_code": 0,
+    "focused_checks": 57,
+    "focused_log": "outputs/evaluate-work-tensors-20261102/focused-validation.log",
+    "validation_order": "Library suite and forced Ritz passed; final zero-pivot/compatibility adjustments were covered by the rerun focused suite on the final sources."
+  },
+  "production_run_started": false,
+  "scientific_scope": "Selected code baseline; bounded validation passed. No new production-scale convergence, runtime or peak-memory claim.",
+  "settings": {
+    "energy_tolerance_Ha": 1e-06,
+    "green_polish": "Preserve current periodic/residual scheduling",
+    "ritz": "Preserve current separate orthogonalization/Ritz scheduling",
+    "SVD": "Current guards and QR fallback retained; no proactive monitoring reports requested"
+  },
+  "implementation_review": "validation/implementation-review.json",
+  "restart_scheduled": false
+}

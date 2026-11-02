@@ -1,0 +1,30 @@
+# Generated calculations, historical bundles, and local tools stay on disk.
+/results/
+/outputs/
+/deliverables/
+/baselines/
+/vendor/
+/.chart-data-*/
+/.tooling/
+
+# Caches, process receipts, and generated binary states.
+__pycache__/
+*.py[cod]
+*.pid
+*.log
+*.jls
+*.h5
+*.hdf5
+*.npy
+*.npz
+
+# Local credentials and editor state.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
