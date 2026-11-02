@@ -31,7 +31,12 @@ Base.@kwdef struct TCIOptions
     initial_pivots::Vector{Int} = Int[]
     post_rounding_factor::Float64 = 0.1
     scalar_cache_capacity::Int = 16384
+    dense_cache_max_points::Int = 262144
     orbital_cache_capacity::Int = 8192
+    slice_cache_capacity::Int = 2048
+    reuse_pivots::Bool = true
+    pivot_cache_capacity::Int = 512
+    orbital_pivot_group_size::Int = 4
     environment_cache_bits::Int = 10
     require_convergence::Bool = false
     zero_check_limit::Int = 4096

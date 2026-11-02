@@ -2,6 +2,8 @@ using Test, QuanticsKS, LinearAlgebra, Random, Serialization, TOML
 include("library_algebra.jl")
 include("svd_safety.jl")
 include("evaluate_work_tensors.jl")
+include("pivot_sampling.jl")
+include("pivot_restart.jl")
 const K=QuanticsKS
 const Q=K.Q
 BLAS.set_num_threads(1)
@@ -229,7 +231,8 @@ steps = 100
             close(rec)
         end
         row=JSON3.read(readlines(joinpath(dir,"tci_calls.jsonl"))[1])
-        @test row.cache_peak_cap==31
+        @test row.cache_mode=="dense_addressed"
+        @test row.cache_peak_cap==32
         @test row.rank_cap==4
         @test row.post_rounding_tolerance≈2e-10
     end

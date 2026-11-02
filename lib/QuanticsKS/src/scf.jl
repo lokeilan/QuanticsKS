@@ -16,6 +16,7 @@ include("scf_audit.jl")
 function ground_state(
     p::Problem;
     initial = nothing,
+    pivot_state = nothing,
     accuracy = Accuracy(),
     scf = SCFOptions(),
     tci = TCIOptions(),
@@ -43,6 +44,7 @@ function ground_state(
     sio = run_io(dir, "scf.jsonl")
     lio = run_io(dir, "lrrap.jsonl")
     try
+        pivot_state === nothing || Q.load_cross_state!(rec, pivot_state)
         cfg = solver_config(p, a, scf)
         ops = build_operators(p, a, rec, physics)
         green = Q.green_mpo(p.grid.R, spacing(p.grid) * sqrt(p.mass), scf.green_shift)
@@ -140,8 +142,10 @@ function ground_state(
             dir === nothing || save_checkpoint(
                 joinpath(dir, "checkpoint.jls"),
                 state;
-                metadata = Dict("history" => history, "restart" => "warm_start"),
+                metadata = Dict("history" => history, "restart" => "warm_start",
+                                "pivot_state_file" => "cross-state.jls"),
             )
+            dir === nothing || Q.save_cross_state(rec, joinpath(dir, "cross-state.jls"))
             @printf("SCF %3d E=% .10f dE=%.3e rank=%d\n", k, energy.total, change, row.max_rank)
             flush(stdout)
             oldinput = n

@@ -6,14 +6,14 @@ include("coefficients.jl")
 
 "tensorchem-style Block-Green correction; no differentiated TCI error in the RHS."
 function block_green(xs, energies, H, green, cfg, rec)
-    ev = evaluate(H.potential, rec)
+    ev = memoized_sample(H.potential, rec)
     ys = QTT[]
     for (i, x) in enumerate(xs)
-        ex = evaluate(x, rec)
+        ex = sampled(x, rec)
         rhs = cross(
             rec,
             cfg.R,
-            j -> (cfg.green_shift + energies[i] - ev(j)) * ex(j);
+            pointwise((v, value) -> (cfg.green_shift + energies[i] - v) * value, ev, ex);
             tol = cfg.rhs_tol,
             cap = get(cfg, :rhs_cap, cfg.workcap),
             label = "block_green_$i",
@@ -32,7 +32,7 @@ function lrrap_step(xs, previous, H, green, cfg, rec; work_tol = 0.0)
     eps, residuals = timed(rec, "L1") do
         eps = Float64[]
         rs = QTT[]
-        ev = evaluate(H.potential, rec)
+        ev = memoized_sample(H.potential, rec)
         for i = 1:b
             e = h_expectation(H, xs[i]) / real(inner(xs[i], xs[i]))
             push!(eps, e)
@@ -169,13 +169,7 @@ function lrrap_step(xs, previous, H, green, cfg, rec; work_tol = 0.0)
         ps = [constant_tt(cfg.R, 0.0) for i = 1:b]
     end
     ys, gramdef, ritz_offdiag = timed(rec, "L7") do
-        yy, gd = orthogonalize(ys, cfg, rec)
-        offdiag = 0.0
-        if polish
-            yy, offdiag = ritz_rotate(yy, H, cfg, rec; work_tol)
-            gd = norm(gram(yy) - I)
-        end
-        yy, gd, offdiag
+        orthogonalize_ritz(ys, H, cfg, rec; ritz = polish, work_tol)
     end
     metrics = (
         anchor = anchor,

@@ -73,19 +73,5 @@ function (e::Evaluator)(j::Int)
     end
     z
 end
-mutable struct BlockOracle
-    evals::Vector{Evaluator}
-    cache::Dict{Int,Vector{ComplexF64}}
-    cap::Int
-end
-BlockOracle(xs; cap = 8192, cachebits = 10) =
-    BlockOracle([Evaluator(x; cachebits) for x in xs], Dict{Int,Vector{ComplexF64}}(), cap)
-function (o::BlockOracle)(j::Int)
-    haskey(o.cache, j) && return o.cache[j]
-    length(o.cache) >= o.cap && empty!(o.cache)
-    v = [e(j) for e in o.evals]
-    o.cache[j] = v
-    v
-end
 bits(j, R) = [((j >> (k - 1)) & 1) + 1 for k = 1:R]
-indexof(v) = sum((v[k] - 1) << (k - 1) for k = 1:length(v))
+indexof(v) = sum(((v[k] - 1) << (k - 1) for k = 1:length(v)); init = 0)

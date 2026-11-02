@@ -83,7 +83,7 @@ function density(p, xs, a, rec; renormalize = false, label = "density")
     n = Q.cross(
         rec,
         p.grid.R,
-        j -> sum(p.occupations .* abs2.(o(j))) / h;
+        Q.DensitySamples(o, Float64.(p.occupations ./ h));
         tol = a.density_tolerance,
         cap = a.field_cap,
         label,
@@ -108,17 +108,17 @@ function effective_hamiltonian(p, n, ops, a, rec; time = 0.0, drive = NoDrive())
         return Q.Hamiltonian(v, Q.diagonal(v), ops.plus, ops.minus, spacing(p.grid) * sqrt(p.mass))
     end
     vh = hartree(n, p, ops, a)
-    en = Q.evaluate(n, rec)
-    eh = Q.evaluate(vh, rec)
-    ev = Q.evaluate(ops.external, rec)
+    en = Q.sampled(n, rec)
+    eh = Q.sampled(vh, rec)
+    ev = Q.sampled(ops.external, rec)
     h = spacing(p.grid)
     v = Q.cross(
         rec,
         p.grid.R,
-        j ->
-            real(ev(j) + eh(j)) +
-            (ops.xc_table === nothing ? 0.0 : Q.xc(ops.xc_table, real(en(j)))[2]) +
-            drive_value(drive, j * h, time, p.grid.L);
+        Q.pointwise((external, hartree, density, drive) ->
+            real(external + hartree) +
+            (ops.xc_table === nothing ? 0.0 : Q.xc(ops.xc_table, real(density))[2]) + drive,
+            ev, eh, en, Q.sampled(j -> drive_value(drive, j * h, time, p.grid.L), p.grid.R));
         tol = a.field_tolerance,
         cap = a.field_cap,
         label = "effective_potential",
@@ -138,11 +138,11 @@ function total_energy(p, xs, n, ops, a, rec; time = 0.0, drive = NoDrive())
     eh = 0.5h * real(Q.inner(n, vh))
     exc = 0.0
     if ops.xc_table !== nothing
-        en = Q.evaluate(n, rec)
+        en = Q.sampled(n, rec)
         e = Q.cross(
             rec,
             p.grid.R,
-            j -> Q.xc(ops.xc_table, real(en(j)))[1];
+            Q.pointwise(value -> Q.xc(ops.xc_table, real(value))[1], en);
             tol = a.xc_energy_tolerance,
             cap = a.field_cap,
             label = "xc_energy_density",

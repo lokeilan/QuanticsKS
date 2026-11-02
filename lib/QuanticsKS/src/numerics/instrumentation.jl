@@ -1,6 +1,7 @@
 # Recorder tracks stages, samples, and timings; cross.jl performs TCI fits.
 
 using JSON3, Dates, Printf
+include("cross_state.jl")
 
 mutable struct Recorder
     options::NamedTuple
@@ -13,9 +14,12 @@ mutable struct Recorder
     tci_time::Float64
     stage_io::IO
     tci_io::IO
+    cross_states::Dict{CrossKey,CrossState}
+    cross_order::Vector{CrossKey}
 end
 function Recorder(dir; options)
-    dir === nothing && return Recorder(options, nothing, 0, 0, "init", 0, 0, 0.0, devnull, devnull)
+    dir === nothing && return Recorder(options, nothing, 0, 0, "init", 0, 0, 0.0, devnull, devnull,
+                                      Dict{CrossKey,CrossState}(), CrossKey[])
     mkpath(dir)
     Recorder(
         options,
@@ -28,6 +32,8 @@ function Recorder(dir; options)
         0.0,
         open(joinpath(dir, "stages.jsonl"), "w"),
         open(joinpath(dir, "tci_calls.jsonl"), "w"),
+        Dict{CrossKey,CrossState}(),
+        CrossKey[],
     )
 end
 function memory_info()
@@ -91,7 +97,15 @@ function timed(f, r::Recorder, id::String; item = "")
         r.stage = prev
     end
 end
-Base.close(r::Recorder) = r.dir === nothing ? nothing : (close(r.stage_io); close(r.tci_io))
+function Base.close(r::Recorder)
+    r.dir === nothing && return nothing
+    try
+        isempty(r.cross_states) || save_cross_state(r, joinpath(r.dir, "cross-state.jls"))
+    finally
+        close(r.stage_io)
+        close(r.tci_io)
+    end
+end
 debug_snapshot(r::Recorder, name, data) =
     r.dir === nothing ? nothing : serialize(joinpath(r.dir, name), data)
 
@@ -100,6 +114,7 @@ block_oracle(xs, r::Recorder) = BlockOracle(
     xs;
     cap = r.options.orbital_cache_capacity,
     cachebits = r.options.environment_cache_bits,
+    frame_capacity = get(r.options, :slice_cache_capacity, 2048),
 )
 
 include("cross.jl")

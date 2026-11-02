@@ -151,7 +151,9 @@ function run_config(d::AbstractDict, path; output = nothing, checkpoint = nothin
             !compatible_problem(initial.problem, p) &&
             throw(ArgumentError("Checkpoint problem mismatch"))
         result = if kind == "scf"
-            ground_state(p; initial, accuracy = a, scf, tci, guess, physics, audit, output = out)
+            pivot_file = cp === nothing ? nothing : joinpath(dirname(cp), "cross-state.jls")
+            pivot_state = tci.reuse_pivots && pivot_file !== nothing && isfile(pivot_file) ? pivot_file : nothing
+            ground_state(p; initial, pivot_state, accuracy = a, scf, tci, guess, physics, audit, output = out)
         else
             initial === nothing && (initial = initial_state(p, a, recorder(nothing, tci), guess))
             propagate(initial; time = to, drive, accuracy = a, tci, physics, output = out)

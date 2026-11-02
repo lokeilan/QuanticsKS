@@ -45,8 +45,16 @@ function h_residual(H, x, energy, cfg, rec;
                     label = "orbital_residual", potential = nothing)
     algebra_options(tol, cap)
     isfinite(energy) || throw(ArgumentError("Nonfinite orbital energy"))
-    e = h_evaluator(H, x, rec; potential)
-    cross(rec, length(x), j -> residual_value(e, j, energy); tol, cap, label,
+    orbital = sampled(x, rec)
+    field = potential === nothing ? memoized_sample(H.potential, rec) :
+            potential isa SampledFunction ? potential :
+            potential isa Evaluator ? TensorSamples(potential;
+                frame_capacity = get(rec.options, :slice_cache_capacity, 2048)) : sampled(potential, length(x))
+    inverse_two_h_squared = 1 / (2H.h^2)
+    fn = pointwise((center, left, right, v) ->
+        ((center - left) + (center - right)) * inverse_two_h_squared + (v - energy) * center,
+        orbital, shifted(orbital, -1), shifted(orbital, 1), field)
+    cross(rec, length(x), fn; tol, cap, label,
           initial_zero_fallback = () -> h_core_fallback(H, x, energy; tol, cap))
 end
 
