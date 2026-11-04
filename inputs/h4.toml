@@ -1,0 +1,31 @@
+# Four atoms and two occupied orbitals; enables bounded Julia task parallelism.
+[run]
+kind = "scf"
+blas_threads = 1
+
+[grid]
+R = 6
+cell = 16.0
+
+[system]
+kind = "hydrogen_chain"
+natoms = 4
+distance = 4.0
+
+[accuracy]
+orbital_cap = 16
+work_cap = 32
+field_cap = 32
+field_tolerance = 1e-9
+work_tolerance = 1e-8
+storage_tolerance = 1e-10
+
+[physics]
+xc_table_points = 128
+
+[scf]
+parallel_tasks = 0
+criterion = "energy"
+energy_tolerance = 1e-7
+max_iterations = 60
+seed = 20261030

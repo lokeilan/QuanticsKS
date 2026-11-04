@@ -1,0 +1,13 @@
+using Test, QuanticsKS, LinearAlgebra, Random, Serialization, TOML
+include("library_algebra.jl")
+include("kernel_optimizations.jl")
+include("svd_safety.jl")
+include("evaluate_work_tensors.jl")
+include("hamiltonian_fields.jl")
+include("mpo_input_gauge.jl")
+include("pivot_sampling.jl")
+include("pivot_restart.jl")
+include("nonlinear_and_driven.jl")
+include("parameter_contracts.jl")
+include("states_and_runs.jl")
+include("fixed_spectrum.jl")

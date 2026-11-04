@@ -1,0 +1,21 @@
+# Small periodic local-potential example for split-step propagation.
+[run]
+kind = "propagation"
+blas_threads = 1
+
+[grid]
+R = 5
+cell = 8.0
+
+[system]
+kind = "cosine_potential"
+amplitude = 0.1
+mode = 1
+occupations = [1.0]
+
+[time]
+parallel_tasks = 0
+dt = 0.01
+steps = 4
+observe_every = 1
+snapshot_every = 2

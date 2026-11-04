@@ -1,0 +1,300 @@
+module PivotSamplingChecks
+using Test, QuanticsKS, LinearAlgebra, Random, JSON3, Serialization
+const K = QuanticsKS
+const Q = K.Q
+const rng = MersenneTwister(20261102)
+values(x) = [
+    only(prod(g[:, ((j >> (k - 1)) & 1) + 1, :] for (k, g) in enumerate(x.c))) for
+    j = 0:(2^length(x) - 1)
+]
+function random_train(R, r = 3)
+    ranks = [1; fill(r, R - 1); 1]
+    Q.normalize(Q.QTT([randn(rng, ComplexF64, ranks[k], 2, ranks[k + 1]) for k = 1:R]))
+end
+function expected_slice(v, R, left, right, ::Val{M}) where {M}
+    dense = reshape(v, ntuple(_ -> 2, R))
+    out = zeros(ComplexF64, length(left), ntuple(_ -> 2, M)..., length(right))
+    for ci in CartesianIndices(out)
+        q = vcat(left[ci[1]], collect(Tuple(ci)[2:(end - 1)]), right[ci[M + 2]])
+        out[ci] = dense[q...]
+    end
+    out
+end
+
+@testset "Fit-local caches eliminate repeated scalar and slice evaluation" begin
+    R = 16
+    counts = zeros(Int, 1 << R)
+    opts = K.option_tuple(TCIOptions(scalar_cache_capacity = 7))
+    source = Q.sampled(j -> (counts[j + 1] += 1; complex(j, -j)), R)
+    oracle = Q.RecordedSamples(source, opts)
+    for j = 0:((1 << R) - 1)
+        oracle(j)
+    end
+    @test all(oracle(j) == complex(j, -j) for j = ((1 << R) - 1):-1:0)
+    @test all(==(1), counts)
+    @test oracle.evaluations == 1 << R
+    @test oracle.cache.evictions == 0
+    @test length(oracle.cache.values) == 1 << R
+
+    counts = zeros(Int, 64)
+    source = Q.sampled(j -> (counts[j + 1] += 1; complex(j + 1, j)), 6)
+    oracle = Q.RecordedSamples(source, opts)
+    left, right = Q.bits.(0:3, 2), Q.bits.(0:3, 2)
+    oracle(0)
+    oracle(31)
+    got = oracle(left, right, Val(2))
+    expected = expected_slice(complex.(1:64, 0:63), 6, left, right, Val(2))
+    @test got == expected
+    @test oracle(left, right, Val(2)) == expected
+    @test all(==(1), counts)
+    @test oracle.evaluations == 64
+    @test oracle.computed_batches > 0
+    @test_throws BoundsError oracle(64)
+
+    sparse = Q.RecordedSamples(source, merge(opts, (; dense_cache_max_points = 0)))
+    for j = 0:63
+        @test sparse(j) == complex(j + 1, j)
+        @test length(sparse.cache) <= 7
+    end
+    @test sparse.cache.evictions == 57
+    @test length(sparse.cache) == 7
+end
+
+@testset "Native cross slices and periodic carries match independent dense values" begin
+    R = 7
+    x, y = random_train(R), random_train(R, 2)
+    saved = deepcopy(x.c)
+    rec = K.recorder(nothing, TCIOptions(environment_cache_bits = 2, slice_cache_capacity = 17))
+    sx, sy = Q.sampled(x, rec), Q.sampled(y, rec)
+    vx, vy = values(x), values(y)
+    expressions = (
+        sx,
+        Q.pointwise((a, b) -> 2a - im * b + a * b, sx, sy),
+        Q.shifted(sx, -1),
+        Q.shifted(sx, 1),
+        Q.shifted(sx, 129),
+    )
+    targets =
+        (vx, 2vx - im * vy + vx .* vy, circshift(vx, 1), circshift(vx, -1), circshift(vx, -129))
+    for M in (0, 1, 2), nl in unique((0, 2, R - M))
+        nr = R - M - nl
+        left = Q.bits.(unique([0, (1 << nl) - 1, min(1, (1 << nl) - 1)]), nl)
+        right = Q.bits.(unique([0, (1 << nr) - 1, min(2, (1 << nr) - 1)]), nr)
+        for (f, target) in zip(expressions, targets)
+            @test f(left, right, Val(M)) ≈ expected_slice(target, R, left, right, Val(M)) atol =
+                2e-13
+        end
+    end
+    @test x.c == saved
+    @test sum(length, sx.frames.cacheleft) + sum(length, sx.frames.cacheright) <= 17
+    @test isempty(sx(Vector{Int}[], [Int[]], Val(1)))
+    oracle = Q.block_oracle([x, y], rec)
+    l, r = Q.bits.(0:3, 2), Q.bits.(0:7, 3)
+    f = Q.LinearSamples(oracle, ComplexF64[2, -im])
+    @test f(l, r, Val(2)) ≈ expected_slice(2vx - im * vy, R, l, r, Val(2)) atol = 2e-13
+    d = Q.DensitySamples(oracle, [1.0, 2.0])
+    @test d(l, r, Val(2)) ≈ expected_slice(abs2.(vx) + 2abs2.(vy), R, l, r, Val(2)) atol = 2e-13
+end
+
+@testset "Full geometry survives iterations and reloads while values change" begin
+    mktempdir() do dir
+        options = TCIOptions(initial_random_pivots = 3, environment_cache_bits = 2)
+        rec = K.recorder(dir, options)
+        x, y = random_train(6, 2), random_train(6, 2)
+        vx, vy = values(x), values(y)
+        firstfit = Q.cross(
+            rec,
+            6,
+            Q.sampled(x, rec);
+            tol = 1e-11,
+            cap = 16,
+            label = "persistent",
+            shared_pivots = "group",
+        )
+        @test values(firstfit) ≈ vx atol = 1e-10
+        firststate = rec.cross_states[("persistent", 6)]
+        groupstate = rec.cross_states[("group", 6)]
+        @test firststate.left === groupstate.left
+        @test firststate.right === groupstate.right
+        saved_geometry = deepcopy((groupstate.left, groupstate.right))
+        rec.scf = 2
+        changed = Q.pointwise((a, b) -> 2a + im * b, Q.sampled(x, rec), Q.sampled(y, rec))
+        secondfit = Q.cross(rec, 6, changed; tol = 1e-11, cap = 16, label = "persistent")
+        @test values(secondfit) ≈ 2vx + im * vy atol = 1e-10
+        @test (groupstate.left, groupstate.right) == saved_geometry
+        @test rec.cross_states[("group", 6)].uses == 1
+        @test rec.cross_states[("persistent", 6)].left !== groupstate.left
+        grouped = Q.cross(
+            rec,
+            6,
+            Q.sampled(y, rec);
+            tol = 1e-11,
+            cap = 16,
+            label = "another_orbital",
+            shared_pivots = "group",
+        )
+        @test values(grouped) ≈ vy atol = 1e-10
+        @test rec.cross_states[("persistent", 6)].uses == 2
+        Q.save_cross_state(rec, joinpath(dir, "pivots.jls"))
+        restored = K.recorder(nothing, options)
+        Q.load_cross_state!(restored, joinpath(dir, "pivots.jls"))
+        @test restored.cross_states[("persistent", 6)].left ==
+              rec.cross_states[("persistent", 6)].left
+        @test restored.cross_states[("persistent", 6)].right ==
+              rec.cross_states[("persistent", 6)].right
+        thirdfit = Q.cross(
+            restored,
+            6,
+            Q.sampled(y, restored);
+            tol = 1e-11,
+            cap = 16,
+            label = "persistent",
+        )
+        @test values(thirdfit) ≈ vy atol = 1e-10
+        close(rec)
+        rows = JSON3.read.(readlines(joinpath(dir, "tci_calls.jsonl")))
+        @test rows[2].pivot_reused
+        @test rows[2].pivot_source == "previous_fit"
+        @test rows[3].pivot_source == "orbital_group"
+        @test all(row -> row.native_batch && row.batch_calls > 0, rows)
+        @test all(row -> row.oracle_evaluations <= 64 && row.cache_evictions == 0, rows)
+        @test isfile(joinpath(dir, "cross-state.jls"))
+        bad = deserialize(joinpath(dir, "pivots.jls"))
+        bad["states"][1]["left"][1] = [[2]]
+        serialize(joinpath(dir, "bad.jls"), bad)
+        @test_throws ArgumentError Q.load_cross_state!(restored, joinpath(dir, "bad.jls"))
+    end
+end
+
+@testset "Endpoint batches retain fast evaluation and shared samples within budget" begin
+    R = 16
+    x, y = random_train(R, 3), random_train(R, 2)
+    rec = K.recorder(nothing, TCIOptions(environment_cache_bits = 8))
+    oracle = Q.block_oracle([x, y], rec)
+    f = Q.LinearSamples(oracle, ComplexF64[2, -im])
+    cached = Q.RecordedSamples(f, rec.options)
+    left, right = Q.bits.(0:31, 7), Q.bits.(0:31, 7)
+    indices = Q.slice_indices(R, left, right, Val(2))
+    ex, ey = Q.Evaluator(x; cachebits = 0), Q.Evaluator(y; cachebits = 0)
+    expected = map(j -> 2ex(j) - im * ey(j), indices)
+    @test Q.scalar_fastpath(f)
+    @test cached(left, right, Val(2)) ≈ expected atol = 2e-13
+    @test cached.evaluations == oracle.evaluations == length(indices)
+    @test cached.requests == length(indices)
+    before = oracle.evaluations
+    other = Q.RecordedSamples(Q.LinearSamples(oracle, ComplexF64[im, 0.5]), rec.options)
+    other(left, right, Val(2))
+    @test oracle.evaluations == before
+    @test Q.block_cache_stats(oracle).block_cache_evictions == 0
+    @test all(s -> s.frames === nothing, oracle.samples)
+    bounded = Q.BlockOracle([x, y]; cap = 7, cachebits = 8, dense_limit = 1 << 18, max_bytes = 1)
+    foreach(bounded, 0:15)
+    @test isempty(bounded.cache.values)
+    @test bounded.cache.evictions == 9
+    @test_throws ArgumentError K.validate(TCIOptions(orbital_cache_max_bytes = -1))
+end
+
+@testset "Orthogonalization and Ritz materialize once and preserve the occupied space" begin
+    mktempdir() do dir
+        R = 6
+        p = Problem(PeriodicGrid1D(R, 8.0), LocalPotential1D(0.0), ones(3))
+        cfg = K.solver_config(
+            p,
+            Accuracy(orbital_cap = 32, work_cap = 64, orthogonalization_tolerance = 1e-12),
+            SCFOptions(orthogonalize_threshold = 1e-9),
+        )
+        rec = K.recorder(dir, TCIOptions(environment_cache_bits = 3))
+        xs = [random_train(R, 2) for _ = 1:3]
+        xs[2] = Q.normalize(Q.add(xs[1], xs[2]; b = 0.7, tol = 0.0, cap = 32))
+        saved = deepcopy([x.c for x in xs])
+        X = hcat(values.(xs)...)
+        v = Q.cross(rec, R, j -> 0.3cos(2pi * j / 2^R); tol = 1e-13, cap = 16)
+        H = Q.Hamiltonian(
+            v,
+            Q.diagonal(v),
+            Q.circulant(Q.delta_tt(R, 1)),
+            Q.circulant(Q.delta_tt(R, 2^R - 1)),
+            K.spacing(p.grid),
+        )
+        A = Matrix(Diagonal(values(v) .+ 1 / H.h^2))
+        for j = 1:(2^R), offset in (-1, 1)
+            A[j, mod1(j + offset, 2^R)] -= 1 / (2H.h^2)
+        end
+        S = eigen(Hermitian(X' * X))
+        B = X * S.vectors * Diagonal(1 ./ sqrt.(S.values)) * S.vectors'
+        before = rec.calls
+        ys, defect, offdiag = Q.orthogonalize_ritz(xs, H, cfg, rec)
+        Y = hcat(values.(ys)...)
+        @test rec.calls - before == length(xs)
+        @test defect < 1e-9
+        @test offdiag > 0
+        @test Y' * Y ≈ I atol = 2e-10
+        @test Y * Y' ≈ B * B' atol = 2e-10
+        @test real.(diag(Y' * A * Y)) ≈ eigvals(Hermitian(B' * A * B)) atol = 2e-8
+        @test norm(Y' * A * Y - Diagonal(diag(Y' * A * Y))) < 2e-8
+        @test [x.c for x in xs] == saved
+        sampled_rec = K.recorder(nothing, TCIOptions(environment_cache_bits = 3))
+        projected = Q.ritz_projection(xs, H, cfg, sampled_rec; work_tol = 1e-12)
+        @test projected ≈ X' * A * X atol = 2e-8
+        @test sampled_rec.calls == length(xs)
+        field = Q.memoized_sample(H.potential, sampled_rec)
+        Q.ritz_projection(xs, H, cfg, sampled_rec; work_tol = 1e-12, potential = field)
+        before = field.evaluations
+        Q.ritz_projection(xs, H, cfg, sampled_rec; work_tol = 1e-12, potential = field)
+        @test field.evaluations == before
+        other_field = Q.memoized_sample(Q.scale(H.potential, 2), sampled_rec)
+        @test other_field.evaluations == 0
+        @test other_field(3) ≈ 2field(3)
+        sampled_result, sampled_defect, _ =
+            Q.orthogonalize_ritz(xs, H, cfg, sampled_rec; work_tol = 1e-12)
+        sampled_values = hcat(values.(sampled_result)...)
+        @test sampled_defect < 1e-9
+        @test sampled_values * sampled_values' ≈ B * B' atol = 2e-10
+        @test eigvals(Hermitian(sampled_values' * A * sampled_values)) ≈
+              eigvals(Hermitian(B' * A * B)) atol = 2e-8
+        close(rec)
+        events = JSON3.read.(readlines(joinpath(dir, "stages.jsonl")))
+        event = only(filter(e -> get(e, :event, "") == "orbital_transform", events))
+        @test event.coefficient_transforms >= 2
+        @test event.materialization_passes == 1
+        @test !event.post_fit_orthogonalization
+    end
+end
+
+@testset "Streamed slices preserve shapes, warm-start maxima and counters" begin
+    options = K.option_tuple(TCIOptions(environment_cache_bits = 8))
+    for dense in (0, 1 << 18), M in (0, 1, 2)
+        opts = merge(options, (; dense_cache_max_points = dense, scalar_cache_capacity = 7))
+        f = Q.sampled(j -> complex(j - 12, j % 3), 6)
+        a, b = Q.RecordedSamples(f, opts), Q.RecordedSamples(f, opts)
+        l, r = Q.bits.(0:3, 2), Q.bits.(0:((1 << (4 - M)) - 1), 4 - M)
+        expected =
+            expected_slice(complex.(collect(0:63) .- 12, collect(0:63) .% 3), 6, l, r, Val(M))
+        @test a(l, r, Val(M)) == expected
+        @test size(a(l, r, Val(M))) == size(expected)
+        for _ = 1:2
+            @test Q.maximum_slice(b, l, r, Val(M)) == maximum(abs, expected)
+        end
+        @test (a.requests, a.evaluations, a.batches, a.computed_batches, a.batch_evaluations) ==
+              (b.requests, b.evaluations, b.batches, b.computed_batches, b.batch_evaluations)
+        @test isempty(a(Vector{Int}[], [Int[]], Val(M)))
+        @test Q.maximum_slice(b, Vector{Int}[], [Int[]], Val(M)) == 0
+    end
+end
+
+@testset "Self Gram and packing metadata describe the actual stored orbitals" begin
+    xs, ys = [random_train(6, 2) for _ = 1:3], [random_train(6, 2) for _ = 1:2]
+    X, Y = hcat(values.(xs)...), hcat(values.(ys)...)
+    @test Q.gram(xs) ≈ X'X atol = 2e-13
+    @test Q.gram(xs, ys) ≈ X'Y atol = 2e-13
+    p = Problem(PeriodicGrid1D(6, 8.0), LocalPotential1D(0.0), ones(3))
+    cfg = K.solver_config(p, Accuracy(orbital_cap = 32), SCFOptions())
+    defect = norm(Q.gram(xs) - I)
+    packed, metadata = Q.pack_orbitals(xs, cfg; tol = 1e-10, input_gram_defect = defect)
+    @test metadata.packed_gram_defect ≈
+          norm(hcat(values.(packed)...)' * hcat(values.(packed)...) - I) atol = 2e-13
+    unchanged, zero_metadata = Q.pack_orbitals(xs, cfg; tol = 0.0, input_gram_defect = defect)
+    @test unchanged === xs
+    @test zero_metadata.packed_gram_defect == defect
+end
+end

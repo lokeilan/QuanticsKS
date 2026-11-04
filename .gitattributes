@@ -1,2 +1,2 @@
-# Preserve the original source bytes and frozen-snapshot SHA256 values.
-* -text
+# Keep source line endings explicit across platforms.
+* -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
