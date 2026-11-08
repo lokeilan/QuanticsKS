@@ -11,7 +11,7 @@ function train(R, cap; physical = 2)
         randn(rng, ComplexF64, bonds[k], physical, bonds[k + 1]) / sqrt(physical * bonds[k]) for
         k = 1:R
     ])
-    Q.scale(x, inv(sqrt(real(Q.inner_tci(x, x)))))
+    Q.scale(x, inv(sqrt(real(Q.inner(x, x)))))
 end
 
 function dense(x)
@@ -22,67 +22,7 @@ function dense(x)
     ]
 end
 
-struct ObservedScratch <: AbstractVector{Vector{ComplexF64}}
-    data::Vector{Vector{ComplexF64}}
-    tasks::Vector{Any}
-end
-Base.size(s::ObservedScratch) = size(s.data)
-function Base.getindex(s::ObservedScratch, i::Int)
-    s.tasks[i] = (; task = current_task(), pool = Threads.threadpool())
-    s.data[i]
-end
-
-@testset "Single direct inner uses bounded internal workers" begin
-    cfg = (; parallel_tasks = 0)
-    for cap in (16, 32, 48, 64)
-        x, y = train(16, cap), train(16, cap - 1)
-        saved = deepcopy((x.c, y.c))
-        reference = Q.inner(x, y)
-        @test Q.inner(x, y; cfg) ≈ reference atol = 2e-13
-        @test Q.inner(y, x; cfg) ≈ conj(reference) atol = 2e-13
-        @test Q.ttnorm(x; cfg) ≈ Q.ttnorm(x) atol = 2e-13
-        @test (x.c, y.c) == saved
-        nested = Q.independent_map(Any, 4, cfg) do i
-            (; value = Q.inner(x, y; cfg), workers = Q.inner_site_workers(x.c[8], y.c[8], cfg))
-        end
-        @test all(r -> r.value ≈ reference, nested)
-        if Threads.nthreads(:default) > 1
-            @test all(r -> r.workers == 1, nested)
-        end
-    end
-    large_x, large_y = train(16, 48), train(16, 48)
-    @test Q.inner_direct_workers(large_x, large_y, cfg) == min(Threads.nthreads(:default), 48)
-    @test Q.inner_direct_workers(train(16, 32), train(16, 32), cfg) == 1
-    gx = randn(rng, ComplexF64, 48, 2, 47)
-    gy = randn(rng, ComplexF64, 44, 2, 43)
-    input = randn(rng, ComplexF64, 48 * 44)
-    expected = zeros(ComplexF64, 47 * 43)
-    Q.inner_direct_site!(
-        expected,
-        input,
-        gx,
-        gy,
-        [zeros(ComplexF64, 2 * 44)],
-        (; parallel_tasks = 1),
-    )
-    for requested in (0, 2)
-        localcfg = (; parallel_tasks = requested)
-        workers = Q.inner_site_workers(gx, gy, localcfg)
-        scratch = ObservedScratch(
-            [zeros(ComplexF64, 2 * 44) for _ = 1:workers],
-            Vector{Any}(undef, workers),
-        )
-        actual = zeros(ComplexF64, 47 * 43)
-        Q.inner_direct_site!(actual, input, gx, gy, scratch, localcfg)
-        @test actual == expected
-        @test length(unique(s.task for s in scratch.tasks)) == workers
-        workers > 1 && @test all(s -> s.pool == :default, scratch.tasks)
-    end
-    @test Q.inner_site_workers(gx, gy, (; parallel_tasks = 1)) == 1
-    @test Q.inner_site_workers(zeros(ComplexF64, 2, 2, 2), zeros(ComplexF64, 2, 2, 2), cfg) == 1
-end
-
-@testset "Conditional inner contraction and independent calls" begin
+@testset "Library inner contraction and independent calls" begin
     for physical in (2, 3), R in (1, 2, 5)
         x, y = train(R, 3; physical), train(R, 5; physical)
         saved = deepcopy((x.c, y.c))
@@ -91,12 +31,8 @@ end
         @test (x.c, y.c) == saved
     end
     pairs = [(train(16, cap), train(16, cap)) for cap in (4, 16, 48, 64, 96)]
-    @test Q.inner_backend(pairs[3]...) == :direct
-    @test Q.inner_backend(pairs[4]...) == :tci
-    @test Q.inner_backend(pairs[5]...) == :tci
     push!(pairs, (last(pairs)[1], train(16, 1)))
-    @test Q.inner_backend(last(pairs)...) == :direct
-    expected = [Q.inner_tci(x, y) for (x, y) in pairs]
+    expected = [Q.inner(x, y) for (x, y) in pairs]
     actual = Q.independent_map(
         i -> Q.inner(pairs[i]...),
         ComplexF64,

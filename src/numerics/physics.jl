@@ -3,13 +3,13 @@
 using SpecialFunctions, QuadGK
 
 struct XCTable
-    logn::Vector{Float64}
-    e::Vector{Float64}
-    derivative::Vector{Float64}
+    log_density::Vector{Float64}
+    energy_density::Vector{Float64}
+    log_density_derivative::Vector{Float64}
     quadrature_rtol::Float64
 end
-function correlation(n)
-    rs = 1 / (2n)
+function correlation(rho)
+    rs = 1 / (2rho)
     A = 18.40
     C = 7.501
     D = 0.10185
@@ -22,19 +22,22 @@ function correlation(n)
     q = alpha * rs + beta * rs^m
     f = num / den
     fp = ((1 + 2E * rs) * den - num * (2C * rs + 3D * rs^2)) / den^2
-    eps = -0.5 * f * log1p(q)
-    deps = -0.5 * (fp * log1p(q) + f * (alpha + beta * m * rs^(m - 1)) / (1 + q))
-    n * eps, eps - rs * deps
+    epsilon_c = -0.5 * f * log1p(q)
+    derivative_rs = -0.5 * (fp * log1p(q) + f * (alpha + beta * m * rs^(m - 1)) / (1 + q))
+    rho * epsilon_c, epsilon_c - rs * derivative_rs
 end
-function xc_exact(n; rtol = 2e-11)
-    n = max(n, 1e-12)
-    q = pi * n
+function xc_exact(rho; rtol = 2e-11)
+    rho = max(rho, 1e-12)
+    q = pi * rho
     i0 = quadgk(t -> besselk(0, t), 0.0, q; rtol = rtol)[1]
-    i1 = 1 - q * besselk(1, q)
-    ex = -(q * i0 - i1) / pi^2
-    vx = -i0 / pi
-    ec, vc = correlation(n)
-    ex + ec, vx + vc
+    # Avoid cancellation in 1-q*K1(q); table derivatives amplify that noise at low density.
+    i1 =
+        q < 0.1 ? q^2 * quadgk(t -> t * besselk(0, q * t), 0.0, 1.0; rtol)[1] :
+        1 - q * besselk(1, q)
+    exchange_energy = -(q * i0 - i1) / pi^2
+    Vexchange = -i0 / pi
+    correlation_energy, Vcorrelation = correlation(rho)
+    exchange_energy + correlation_energy, Vexchange + Vcorrelation
 end
 function XCTable(;
     npoints = 2048,
@@ -43,38 +46,40 @@ function XCTable(;
     rtol = 2e-11,
     parallel_tasks = 1,
 )
-    grid = collect(range(log(density_min), log(density_max); length = npoints))
-    es = Vector{Float64}(undef, npoints)
-    ds = Vector{Float64}(undef, npoints)
+    log_density = collect(range(log(density_min), log(density_max); length = npoints))
+    energy_density = Vector{Float64}(undef, npoints)
+    log_density_derivative = Vector{Float64}(undef, npoints)
     foreach_independent(npoints, (; parallel_tasks)) do i
-        n = exp(grid[i])
-        e, v = xc_exact(n; rtol)
-        es[i] = e
-        ds[i] = n * v
+        rho = exp(log_density[i])
+        exc, Vxc = xc_exact(rho; rtol)
+        energy_density[i] = exc
+        log_density_derivative[i] = rho * Vxc
     end
-    XCTable(grid, es, ds, rtol)
+    XCTable(log_density, energy_density, log_density_derivative, rtol)
 end
-function xc(tab::XCTable, n)
-    n = max(real(n), 1e-12)
-    t = log(n)
-    if t < tab.logn[1] || t > tab.logn[end]
-        return xc_exact(n; rtol = tab.quadrature_rtol)
+function xc(table::XCTable, rho)
+    rho = max(real(rho), 1e-12)
+    log_rho = log(rho)
+    if log_rho < table.log_density[1] || log_rho > table.log_density[end]
+        return xc_exact(rho; rtol = table.quadrature_rtol)
     end
-    h = tab.logn[2] - tab.logn[1]
-    i = clamp(floor(Int, (t - tab.logn[1]) / h) + 1, 1, length(tab.e) - 1)
-    s = (t - tab.logn[i]) / h
-    e0 = tab.e[i]
-    e1 = tab.e[i + 1]
-    d0 = tab.derivative[i]
-    d1 = tab.derivative[i + 1]
-    e =
+    h = table.log_density[2] - table.log_density[1]
+    i = clamp(
+        floor(Int, (log_rho - table.log_density[1]) / h) + 1,
+        1,
+        length(table.energy_density) - 1,
+    )
+    s = (log_rho - table.log_density[i]) / h
+    e0, e1 = table.energy_density[i], table.energy_density[i + 1]
+    d0, d1 = table.log_density_derivative[i], table.log_density_derivative[i + 1]
+    energy_density =
         (2s^3 - 3s^2 + 1) * e0 +
         (s^3 - 2s^2 + s) * h * d0 +
         (-2s^3 + 3s^2) * e1 +
         (s^3 - s^2) * h * d1
     dp =
         ((6s^2 - 6s) * e0 + (3s^2 - 4s + 1) * h * d0 + (-6s^2 + 6s) * e1 + (3s^2 - 2s) * h * d1) / h
-    e, dp / n
+    energy_density, dp / rho
 end
 const IMAGE_ZETA = [zeta(2m + 1) for m = 1:28]
 "Smooth periodic soft Coulomb: symmetric image sum with 2/(mL) constants subtracted."
@@ -97,6 +102,3 @@ function soft(x, L)
     end
     inv(r) + 2tail / L
 end
-vext(x, L, natoms, spacing) = -sum(soft(x - spacing * A, L) for A = 0:(natoms - 1))
-nuclear_energy(L, natoms, spacing) =
-    sum(soft(spacing * (A - B), L) for A = 0:(natoms - 1) for B = 0:(A - 1))

@@ -138,8 +138,8 @@ end
     @test serial(left, right, Val(2)) == threaded(left, right, Val(2))
     serial_table = Q.XCTable(npoints = 16)
     threaded_table = Q.XCTable(npoints = 16, parallel_tasks = 0)
-    @test serial_table.e == threaded_table.e
-    @test serial_table.derivative == threaded_table.derivative
+    @test serial_table.energy_density == threaded_table.energy_density
+    @test serial_table.log_density_derivative == threaded_table.log_density_derivative
 end
 
 @testset "Fixed-H methods, strict output Ritz, refinement and propagation" begin

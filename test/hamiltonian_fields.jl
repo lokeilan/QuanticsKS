@@ -58,6 +58,31 @@ end
     )
 end
 
+@testset "Independent periodic QTT low-pass action" begin
+    R = 5
+    grid = PeriodicGrid1D(R, 4.0)
+    p = Problem(grid, LocalPotential1D(0.0), [1, 1]; mass = 1.7)
+    h = K.spacing(grid) * sqrt(p.mass)
+    cutoff = 3.0
+    filter = lowpass_mpo(p; cutoff)
+    T = kinetic(R, h)
+    expected = inv(I + (T / cutoff)^2)
+    @test norm(dense_mpo(filter.cores) - expected) < 1e-11
+
+    base = Q.normalize(Q.constant_tt(R))
+    xs = [Q.add(base, Q.phase_tt(base, length(grid) ÷ 2); b = 0.3im), Q.phase_tt(base, 3)]
+    X = hcat(values.(xs)...)
+    state = OrbitalState(p, xs; time = 0.5)
+    filtered = apply_lowpass(filter, state; tol = 1e-13, cap = 32, parallel_tasks = 0)
+    Y = hcat(values.(filtered.orbitals)...)
+    @test norm(Y - expected * X) < 1e-11
+    @test norm(Y[:, 2]) < norm(X[:, 2])
+    @test hcat(values.(state.orbitals)...) == X
+    @test filtered.time == state.time
+    @test_throws ArgumentError lowpass_mpo(grid; cutoff = 0)
+    @test_throws ArgumentError apply_lowpass(lowpass_mpo(grid; cutoff), state)
+end
+
 @testset "Frozen density, fused local sources, and core field projections" begin
     Random.seed!(20261103)
     R = 6
@@ -151,7 +176,7 @@ end
     close(rec)
 end
 
-@testset "TCI post-fit rounding uses the configured factor" begin
+@testset "TCI construction and optional post-fit rounding" begin
     mktempdir() do dir
         rec = K.recorder(dir, TCIOptions())
         f(j) = exp(0.2cos(2pi * j / 64)) + 0.1im * sin(4pi * j / 64)
@@ -177,14 +202,14 @@ end
         @test norm(values(x) - f.(0:63)) < 1e-8
         @test norm(values(y) - f.(0:63)) < 1e-8
         @test norm(values(raw) - f.(0:63)) < 1e-8
-        for g in x.c[2:end]
+        for g in y.c[2:end]
             A = reshape(g, size(g, 1), :)
             @test norm(A * A' - I) < 2e-12
         end
         close(rec)
         rows = JSON3.read.(readlines(joinpath(dir, "tci_calls.jsonl")))
-        @test rows[1].post_rounding_seconds >= 0.0
-        @test rows[1].post_rounding_tolerance ≈ 1e-11
+        @test rows[1].post_rounding_seconds == 0.0
+        @test rows[1].post_rounding_tolerance === nothing
         @test rows[2].post_rounding_tolerance == 1e-12
         @test rows[3].post_rounding_tolerance === nothing
         @test rows[3].post_rounding_seconds == 0.0

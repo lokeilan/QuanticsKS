@@ -4,6 +4,8 @@ version = "0.1.0"
 
 [deps]
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+ITensorMPS = "0d1a4710-d33b-49a5-8f18-73bdf49b47e2"
+ITensors = "9136182c-28ba-11e9-034c-db9fb085ebd5"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
@@ -12,17 +14,19 @@ Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
+TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 TensorCrossInterpolation = "b261b2ec-6378-4871-b32e-9173bb050604"
 TensorOperations = "6aa20fa7-93e2-5fca-9bc0-fbd0db3c71a2"
-TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 
 [compat]
-julia = "1.12"
+ITensorMPS = "0.3.45"
+ITensors = "0.9.32"
 JSON3 = "1.14"
 QuadGK = "2.11"
 SpecialFunctions = "2.9"
 TensorCrossInterpolation = "0.9.19"
 TensorOperations = "5.8"
+julia = "1.12"
 
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"

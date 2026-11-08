@@ -1,0 +1,31 @@
+# Small-grid execution check; not a continuum helium benchmark.
+[run]
+kind = "scf"
+blas_threads = 1
+
+[grid]
+dimensions = 3
+R = 2
+cell = [8.0, 8.0, 8.0]
+
+[system]
+kind = "all_electron"
+positions = [[0.0, 0.0, 0.0]]
+charges = [2.0]
+occupations = [2.0]
+xc = "pz81"
+
+[accuracy]
+orbital_cap = 16
+field_cap = 32
+work_cap = 32
+work_tolerance = 1e-9
+storage_tolerance = 1e-11
+
+[scf]
+criterion = "strict"
+max_iterations = 50
+energy_tolerance = 1e-8
+eigen_tolerance = 1e-6
+density_tolerance = 1e-6
+mixing = 0.5

@@ -1,6 +1,7 @@
 # Fresh processes keep each suite's module aliases and random seeds independent.
 const TEST_PROJECT = dirname(Base.active_project())
 for (file, threads) in (
+    ("three_dimensional.jl", "1"),
     ("library.jl", "1"),
     ("configuration.jl", "1"),
     ("julia_parallel.jl", "1"),
@@ -15,4 +16,4 @@ for (file, threads) in (
         `$(Base.julia_cmd()) --startup-file=no --threads=$threads --project=$TEST_PROJECT $(joinpath(@__DIR__, file))`,
     )
 end
-println("One-dimensional regression completed.")
+println("Numerical regression completed.")

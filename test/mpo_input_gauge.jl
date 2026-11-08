@@ -59,9 +59,9 @@ end
     @test norm(values(actual) - expected) / norm(expected) < 1e-8
     @test changed.c == saved
     canonical = Q.right_canonical(changed)
-    explicit = Q.apply_mpo(green, canonical; tol = 1e-12, cap = 16, input_right_canonical = true)
+    explicit = Q.apply_mpo(green, canonical; tol = 1e-12, cap = 16)
     @test norm(values(explicit) - values(actual)) / norm(values(actual)) < 1e-10
-    restored = Q.apply_mpo(green, rhs; tol = 1e-12, cap = 16, input_right_canonical = true)
+    restored = Q.apply_mpo(green, rhs; tol = 1e-12, cap = 16)
     @test norm(values(restored) - expected) / norm(expected) < 1e-8
     @test norm(values(restored) - values(Q.apply_mpo(green, rhs; tol = 1e-12, cap = 16))) /
           norm(values(restored)) < 1e-10

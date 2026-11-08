@@ -1,16 +1,16 @@
 # Observe states and postprocess saved results, sampling orbitals on the requested output grid.
 
-function observe_state(state, ops, a, rec; drive = NoDrive())
-    p = state.problem
-    xs = state.orbitals
-    g = p.grid
-    S = Q.gram(xs; cfg = rec.options)
+function observe_state(state, ops, accuracy, rec; drive = NoDrive())
+    problem = state.problem
+    orbitals = state.orbitals
+    grid = problem.grid
+    S = Q.gram(orbitals; cfg = rec.options)
     norms = real.(diag(S))
-    n = density(p, xs, a, rec)
-    energy = total_energy(p, xs, n, ops, a, rec; time = state.time, drive)
-    charge = sum(p.occupations .* norms)
-    q = Q.phase_tt(Q.constant_tt(g.R), -1)
-    moment = spacing(g) * Q.inner(q, n; cfg = rec.options) / sum(p.occupations)
+    rho = density(problem, orbitals, accuracy, rec)
+    energy = total_energy(problem, orbitals, rho, ops, accuracy, rec; time = state.time, drive)
+    charge = sum(problem.occupations .* norms)
+    q = Q.phase_tt(Q.constant_tt(grid.R), -1)
+    moment = spacing(grid) * Q.inner(q, rho; cfg = rec.options) / sum(problem.occupations)
     (;
         time = state.time,
         energy,
@@ -19,8 +19,8 @@ function observe_state(state, ops, a, rec; drive = NoDrive())
         gram_defect = norm(S - I),
         periodic_cosine = real(moment),
         periodic_sine = imag(moment),
-        max_bond_dimension = maximum(Q.rank.(xs)),
-        orbital_bytes = sum(Q.storage, xs),
+        max_bond_dimension = maximum(Q.rank.(orbitals)),
+        orbital_bytes = sum(Q.storage, orbitals),
     )
 end
 function observe(
@@ -31,11 +31,11 @@ function observe(
     drive = NoDrive(),
     parallel_tasks = 1,
 )
-    a = validate(accuracy)
+    validate(accuracy)
     validate(drive)
     rec = recorder(nothing, tci; parallel_tasks)
-    ops = build_operators(state.problem, a, rec, physics)
-    observe_state(state, ops, a, rec; drive)
+    ops = build_operators(state.problem, accuracy, rec, physics)
+    observe_state(state, ops, accuracy, rec; drive)
 end
 "Postprocess a completed run without changing snapshots. Custom potential models must be supplied."
 function postprocess(
@@ -85,18 +85,22 @@ function postprocess(
         throw(ArgumentError("Final checkpoint problem mismatch"))
     last(rows).time != final.time && push!(rows, observe_state(final, ops, accuracy, rec; drive))
     write_json(joinpath(out, "trajectory.json"), rows)
-    p = final.problem
-    g = p.grid
-    h = spacing(g)
+    problem = final.problem
+    grid = problem.grid
+    dx = volume_element(grid)
     oracle = Q.BlockOracle(
         final.orbitals;
         cap = tci.orbital_cache_capacity,
         cachebits = tci.environment_cache_bits,
     )
     open(joinpath(out, "density.csv"), "w") do io
-        println(io, "x,density")
-        for j in unique(round.(Int, range(0, length(g) - 1; length = min(samples, length(g)))))
-            println(io, "$(j*h),$(sum(p.occupations.*abs2.(oracle(j)))/h)")
+        println(io, grid isa BoxGrid3D ? "x,y,z,density" : "x,density")
+        count = min(samples, length(grid))
+        for index = 0:(count - 1)
+            j = round(Int, (big(length(grid)) - 1) * index // (count - 1))
+            position = grid_position(grid, j)
+            coordinates = position isa Tuple ? join(position, ",") : string(position)
+            println(io, "$coordinates,$(sum(problem.occupations.*abs2.(oracle(j)))/dx)")
         end
     end
     cap =
@@ -111,7 +115,7 @@ function postprocess(
     open(joinpath(out, "bond_profiles.csv"), "w") do io
         println(io, "orbital,bond_index,bond_dimension,algebraic_cap,code_cap")
         for i in axes(profiles, 1), k in axes(profiles, 2)
-            println(io, "$i,$k,$(profiles[i,k]),$(2^min(k,g.R-k)),$cap")
+            println(io, "$i,$k,$(profiles[i,k]),$(2^min(k,nsites(grid)-k)),$cap")
         end
     end
     write_json(

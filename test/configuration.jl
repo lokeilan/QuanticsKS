@@ -62,6 +62,12 @@ end
         )
         @test !TOML.parse(plan_text)["calculation_started"]
         @test JSON3.read(read(joinpath(out, "status.json"), String)).iterations == 1
+        status = JSON3.read(read(joinpath(out, "status.json"), String))
+        inner = JSON3.read(only(readlines(joinpath(out, "lrrap.jsonl"))))
+        @test status.final.stored_max_rank == maximum(K.Q.rank.(state.orbitals))
+        @test status.final.max_rank == status.final.stored_max_rank
+        @test status.final.inner_output_max_rank == inner.max_rank
+        @test status.final.orbital_rank_before_pack == inner.inner_output_max_rank
 
         resumed = deepcopy(settings)
         resumed["run"]["checkpoint"] = "scf/checkpoint.jls"

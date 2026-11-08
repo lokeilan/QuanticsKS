@@ -6,28 +6,28 @@ struct TimeResult
     completed_steps::Int
     elapsed_seconds::Float64
 end
-function potential_half_step(p, xs, ops, a, rec, t, drive, options)
-    n = density(p, xs, a, rec)
-    v = local_potential_samples(p, n, ops, a, rec; time = t, drive)
-    v = Q.synchronized(v)
-    Q.recorded_map(Q.QTT, length(xs), options, rec) do i, localrec
-        e = Q.evaluate(xs[i], localrec)
+function potential_half_step(problem, orbitals, ops, accuracy, rec, t, drive, options)
+    rho = density(problem, orbitals, accuracy, rec)
+    Veff = local_potential_samples(problem, rho, ops, accuracy, rec; time = t, drive)
+    Veff = Q.synchronized(Veff)
+    Q.recorded_map(Q.QTT, length(orbitals), options, rec) do i, localrec
+        e = Q.evaluate(orbitals[i], localrec)
         Q.cross(
             localrec,
-            p.grid.R,
-            j -> cis(-options.dt * real(v(j)) / 2) * e(j);
+            problem.grid.R,
+            j -> cis(-options.dt * real(Veff(j)) / 2) * e(j);
             tol = options.phase_tolerance,
             cap = options.phase_cap,
             label = "potential_phase_$i",
         )
     end
 end
-function kinetic_step(xs, green, mu, t, rec)
-    Q.recorded_map(Q.QTT, length(xs), t, rec) do i, localrec
-        x = xs[i]
+function kinetic_step(orbitals, green, mu, t, rec)
+    Q.recorded_map(Q.QTT, length(orbitals), t, rec) do i, localrec
+        psi = orbitals[i]
         Q.add(
-            Q.apply_mpo(green, x; tol = t.kinetic_tolerance, cap = t.kinetic_cap),
-            x;
+            Q.apply_mpo(green, psi; tol = t.kinetic_tolerance, cap = t.kinetic_cap),
+            psi;
             a = 2mu,
             b = -1,
             tol = t.output_tolerance,
@@ -47,27 +47,29 @@ function propagate(
     physics = PhysicsNumerics(),
     output = nothing,
 )
+    initial.problem.grid isa BoxGrid3D &&
+        throw(ArgumentError("3D real-time propagation is not implemented; use ground_state"))
     validate(time)
     validate(drive)
-    a = validate(accuracy)
+    validate(accuracy)
     validate(tci)
     validate(physics)
     t0 = time_ns()
     Random.seed!(time.seed)
-    p = initial.problem
-    dir = prepare_run(output, "propagation", p; accuracy = a, time, tci, physics)
+    problem = initial.problem
+    dir = prepare_run(output, "propagation", problem; accuracy = accuracy, time, tci, physics)
     dir === nothing || write_json(joinpath(dir, "drive.json"), drive_descriptor(drive))
     rec = recorder(dir, tci; parallel_tasks = time.parallel_tasks)
     io = run_io(dir, "observations.jsonl")
     try
-        ops = build_operators(p, a, rec, physics)
+        ops = build_operators(problem, accuracy, rec, physics)
         mu = 2 / (im * time.dt)
-        green = Q.green_mpo(p.grid.R, spacing(p.grid) * sqrt(p.mass), mu)
+        green = Q.green_mpo(problem.grid.R, spacing(problem.grid) * sqrt(problem.mass), mu)
         state = initial
         observations = Any[]
         S0 = Q.gram(initial.orbitals; cfg = time)
         norm0 = real.(diag(S0))
-        row = observe_state(state, ops, a, rec; drive)
+        row = observe_state(state, ops, accuracy, rec; drive)
         push!(observations, merge((step = 0,), row))
         Q.event!(io, last(observations))
         dir === nothing || save_checkpoint(joinpath(dir, "snapshots", "step-000000.jls"), state)
@@ -75,11 +77,12 @@ function propagate(
         for k = 1:(time.steps)
             rec.scf = k
             mid = initial.time + (k - 0.5) * time.dt
-            xs = potential_half_step(p, state.orbitals, ops, a, rec, mid, drive, time)
-            xs = kinetic_step(xs, green, mu, time, rec)
-            xs = potential_half_step(p, xs, ops, a, rec, mid, drive, time)
-            state = OrbitalState(p, xs; time = initial.time + k * time.dt)
-            S = Q.gram(xs; cfg = time)
+            orbitals =
+                potential_half_step(problem, state.orbitals, ops, accuracy, rec, mid, drive, time)
+            orbitals = kinetic_step(orbitals, green, mu, time, rec)
+            orbitals = potential_half_step(problem, orbitals, ops, accuracy, rec, mid, drive, time)
+            state = OrbitalState(problem, orbitals; time = initial.time + k * time.dt)
+            S = Q.gram(orbitals; cfg = time)
             nd = maximum(abs.(real.(diag(S)) .- norm0))
             gd = norm(S - S0)
             nd <= time.norm_drift_limit && gd <= time.gram_drift_limit || error(
@@ -89,7 +92,7 @@ function propagate(
             if k % time.observe_every == 0 || k == time.steps
                 row = merge(
                     (step = k, norm_drift = nd, gram_drift = gd),
-                    observe_state(state, ops, a, rec; drive),
+                    observe_state(state, ops, accuracy, rec; drive),
                 )
                 push!(observations, row)
                 Q.event!(io, row)

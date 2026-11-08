@@ -1,0 +1,39 @@
+# Rakhuba and Oseledets, arXiv:1508.07632, Section 8.5.
+# Physical distance: 2 angstrom = 3.7794522492515404 bohr.
+# R, padding, rank limits, and stopping settings below are implementation choices.
+[run]
+kind = "scf"
+blas_threads = 1
+
+[grid]
+dimensions = 3
+R = 7
+
+[system]
+kind = "hydrogen_cluster"
+shape = [3, 2, 2]
+distance = 3.7794522492515404
+padding = 10.0
+xc = "pz81"
+
+[accuracy]
+orbital_cap = 64
+field_cap = 80
+work_cap = 128
+work_tolerance = 1e-6
+storage_tolerance = 1e-8
+
+[scf]
+criterion = "strict"
+max_iterations = 100
+mixing = 0.3
+energy_tolerance = 1e-6
+eigen_tolerance = 1e-4
+density_tolerance = 1e-4
+
+[physics]
+green_relative_tolerance = 1e-7
+green_max_iterations = 500
+
+[tci]
+require_convergence = true

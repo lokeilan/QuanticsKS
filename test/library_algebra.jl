@@ -23,6 +23,8 @@ values(x) = [
         @test Q.inner(y, x) ≈ conj(Q.inner(x, y))
         @test Q.inner(Q.scale(x, 2 + im), y) ≈ (2 - im) * dot(vx, vy)
         @test Q.ttnorm(x) ≈ norm(vx)
+        @test sum(Q.tensortrain(x)) ≈ sum(vx)
+        @test iszero(sum(Q.tensortrain(Q.constant_tt(R, 0))))
         @test iszero(Q.inner(Q.constant_tt(R, 0), y))
         @test iszero(Q.inner(Q.delta_tt(R, 0), Q.delta_tt(R, 1)))
         @test Q.gram([x, y]) ≈ hcat(vx, vy)' * hcat(vx, vy)
@@ -30,6 +32,35 @@ values(x) = [
         @test x.c == saved_x
         @test y.c == saved_y
     end
+end
+
+@testset "Expression Gram matrices and cancellation in amplitude space" begin
+    x, y, z = [random_train(4) for _ = 1:3]
+    coefficients = ComplexF64[1 im; -2im 0.5; 0.25 -1]
+    expressions = [Q.linear_expression((x, y, z), c) for c in eachcol(coefficients)]
+    amplitudes = hcat(values.((x, y, z))...) * coefficients
+    @test Q.expression_gram(expressions) ≈ amplitudes' * amplitudes rtol = 1e-12
+    zero = Q.linear_expression((x, x), (1, -1))
+    @test iszero(only(Q.expression_gram([zero])))
+
+    # Contract the stored cores in high precision to resolve a tiny difference.
+    x = Q.constant_tt(4)
+    y = Q.QTT(deepcopy(x.c))
+    y.c[end][1, 1, 1] += 1e-10
+    dense_values(psi) = [
+        only(
+            prod(
+                Complex{BigFloat}.(core[:, ((j >> (k - 1)) & 1) + 1, :]) for
+                (k, core) in enumerate(psi.c)
+            ),
+        ) for j = 0:15
+    ]
+    residual = dense_values(x) - dense_values(y)
+    expression = Q.linear_expression((x, y), (1, -1))
+    squared_norm = real(only(Q.expression_gram([expression])))
+    @test squared_norm > 0
+    @test squared_norm ≈ Float64(sum(abs2, residual)) rtol = 1e-4
+    @test Q.difference_norm(x, y) ≈ Float64(norm(residual)) rtol = 1e-4
 end
 
 @testset "Library TT adapters and bounded point evaluation" begin
@@ -139,9 +170,12 @@ end
     saved = deepcopy(x.c)
     v = values(x)
     shift = Q.circulant(Q.delta_tt(5, 1))
-    for algorithm in (:zipup, :naive)
+    for algorithm in (:zipup, :naive, :TCI)
         result = Q.apply_mpo(shift, x; tol = 1e-10, cap = 16, algorithm)
         @test values(result) ≈ circshift(v, 1) rtol = 1e-8
+        limited = Q.apply_mpo(shift, x; tol = 1e-10, cap = 1, algorithm)
+        @test Q.rank(limited) == 1
+        @test all(g -> all(isfinite, g), limited.c)
     end
     field = random_train(5)
     @test values(Q.apply_mpo(Q.diagonal(field), x; cap = 32)) ≈ values(field) .* v rtol = 1e-8
@@ -159,6 +193,29 @@ end
     end
     @test all(isfinite, Q.project(frame, x))
     @test x.c == saved
+end
+
+@testset "ITensor matrix elements and sampling RNG isolation" begin
+    for R in (1, 2, 5)
+        bra, ket, field = [random_train(R) for _ = 1:3]
+        @test Q.inner_mpo(bra, Q.diagonal(field), ket) ≈
+              dot(values(bra), values(field) .* values(ket)) rtol = 1e-11
+    end
+    saved_rng = copy(Random.default_rng())
+    try
+        Random.seed!(812)
+        expected = rand(8)
+        Random.seed!(812)
+        x = random_train(5)
+        w = Q.shift_mpo(5)
+        Q.inner_mpo(x, w, x)
+        Q.right_canonical(x)
+        Q.canonical_frame(x)
+        Q.apply_mpo(w, x)
+        @test rand(8) == expected
+    finally
+        copy!(Random.default_rng(), saved_rng)
+    end
 end
 
 @testset "SVD MPO contraction boundaries" begin

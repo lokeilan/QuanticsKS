@@ -2,25 +2,30 @@
 
 # The two concrete models share grid operators and solvers. Model-specific
 # interactions live here, not in the SCF or propagation loops.
-kernel_value(m::SoftCoulombLSDA1D, x, L) =
-    m.coupling * Q.soft(x / m.softening, L / m.softening) / m.softening
-external_value(m::SoftCoulombLSDA1D, x, L) =
-    -sum(z * kernel_value(m, x - a, L) for (a, z) in zip(m.positions, m.charges))
-function external_value(m::LocalPotential1D, x, L)
-    value = m.potential(x)
+kernel_value(model::SoftCoulombLSDA1D, x, L) =
+    model.coupling * Q.soft(x / model.softening, L / model.softening) / model.softening
+external_value(model::SoftCoulombLSDA1D, x, L) =
+    -sum(
+        charge * kernel_value(model, x - position, L) for
+        (position, charge) in zip(model.positions, model.charges)
+    )
+function external_value(model::LocalPotential1D, x, L)
+    value = model.potential(x)
     isreal(value) && isfinite(value) ||
         throw(ArgumentError("A finite real local potential is required"))
     real(value)
 end
-nuclear_energy(m::LocalPotential1D, L) = 0.0
-nuclear_energy(m::SoftCoulombLSDA1D, L) = sum(
+nuclear_energy(model::LocalPotential1D, L) = 0.0
+nuclear_energy(model::SoftCoulombLSDA1D, L) = sum(
     (
-        m.charges[a] * m.charges[b] * kernel_value(m, m.positions[a] - m.positions[b], L) for
-        a in eachindex(m.positions) for b = 1:(a - 1)
+        model.charges[i] *
+        model.charges[j] *
+        kernel_value(model, model.positions[i] - model.positions[j], L) for
+        i in eachindex(model.positions) for j = 1:(i - 1)
     );
     init = 0.0,
 )
-has_xc(m) = m isa SoftCoulombLSDA1D && m.xc == :lsda
+has_xc(model) = model isa SoftCoulombLSDA1D && model.xc == :lsda
 
 struct Operators{W,T,S}
     external::Q.QTT
@@ -31,46 +36,47 @@ struct Operators{W,T,S}
     external_samples::S
     nuclear::Float64
 end
-function build_operators(p, a, rec, physics::PhysicsNumerics)
+function build_operators(problem, accuracy, rec, physics::PhysicsNumerics)
     validate(physics)
-    g = p.grid
-    h = spacing(g)
-    N = length(g)
+    grid = problem.grid
+    dx = spacing(grid)
+    ngrid = length(grid)
     pivots =
-        p.model isa SoftCoulombLSDA1D ? round.(Int, mod.(p.model.positions, g.L) ./ h) .% N : Int[]
-    model = deepcopy(p.model)
+        problem.model isa SoftCoulombLSDA1D ?
+        round.(Int, mod.(problem.model.positions, grid.L) ./ dx) .% ngrid : Int[]
+    model = deepcopy(problem.model)
     external_samples =
-        Q.memoized_sample(Q.sampled(j -> external_value(model, j * h, g.L), g.R), rec)
+        Q.memoized_sample(Q.sampled(j -> external_value(model, j * dx, grid.L), grid.R), rec)
     built = Q.recorded_map(Any, 2, rec.options, rec) do item, localrec
         if item == 1
-            p.model isa LocalPotential1D && p.model.potential isa ConstantPotential ?
-            Q.constant_tt(g.R, p.model.potential.value) :
+            problem.model isa LocalPotential1D && problem.model.potential isa ConstantPotential ?
+            Q.constant_tt(grid.R, problem.model.potential.value) :
             Q.cross(
                 localrec,
-                g.R,
+                grid.R,
                 external_samples;
-                tol = a.external_tolerance,
-                cap = a.field_cap,
+                tol = accuracy.external_tolerance,
+                cap = field_caps(accuracy).external_cap,
                 label = "external",
                 pivots,
             )
         else
-            p.model isa SoftCoulombLSDA1D ?
+            problem.model isa SoftCoulombLSDA1D ?
             Q.circulant(
                 Q.cross(
                     localrec,
-                    g.R,
-                    j -> kernel_value(p.model, j * h, g.L);
-                    tol = a.kernel_tolerance,
-                    cap = a.field_cap,
+                    grid.R,
+                    j -> kernel_value(problem.model, j * dx, grid.L);
+                    tol = accuracy.kernel_tolerance,
+                    cap = field_caps(accuracy).kernel_cap,
                     label = "interaction",
                 ),
             ) : nothing
         end
     end
-    external, w = built
-    tab =
-        has_xc(p.model) ?
+    external, interaction = built
+    xc_table =
+        has_xc(problem.model) ?
         Q.XCTable(
             npoints = physics.xc_table_points,
             density_min = physics.xc_density_min,
@@ -80,51 +86,56 @@ function build_operators(p, a, rec, physics::PhysicsNumerics)
         ) : nothing
     Operators(
         external,
-        w,
-        tab,
-        Q.shift_mpo(g.R, 1),
-        Q.shift_mpo(g.R, -1),
+        interaction,
+        xc_table,
+        Q.shift_mpo(grid.R, 1),
+        Q.shift_mpo(grid.R, -1),
         external_samples,
-        nuclear_energy(model, g.L),
+        nuclear_energy(model, grid.L),
     )
 end
-# Cores store sqrt(h)*psi, so divide by h to recover physical density.
-function density(p, xs, a, rec; renormalize = false, label = "density")
-    h = spacing(p.grid)
-    o = Q.block_oracle(xs, rec)
-    n = Q.cross(
+# Cores store sqrt(dV)*psi, so divide by the volume element to recover density.
+function density(problem, orbitals, accuracy, rec; renormalize = false, label = "density")
+    dx = volume_element(problem.grid)
+    orbital_samples = Q.block_oracle(orbitals, rec)
+    rho = Q.cross(
         rec,
-        p.grid.R,
-        Q.DensitySamples(o, Float64.(p.occupations ./ h));
-        tol = a.density_tolerance,
-        cap = a.field_cap,
+        nsites(problem.grid),
+        Q.DensitySamples(orbital_samples, Float64.(problem.occupations ./ dx));
+        tol = accuracy.density_tolerance,
+        cap = field_caps(accuracy).density_cap,
         label,
     )
     if renormalize
-        charge = h * real(Q.inner(Q.constant_tt(p.grid.R), n; cfg = rec.options))
+        charge = dx * real(sum(Q.tensortrain(rho)))
         charge > 0 || error("Nonpositive density integral")
-        return Q.scale(n, sum(p.occupations) / charge)
+        return Q.scale(rho, sum(problem.occupations) / charge)
     end
-    n
+    rho
 end
-# Multiply the cyclic convolution by h once to obtain the spatial integral.
-hartree(n, p, ops, a) =
-    ops.interaction === nothing ? Q.constant_tt(p.grid.R, 0) :
+# Multiply the cyclic convolution by dx once to obtain the spatial integral.
+hartree(rho, problem, ops, accuracy) =
+    ops.interaction === nothing ? Q.constant_tt(problem.grid.R, 0) :
     Q.scale(
-        Q.apply_mpo(ops.interaction, n; tol = a.algebra_tolerance, cap = a.field_cap),
-        spacing(p.grid),
+        Q.apply_mpo(
+            ops.interaction,
+            rho;
+            tol = accuracy.algebra_tolerance,
+            cap = field_caps(accuracy).hartree_cap,
+        ),
+        spacing(problem.grid),
     )
 "Freeze one density and share its Hartree/XC expression across local consumers."
-function local_potential_samples(p, n, ops, a, rec; time = 0.0, drive = NoDrive())
-    if p.model isa LocalPotential1D && drive isa NoDrive
+function local_potential_samples(problem, rho, ops, accuracy, rec; time = 0.0, drive = NoDrive())
+    if problem.model isa LocalPotential1D && drive isa NoDrive
         return ops.external_samples
     end
     # Hartree and XC read the same immutable SCF input, never updated orbitals.
-    frozen_density = Q.QTT([copy(g) for g in n.c])
-    vh = hartree(frozen_density, p, ops, a)
-    en = Q.memoized_sample(frozen_density, rec)
-    eh = Q.memoized_sample(vh, rec)
-    h = spacing(p.grid)
+    frozen_density = Q.QTT([copy(core) for core in rho.c])
+    Vhartree = hartree(frozen_density, problem, ops, accuracy)
+    rho_samples = Q.memoized_sample(frozen_density, rec)
+    hartree_samples = Q.memoized_sample(Vhartree, rec)
+    dx = spacing(problem.grid)
     Q.memoized_sample(
         Q.pointwise(
             (external, hartree, density, drive) ->
@@ -132,86 +143,95 @@ function local_potential_samples(p, n, ops, a, rec; time = 0.0, drive = NoDrive(
                 (ops.xc_table === nothing ? 0.0 : Q.xc(ops.xc_table, real(density))[2]) +
                 drive,
             ops.external_samples,
-            eh,
-            en,
-            Q.sampled(j -> drive_value(drive, j * h, time, p.grid.L), p.grid.R),
+            hartree_samples,
+            rho_samples,
+            Q.sampled(j -> drive_value(drive, j * dx, time, problem.grid.L), problem.grid.R),
         ),
         rec,
     )
 end
 
-function effective_hamiltonian(p, n, ops, a, rec; time = 0.0, drive = NoDrive())
-    field = local_potential_samples(p, n, ops, a, rec; time, drive)
-    if p.model isa LocalPotential1D && drive isa NoDrive
-        v = ops.external
-        return Q.Hamiltonian(
-            v,
-            Q.diagonal(v),
-            ops.plus,
-            ops.minus,
-            spacing(p.grid) * sqrt(p.mass),
-            field,
-        )
-    end
+function effective_hamiltonian(problem, rho, ops, accuracy, rec; time = 0.0, drive = NoDrive())
+    field = local_potential_samples(problem, rho, ops, accuracy, rec; time, drive)
     # Core projections need one shared field representation; sampled residuals
     # and Green sources consume the original local expression directly.
-    v = Q.cross(
-        rec,
-        p.grid.R,
-        field;
-        tol = a.field_tolerance,
-        cap = a.field_cap,
-        label = "effective_potential",
+    Veff =
+        problem.model isa LocalPotential1D && drive isa NoDrive &&
+        Q.rank(ops.external) <= field_caps(accuracy).effective_potential_cap ? ops.external :
+        Q.cross(
+            rec,
+            problem.grid.R,
+            field;
+            tol = accuracy.field_tolerance,
+            cap = field_caps(accuracy).effective_potential_cap,
+            label = "effective_potential",
+        )
+    Q.Hamiltonian(
+        Veff,
+        Q.diagonal(Veff),
+        ops.plus,
+        ops.minus,
+        spacing(problem.grid) * sqrt(problem.mass),
+        field,
     )
-    Q.Hamiltonian(v, Q.diagonal(v), ops.plus, ops.minus, spacing(p.grid) * sqrt(p.mass), field)
 end
-function total_energy(p, xs, n, ops, a, rec; time = 0.0, drive = NoDrive())
-    h = spacing(p.grid)
+function total_energy(problem, orbitals, rho, ops, accuracy, rec; time = 0.0, drive = NoDrive())
+    dx = spacing(problem.grid)
     kinetic_terms =
-        Q.recorded_map(Float64, length(xs), rec.options, rec; random = false) do i, localrec
-            w, x = p.occupations[i], xs[i]
-            shifted = Q.apply_mpo(ops.plus, x; tol = a.algebra_tolerance, cap = a.orbital_cap)
+        Q.recorded_map(Float64, length(orbitals), rec.options, rec; random = false) do i, localrec
+            occupation, psi = problem.occupations[i], orbitals[i]
+            shifted = Q.apply_mpo(
+                ops.plus,
+                psi;
+                tol = accuracy.algebra_tolerance,
+                cap = accuracy.orbital_cap,
+            )
             gradient_norm =
-                Q.difference_norm(shifted, x; rec = localrec, label = "kinetic_difference_norm")
-            w * gradient_norm^2 / (2p.mass * h^2)
+                Q.difference_norm(shifted, psi; rec = localrec, label = "kinetic_difference_norm")
+            occupation * gradient_norm^2 / (2problem.mass * dx^2)
         end
-    kin = sum(kinetic_terms)
-    vh = hartree(n, p, ops, a)
-    ext = h * real(Q.inner(n, ops.external; cfg = rec.options))
-    eh = 0.5h * real(Q.inner(n, vh; cfg = rec.options))
-    exc = 0.0
+    kinetic_energy = sum(kinetic_terms)
+    Vhartree = hartree(rho, problem, ops, accuracy)
+    external_energy = dx * real(Q.inner(rho, ops.external; cfg = rec.options))
+    hartree_energy = 0.5dx * real(Q.inner(rho, Vhartree; cfg = rec.options))
+    xc_energy = 0.0
     if ops.xc_table !== nothing
-        en = Q.sampled(n, rec)
+        rho_samples = Q.sampled(rho, rec)
         e = Q.cross(
             rec,
-            p.grid.R,
-            Q.pointwise(value -> Q.xc(ops.xc_table, real(value))[1], en);
-            tol = a.xc_energy_tolerance,
-            cap = a.field_cap,
+            problem.grid.R,
+            Q.pointwise(value -> Q.xc(ops.xc_table, real(value))[1], rho_samples);
+            tol = accuracy.xc_energy_tolerance,
+            cap = field_caps(accuracy).xc_energy_cap,
             label = "xc_energy_density",
         )
-        exc = h * real(Q.inner(Q.constant_tt(p.grid.R), e; cfg = rec.options))
+        xc_energy = dx * real(sum(Q.tensortrain(e)))
     end
-    edrive = 0.0
+    drive_energy = 0.0
     if !(drive isa NoDrive)
-        v = Q.cross(
+        Veff = Q.cross(
             rec,
-            p.grid.R,
-            j -> drive_value(drive, j * h, time, p.grid.L);
-            tol = a.field_tolerance,
-            cap = a.field_cap,
+            problem.grid.R,
+            j -> drive_value(drive, j * dx, time, problem.grid.L);
+            tol = accuracy.field_tolerance,
+            cap = field_caps(accuracy).drive_cap,
             label = "drive_energy",
         )
-        edrive = h * real(Q.inner(n, v; cfg = rec.options))
+        drive_energy = dx * real(Q.inner(rho, Veff; cfg = rec.options))
     end
-    nn = ops.nuclear
+    ion_energy = ops.nuclear
     (;
-        total = kin + ext + eh + exc + nn + edrive,
-        kinetic = kin,
-        external = ext,
-        hartree = eh,
-        xc = exc,
-        nuclear = nn,
-        drive = edrive,
+        total = kinetic_energy +
+                external_energy +
+                hartree_energy +
+                xc_energy +
+                ion_energy +
+                drive_energy,
+        kinetic = kinetic_energy,
+        external = external_energy,
+        hartree = hartree_energy,
+        xc = xc_energy,
+        nuclear = ion_energy,
+        drive = drive_energy,
     )
 end

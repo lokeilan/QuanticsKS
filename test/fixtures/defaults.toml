@@ -40,6 +40,8 @@ slow_sine_mode = 3
 wavevectors = []
 
 [physics]
+green_relative_tolerance = 1.0e-8
+green_max_iterations = 300
 exchange_quadrature_rtol = 2.0e-11
 xc_density_max = 4.0
 xc_density_min = 1.0e-8
@@ -100,7 +102,7 @@ initial_random_pivots = 6
 max_global_pivots = 5
 max_iterations = 16
 orbital_cache_capacity = 8192
-post_rounding_factor = 0.1
+post_rounding_factor = 0.0
 require_convergence = false
 scalar_cache_capacity = 16384
 zero_check_limit = 4096

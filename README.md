@@ -1,8 +1,8 @@
 # QuanticsKS
 
-一维周期 Kohn–Sham 计算的 Julia 包。轨道和场使用 QTT 表示，TCI 负责采样重构；支持低秩 SCF、固定势本征谱、实时传播、网格细化和保存状态的后处理。
+QuanticsKS is a Julia QTT/TCI solver for one-dimensional periodic and three-dimensional isolated Kohn-Sham ground states. The 1D model also supports fixed-potential spectra and real-time propagation.
 
-仓库只有一套活动实现：`src/QuanticsKS.jl`。氢链、软库仑模型和局域余弦势共用同一计算流程。旧 TCI-TDKS 外壳、硅和生产 dense 求解器已移出活动代码；小网格 dense 运算仅作为数值验证的独立参照。
+The active implementation is `src/QuanticsKS.jl`. Both dimensions reuse the same tensor algebra, LRRAP updates, and SCF workflow. See [three-dimensional models and paper parameters](docs/three-dimensional.md) for the 3D conventions, runnable inputs, and limitations. Small-grid dense calculations serve only as independent validation.
 
 ## 运行
 
@@ -22,7 +22,7 @@ julia --startup-file=no --threads=4,1 --project=. run.jl solve inputs/h4.toml re
 | `inputs/h100-r16.toml` | 一维周期 100-H 内部模型，R16、50 条双占据轨道 |
 | `inputs/propagation.toml` | 小网格局域余弦势的实时传播 |
 
-R16 输入是较重的计算。它不代表三维 H100 文献复现。当前正式容差保持密度/XC `1e-10`、TCI 后置 SVD 系数 `0.1`。
+R16 输入是较重的计算。它不代表三维 H100 文献复现。密度/XC 默认容差为 `1e-10`。TCI 默认保留 prrLU 构造结果；只有显式设置正的 `post_rounding_factor` 才追加 SVD 舍入。
 
 SCF 命令退出码 `0` 表示达到配置的停止条件，`2` 表示迭代完成但未达到停止条件，`1` 表示输入或执行错误。能量停止和独立物理审计分别输出；达到能量判据不能代替轨道残差与密度接受。传播成功完成配置步数返回 `0`。
 
@@ -30,7 +30,7 @@ SCF 命令退出码 `0` 表示达到配置的停止条件，`2` 表示迭代完�
 
 启动时用 `--threads` 分配 Julia 工作线程。SCF 在 `[scf]`、传播在 `[time]` 设置 `parallel_tasks=0` 使用可用工作线程；`1` 为串行，正整数限制并发数。默认仍为 `1`，`[run].blas_threads` 建议在轨道并行时使用 `1`。
 
-独立轨道拟合、投影、Green 更新、Gram/Ritz、存储和审计可并行。单个较大的直接内积也可内部并行，小收缩保持串行；外层任务内不再次拆分。SCF 轮次、依赖最新系数的扫描和 TT site 递推保持顺序。日志、随机流和 pivot 状态按固定顺序归并。
+独立轨道拟合、投影、Green 更新、Gram/Ritz、存储和审计可并行。内积直接调用 TCI 收缩，任务并行放在轨道和矩阵层。SCF 轮次、依赖最新系数的扫描和 TT site 递推保持顺序。日志、随机流和 pivot 状态按固定顺序归并。
 
 ## Julia 接口
 
@@ -49,6 +49,9 @@ observe(state; parallel_tasks=0)
 - [代码结构](docs/structure.md)：模块职责和阅读顺序。
 - [配置与输出](docs/configuration.md)：输入、重启、源码快照和停止含义。
 - [算法流程](docs/algorithm.md)：构建、秩控制、投影和消费者之间的关系。
+- [本次重构与物理核对](docs/refactor-20261106.md)：库复用、结构和 XC 修正。
+- [循环与软件包复用核查](docs/loop-audit-20261107.md)：直接替换、库迁移候选和保留循环的职责。
+- [ITensorMPS 迁移与 3D 核对](docs/itensormps-3d-20261108.md)：当前张量后端、修正和数值对照。
 - [整理记录](docs/migration.md)：移除范围、保留的历史证据及验证范围。
 
 ```powershell

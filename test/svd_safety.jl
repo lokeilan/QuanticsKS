@@ -32,12 +32,23 @@ records(dir) = [deserialize(joinpath(dir, f)) for f in readdir(dir) if endswith(
             )
             @test Q.add(x, y; a = 2im, b = -3, tol = 1e-6, cap = 4).c == expected.sitetensors
             frame = Q.canonical_frame(x)
-            right = deepcopy(Q.tensortrain(x))
-            Q.TCI.compress!(right, :SVD; tolerance = 0.0)
-            left = reverse(Q.tensortrain(x))
-            Q.TCI.compress!(left, :SVD; tolerance = 0.0)
-            @test frame.right == right.sitetensors
-            @test frame.left == reverse(left).sitetensors
+            expected_values =
+                [Q.TCI.evaluate(Q.tensortrain(x), Q.bits(j, length(x))) for j = 0:(2^length(x) - 1)]
+            for cores in (frame.left, frame.right)
+                values = [
+                    Q.TCI.evaluate(Q.TCI.TensorTrain(cores), Q.bits(j, length(x))) for
+                    j = 0:(2^length(x) - 1)
+                ]
+                @test values ≈ expected_values
+            end
+            for core in frame.left[1:(end - 1)]
+                basis = reshape(core, :, size(core, 3))
+                @test basis' * basis ≈ I
+            end
+            for core in frame.right[2:end]
+                basis = reshape(core, size(core, 1), :)
+                @test basis * basis' ≈ I
+            end
             @test isempty(readdir(dir))
         end
     end

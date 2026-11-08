@@ -110,11 +110,9 @@ function checked_svd(A; full = false, factorize = svd)
     end
 end
 
-stable_svd(A; full = false) = checked_svd(A; full)
-
 "TCI 0.9.19 SVD factorization, preserving its local tail criterion exactly."
 function guarded_svd_factorize(A; tolerance, maxbonddim, leftorthogonal, normalizeerror = true)
-    f = stable_svd(A)
+    f = checked_svd(A)
     reltol, abstol = normalizeerror ? (tolerance, 0.0) : (1e-14, tolerance)
     err = [sum(f.S[(n + 1):end] .^ 2) for n = 1:length(f.S)]
     normalized_err = err ./ sum(f.S .^ 2)
@@ -149,7 +147,7 @@ function check_compression_shapes(cores)
     nothing
 end
 
-"TCI 0.9.19's two compression sweeps with checked SVD and checked contractions."
+"Use library compression; replay with diagnostics only after a numerical failure."
 function guarded_compress!(tt; tolerance = 1e-12, maxbonddim = typemax(Int), normalizeerror = true)
     check_compression_shapes(tt.sitetensors)
     for (k, g) in enumerate(tt.sitetensors)
@@ -157,6 +155,19 @@ function guarded_compress!(tt; tolerance = 1e-12, maxbonddim = typemax(Int), nor
             require_finite(g, "nonfinite_compression_input")
         end
     end
+    # TCI replaces cores without mutating the originals, so a shallow copy is enough.
+    original_cores = copy(tt.sitetensors)
+    try
+        TCI.compress!(tt, :SVD; tolerance, maxbonddim, normalizeerror)
+        all(core -> all(isfinite, core), tt.sitetensors) && return nothing
+    catch error
+        intermediate_nonfinite =
+            error isa ArgumentError &&
+            occursin("matrix contains Infs or NaNs", sprint(showerror, error))
+        retryable_svd_error(error) || intermediate_nonfinite || rethrow()
+    end
+    tt.sitetensors .= original_cores
+    # The pinned library has no factorization callback for checked QR recovery.
     for k = 1:(length(tt) - 1)
         with_svd_context(; site = k, direction = "forward") do
             sh = size(tt.sitetensors[k])

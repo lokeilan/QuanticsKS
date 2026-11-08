@@ -6,154 +6,62 @@ end
 QTT(c::Vector{<:Array}) = QTT([ComplexF64.(g) for g in c])
 Base.length(x::QTT) = length(x.c)
 tensortrain(x::QTT) = TCI.TensorTrain(x.c)
+function QTT(psi::ITensorMPS.MPS)
+    # TCI 0.9.19's reverse conversion needs explicit one- and two-site cases.
+    length(psi) == 1 &&
+        return QTT([reshape(Array(only(psi), only(ITensorMPS.siteinds(psi))), 1, 2, 1)])
+    if length(psi) == 2
+        sites = ITensorMPS.siteinds(psi)
+        bond = ITensorMPS.linkind(psi, 1)
+        return QTT([
+            reshape(Array(psi[1], sites[1], bond), 1, 2, :),
+            reshape(Array(psi[2], bond, sites[2]), :, 2, 1),
+        ])
+    end
+    QTT(TCI.TensorTrain(psi).sitetensors)
+end
 rank(x::QTT) = length(x) == 1 ? 1 : TCI.rank(tensortrain(x))
 storage(x::QTT) = sum(sizeof, x.c)
 scale(x::QTT, a) = QTT(TCI.multiply(tensortrain(x), a).sitetensors)
-const DIRECT_INNER_SITE_WORK_LIMIT = 4 * 48^3
-const DIRECT_INNER_PARALLEL_SITE_WORK = 4 * 40^3
-const DIRECT_INNER_PARALLEL_WORK = 4 * DIRECT_INNER_PARALLEL_SITE_WORK
-
-inner_site_work(gx, gy) = size(gx, 2) * size(gy, 1) * size(gx, 3) * (size(gx, 1) + size(gy, 3))
-
-"Select from both bond profiles; keep large contractions on the TCI/BLAS path."
-function inner_backend(x::QTT, y::QTT)
-    length(x) == length(y) || throw(DimensionMismatch("QTT inner-product lengths"))
-    isempty(x.c) && throw(ArgumentError("An inner product needs nonempty tensor trains"))
-    left_x = left_y = 1
-    direct = true
-    for (gx, gy) in zip(x.c, y.c)
-        rx, p, ox = size(gx)
-        ry, q, oy = size(gy)
-        rx == left_x && ry == left_y && p == q ||
-            throw(DimensionMismatch("QTT inner-product bonds or physical dimensions"))
-        direct &= inner_site_work(gx, gy) <= DIRECT_INNER_SITE_WORK_LIMIT
-        left_x, left_y = ox, oy
-    end
-    left_x == left_y == 1 || throw(DimensionMismatch("QTT inner-product boundaries"))
-    direct ? :direct : :tci
+"Contract <bra|ket> through TCI without fitting or truncating a product state."
+function inner(bra::QTT, ket::QTT; cfg = (;))
+    length(bra) == length(ket) || throw(DimensionMismatch("QTT inner-product lengths"))
+    isempty(bra.c) && throw(ArgumentError("An inner product needs nonempty tensor trains"))
+    check_compression_shapes(bra.c)
+    check_compression_shapes(ket.c)
+    all(size(a, 2) == size(b, 2) for (a, b) in zip(bra.c, ket.c)) ||
+        throw(DimensionMismatch("QTT physical dimensions"))
+    all(size(first(psi.c), 1) == size(last(psi.c), 3) == 1 for psi in (bra, ket)) ||
+        throw(DimensionMismatch("QTT inner-product boundaries"))
+    # A single site has no internal contraction bond in TCI 0.9.19.
+    length(bra) == 1 && return dot(only(bra.c), only(ket.c))
+    bra_mpo = TCI.TensorTrain([
+        reshape(conj.(core), size(core, 1), 1, size(core, 2), size(core, 3)) for core in bra.c
+    ])
+    ket_mpo = TCI.TensorTrain([
+        reshape(core, size(core, 1), size(core, 2), 1, size(core, 3)) for core in ket.c
+    ])
+    TCI.evaluate(TCI.Contraction(bra_mpo, ket_mpo), fill((1, 1), length(bra)))
 end
-
-function inner_direct_serial(x::QTT, y::QTT)
-    buffer = ComplexF64[1]
-    work = ComplexF64[]
-    left_x = 1
-    for (gx, gy) in zip(x.c, y.c)
-        rx, p, ox = size(gx)
-        ry, _, oy = size(gy)
-        resize!(work, ry * p * ox)
-        @inbounds for s = 1:p, m = 1:ry, a = 1:ox
-            value = zero(ComplexF64)
-            for l = 1:rx
-                value += buffer[l + (m - 1) * left_x] * conj(gx[l, s, a])
-            end
-            work[(s - 1) * ry + m + (a - 1) * p * ry] = value
-        end
-        resize!(buffer, ox * oy)
-        fill!(buffer, 0)
-        @inbounds for s = 1:p, m = 1:ry, a = 1:ox
-            value = work[(s - 1) * ry + m + (a - 1) * p * ry]
-            iszero(value) && continue
-            for b = 1:oy
-                buffer[a + (b - 1) * ox] += value * gy[m, s, b]
-            end
-        end
-        left_x = ox
-    end
-    only(buffer)
-end
-
-function inner_site_workers(gx, gy, cfg)
-    inner_site_work(gx, gy) < DIRECT_INNER_PARALLEL_SITE_WORK && return 1
-    parallel_workers(cfg, size(gx, 3))
-end
-
-function inner_direct_workers(x, y, cfg)
-    parallel_workers(cfg, 2) <= 1 && return 1
-    work = 0
-    workers = 1
-    for (gx, gy) in zip(x.c, y.c)
-        count = inner_site_workers(gx, gy, cfg)
-        if count > 1
-            work += inner_site_work(gx, gy)
-            workers = max(workers, count)
-        end
-    end
-    work >= DIRECT_INNER_PARALLEL_WORK ? workers : 1
-end
-
-"Write independent output rows; each worker owns its intermediate column."
-function inner_direct_site!(output, input, gx, gy, scratch, cfg)
-    rx, p, ox = size(gx)
-    ry, _, oy = size(gy)
-    workers = inner_site_workers(gx, gy, cfg)
-    foreach_independent(workers, (; parallel_tasks = workers)) do worker
-        work = scratch[worker]
-        first_a = fld((worker - 1) * ox, workers) + 1
-        last_a = fld(worker * ox, workers)
-        @inbounds for a = first_a:last_a
-            for s = 1:p, m = 1:ry
-                value = zero(ComplexF64)
-                for l = 1:rx
-                    value += input[l + (m - 1) * rx] * conj(gx[l, s, a])
-                end
-                work[(s - 1) * ry + m] = value
-            end
-            for s = 1:p, m = 1:ry
-                value = work[(s - 1) * ry + m]
-                iszero(value) && continue
-                for b = 1:oy
-                    output[a + (b - 1) * ox] += value * gy[m, s, b]
-                end
-            end
-        end
-    end
-    output
-end
-
-function inner_direct(x::QTT, y::QTT; cfg = (;))
-    workers = inner_direct_workers(x, y, cfg)
-    workers <= 1 && return inner_direct_serial(x, y)
-    width = maximum(size(gx, 2) * size(gy, 1) for (gx, gy) in zip(x.c, y.c))
-    scratch = [Vector{ComplexF64}(undef, width) for _ = 1:workers]
-    input = ComplexF64[1]
-    output = ComplexF64[]
-    for (gx, gy) in zip(x.c, y.c)
-        resize!(output, size(gx, 3) * size(gy, 3))
-        fill!(output, 0)
-        inner_direct_site!(output, input, gx, gy, scratch, cfg)
-        input, output = output, input
-    end
-    only(input)
-end
-
-function inner_tci(x::QTT, y::QTT)
-    # Treat the bra and ket as 1-by-N and N-by-1 tensor-train operators.
-    # Evaluating their sole output entry contracts the inner product in TCI
-    # without constructing a pointwise product or fitting another tensor train.
-    bra = TCI.TensorTrain([reshape(conj.(g), size(g, 1), 1, size(g, 2), size(g, 3)) for g in x.c])
-    ket = TCI.TensorTrain([reshape(g, size(g, 1), size(g, 2), 1, size(g, 3)) for g in y.c])
-    indices = fill((1, 1), length(x))
-    if length(x) == 1
-        # TCI 0.9.19's Contraction.evaluate assumes at least two sites.
-        result = TCI.contract(bra, ket; algorithm = :zipup, tolerance = 0.0)
-        return TCI.evaluate(result, indices)
-    end
-    TCI.evaluate(TCI.Contraction(bra, ket), indices)
-end
-inner(x::QTT, y::QTT; cfg = (;)) =
-    inner_backend(x, y) == :direct ? inner_direct(x, y; cfg) : inner_tci(x, y)
 ttnorm(x::QTT; cfg = (;)) = sqrt(max(0, real(inner(x, x; cfg))))
+
+"Convert a shared orbital basis and its operators once per projection."
+function mpo_basis(orbitals, operators)
+    sites = [ITensors.Index(2, "n=$k") for k = 1:length(first(orbitals))]
+    kets = [ITensorMPS.MPS(tensortrain(psi); sites) for psi in orbitals]
+    operator_sites = [[s', s] for s in sites]
+    matrices = [ITensorMPS.MPO(TCI.TensorTrain(w); sites = operator_sites) for w in operators]
+    ITensors.prime.(kets), kets, matrices
+end
+
 "Contract <x|W|y> without truncating or constructing W*y."
 function inner_mpo(x::QTT, w, y::QTT)
     length(x) == length(y) == length(w) || throw(DimensionMismatch("MPO expectation lengths"))
-    e = ones(ComplexF64, 1, 1, 1)
-    for (a, m, b) in zip(x.c, w, y.c)
-        @tensor t1[i, j, t, L] := e[i, j, l] * b[l, t, L]
-        @tensor t2[i, s, J, L] := t1[i, j, t, L] * m[j, s, t, J]
-        @tensor f[I, J, L] := conj(a[i, s, I]) * t2[i, s, J, L]
-        e = f
+    # Random index IDs must not advance the TCI sampling stream.
+    with_sampling_seed(0) do
+        bras, kets, operators = mpo_basis((x, y), (w,))
+        ITensorMPS.inner(bras[1], only(operators), kets[2]; make_inds_match = false)
     end
-    e[1]
 end
 normalize(x::QTT; cfg = (;)) = scale(x, 1 / ttnorm(x; cfg))
 function algebra_options(tol, cap)
@@ -180,40 +88,11 @@ end
 "Establish a right-orthogonal suffix by QR, without tolerance-based truncation."
 function right_canonical(x::QTT)
     check_compression_shapes(x.c)
-    cores = deepcopy(x.c)
-    for (k, g) in enumerate(cores)
-        with_svd_context(; operation = "right_canonical_qr", site = k) do
-            require_finite(g, "nonfinite_right_canonical_input")
-        end
+    foreach(g -> require_finite(g, "nonfinite_right_canonical_input"), x.c)
+    with_sampling_seed(0) do
+        psi = ITensorMPS.MPS(tensortrain(x))
+        QTT(ITensorMPS.orthogonalize!(psi, 1))
     end
-    for k = length(x):-1:2
-        with_svd_context(; operation = "right_canonical_qr", site = k, original_cores = x.c) do
-            g = cores[k]
-            A = reshape(g, size(g, 1), :)
-            factor = try
-                qr(Matrix(A'))
-            catch error
-                event = save_svd_event(
-                    A,
-                    "right_canonical_qr_exception";
-                    details = (; exception = sprint(showerror, error)),
-                )
-                finish_svd_event(event, "failed")
-                rethrow()
-            end
-            triangular = Matrix(factor.R)
-            r = size(triangular, 1)
-            basis = factor.Q * Matrix{ComplexF64}(I, size(A, 2), r)
-            require_finite(basis, "nonfinite_right_canonical_basis")
-            require_finite(triangular, "nonfinite_right_canonical_factor")
-            cores[k] = reshape(Matrix(basis'), r, size(g, 2), size(g, 3))
-            previous = cores[k - 1]
-            contracted = reshape(previous, :, size(previous, 3)) * triangular'
-            require_finite(contracted, "nonfinite_right_canonical_contraction")
-            cores[k - 1] = reshape(contracted, size(previous, 1), size(previous, 2), r)
-        end
-    end
-    QTT(cores)
 end
 "Pointwise addition uses recorded TCI when rec is supplied, otherwise library TT addition."
 function add(x::QTT, y::QTT; a = 1, b = 1, tol = 1e-11, cap = 64, rec = nothing, label = "add")
@@ -224,8 +103,20 @@ function add(x::QTT, y::QTT; a = 1, b = 1, tol = 1e-11, cap = 64, rec = nothing,
     end
     # TCI 0.9.19's block addition assumes distinct first and last sites.
     length(x) == 1 && return QTT([a .* only(x.c) .+ b .* only(y.c)])
-    # Same block construction and scaling site as TCI.add; route its
-    # compression through the checked implementation of the same sweeps.
+    try
+        result = TCI.add(
+            tensortrain(x),
+            tensortrain(y);
+            factorlhs = a,
+            factorrhs = b,
+            tolerance = Float64(tol),
+            maxbonddim = cap,
+        )
+        all(core -> all(isfinite, core), result.sitetensors) && return QTT(result.sitetensors)
+    catch error
+        retryable_svd_error(error) || rethrow()
+    end
+    # Retry from the original inputs with the existing checked SVD/QR path.
     d = length(x)
     result = TCI.TensorTrain([
         TCI._addtttensor(
@@ -280,4 +171,440 @@ function gram(xs, ys; cfg = (;))
         end
     end
     g
+end
+
+# Evaluate integer-labelled samples; the first core holds the least-significant bit.
+
+mutable struct Evaluator
+    x::QTT
+    a::Vector{ComplexF64}
+    b::Vector{ComplexF64}
+    left::Matrix{ComplexF64}
+    right::Matrix{ComplexF64}
+    prefix::Int
+    suffix::Int
+end
+function Evaluator(x::QTT; cachebits = 10)
+    0 <= cachebits <= 16 || throw(ArgumentError("Environment cache bits must be 0:16"))
+    # cachebits is the number of cached binary sites at each end, not a
+    # dictionary-entry budget. Retain only the endpoint environments. R16
+    # with cachebits=8 needs two sets of 256 vectors and one dot product/query.
+    # Larger grids contract the uncached middle cores using reusable buffers.
+    p = min(cachebits, length(x) ÷ 2)
+    s = min(cachebits, length(x) - p)
+    cache = TCI.TTCache(tensortrain(x))
+    l = hcat([TCI.evaluateleft(cache, bits(j, p)) for j = 0:(2^p - 1)]...)
+    r = hcat([TCI.evaluateright(cache, bits(j, s)) for j = 0:(2^s - 1)]...)
+    Evaluator(x, zeros(ComplexF64, max(rank(x), 1)), zeros(ComplexF64, max(rank(x), 1)), l, r, p, s)
+end
+function (e::Evaluator)(j::Int)
+    0 <= j < (1 << length(e.x)) || throw(BoundsError(e.x, j))
+    li = (j & ((1 << e.prefix) - 1)) + 1
+    ri = (j >> (length(e.x) - e.suffix)) + 1
+    if e.prefix + e.suffix == length(e.x)
+        return transpose(view(e.left, :, li)) * view(e.right, :, ri)
+    end
+    copyto!(e.a, 1, e.left, 1 + (li - 1) * size(e.left, 1), size(e.left, 1))
+    for site = (e.prefix + 1):(length(e.x) - e.suffix)
+        core = e.x.c[site]
+        digit = ((j >> (site - 1)) & 1) + 1
+        mul!(
+            view(e.b, 1:size(core, 3)),
+            transpose(view(core, :, digit, :)),
+            view(e.a, 1:size(core, 1)),
+        )
+        e.a, e.b = e.b, e.a
+    end
+    transpose(view(e.a, 1:size(e.right, 1))) * view(e.right, :, ri)
+end
+bits(j, R) = [((j >> (k - 1)) & 1) + 1 for k = 1:R]
+indexof(v) = sum(((v[k] - 1) << (k - 1) for k = 1:length(v)); init = 0)
+
+# Flat linear expressions retain QTT cores until a consumer needs new cores.
+
+struct QTTExpression
+    terms::Vector{QTT}
+    coefficients::Vector{ComplexF64}
+    R::Int
+end
+Base.length(x::QTTExpression) = x.R
+
+function linear_expression(xs, weights)
+    isempty(xs) && throw(ArgumentError("A linear expression needs a grid"))
+    length(xs) == length(weights) || throw(DimensionMismatch("Expression coefficients"))
+    R = length(first(xs))
+    terms = QTT[]
+    coefficients = ComplexF64[]
+    positions = IdDict{Vector{Array{ComplexF64,3}},Int}()
+    function append_term(x::QTT, c)
+        if haskey(positions, x.c)
+            coefficients[positions[x.c]] += c
+        else
+            push!(terms, x)
+            push!(coefficients, c)
+            positions[x.c] = length(terms)
+        end
+    end
+    for (x, c) in zip(xs, weights)
+        length(x) == R || throw(DimensionMismatch("Expression grid lengths"))
+        isfinite(c) || throw(ArgumentError("Nonfinite expression coefficient"))
+        if x isa QTTExpression
+            for (term, weight) in zip(x.terms, x.coefficients)
+                append_term(term, c * weight)
+            end
+        else
+            append_term(x, c)
+        end
+    end
+    all(isfinite, coefficients) || throw(ArgumentError("Nonfinite combined coefficients"))
+    active = findall(!iszero, coefficients)
+    QTTExpression(terms[active], coefficients[active], R)
+end
+scale(x::QTTExpression, a) = linear_expression((x,), (a,))
+
+# Compensate the final scalar/amplitude sums, where cancellation is intended.
+function compensated_sum(values)
+    total = zero(ComplexF64)
+    correction = zero(ComplexF64)
+    for value in values
+        adjusted = value - correction
+        updated = total + adjusted
+        correction = (updated - total) - adjusted
+        total = updated
+    end
+    total
+end
+
+struct ExpressionEvaluator
+    evals::Vector{Evaluator}
+    coefficients::Vector{ComplexF64}
+    R::Int
+end
+Evaluator(x::QTTExpression; cachebits = 10) =
+    ExpressionEvaluator([Evaluator(t; cachebits) for t in x.terms], x.coefficients, x.R)
+function (e::ExpressionEvaluator)(j::Int)
+    0 <= j < (1 << e.R) || throw(BoundsError(e, j))
+    compensated_sum(c * f(j) for (c, f) in zip(e.coefficients, e.evals))
+end
+
+function expression_components(xs)
+    isempty(xs) && throw(ArgumentError("Empty expression collection"))
+    R = length(first(xs))
+    leaves = QTT[]
+    positions = IdDict{Vector{Array{ComplexF64,3}},Int}()
+    for x in xs
+        length(x) == R || throw(DimensionMismatch("Expression grid lengths"))
+        for term in x.terms
+            if !haskey(positions, term.c)
+                push!(leaves, term)
+                positions[term.c] = length(leaves)
+            end
+        end
+    end
+    weights = zeros(ComplexF64, length(leaves), length(xs))
+    for (j, x) in enumerate(xs), (term, c) in zip(x.terms, x.coefficients)
+        weights[positions[term.c], j] += c
+    end
+    leaves, weights
+end
+
+expression_stage(f, rec, label) = rec === nothing ? f() : timed(f, rec, label)
+
+"Stream an untruncated common QR basis; retain its cores only for final materialization."
+function expression_qr(leaves, weights; keep_cores = false)
+    isempty(leaves) && throw(ArgumentError("QR needs at least one nonzero term"))
+    with_svd_context(;
+        operation = "linear_expression_qr",
+        original_cores = [x.c for x in leaves],
+        expression_coefficients = weights,
+    ) do
+        for x in leaves
+            check_compression_shapes(x.c)
+            !isempty(x.c) &&
+                size(first(x.c), 1) == size(last(x.c), 3) == 1 &&
+                all(g -> size(g, 2) == 2, x.c) || throw(
+                DimensionMismatch("Expression QR requires binary QTT cores and scalar boundaries"),
+            )
+        end
+        require_finite(weights, "nonfinite_expression_coefficients")
+        carry = [ones(ComplexF64, 1, 1) for _ in leaves]
+        cores = Array{ComplexF64,3}[]
+        R = length(first(leaves))
+        p = 1
+        for k = 1:R
+            widths = [size(x.c[k], 3) for x in leaves]
+            A = zeros(ComplexF64, 2p, sum(widths))
+            offset = 0
+            for (i, x) in enumerate(leaves)
+                columns = (offset + 1):(offset + widths[i])
+                for s = 1:2
+                    mul!(
+                        view(A, ((s - 1) * p + 1):(s * p), columns),
+                        carry[i],
+                        view(x.c[k], :, s, :),
+                    )
+                end
+                offset += widths[i]
+            end
+            require_finite(A, "nonfinite_expression_qr_input"; details = (; site = k))
+            if k == R
+                # Each final right bond is one. Combine in amplitude space,
+                # not by subtracting almost equal squared norms.
+                C = [
+                    compensated_sum(A[i, t] * weights[t, j] for t in eachindex(leaves)) for
+                    i in axes(A, 1), j in axes(weights, 2)
+                ]
+                require_finite(C, "nonfinite_expression_amplitudes")
+                return C, cores
+            end
+            F = try
+                qr(A)
+            catch e
+                save_svd_event(
+                    A,
+                    "expression_qr_exception";
+                    details = (; site = k, exception = sprint(showerror, e)),
+                )
+                rethrow()
+            end
+            triangular = Matrix(F.R)
+            require_finite(triangular, "nonfinite_expression_qr_output"; details = (; site = k))
+            q = size(triangular, 1)
+            if keep_cores
+                # Applying Q to the thin identity avoids a full square Q.
+                basis = F.Q * Matrix{ComplexF64}(I, size(A, 1), q)
+                require_finite(basis, "nonfinite_expression_q_basis"; details = (; site = k))
+                push!(cores, reshape(basis, p, 2, q))
+            end
+            offset = 0
+            for i in eachindex(leaves)
+                carry[i] = triangular[:, (offset + 1):(offset + widths[i])]
+                offset += widths[i]
+            end
+            p = q
+        end
+        error("Empty QTT grid")
+    end
+end
+
+"Gram from original TCI inner products, with QR fallback for cancellation or near dependence."
+function expression_gram(xs; rec = nothing)
+    leaves, W = expression_components(xs)
+    m = length(xs)
+    isempty(leaves) && return zeros(ComplexF64, m, m)
+    K = expression_stage(rec, "density_gram_core_inner") do
+        result = gram(leaves; cfg = rec === nothing ? (;) : rec.options)
+        require_finite(result, "nonfinite_expression_core_gram")
+        result
+    end
+    G = W' * K * W
+    magnitudes = abs.(W)
+    scales = diag(transpose(magnitudes) * abs.(K) * magnitudes)
+    require_finite(G, "nonfinite_expression_gram")
+    require_finite(scales, "nonfinite_expression_gram_scale")
+    # Small norms need an amplitude-space QR, not subtraction of squared norms.
+    fallback = any(1:m) do i
+        real(G[i, i]) <= sqrt(eps(Float64)) * scales[i] ||
+            abs(imag(G[i, i])) > 64eps(Float64) * scales[i]
+    end
+    G = Matrix(Hermitian(G, :U))
+    if m > 1
+        fallback |= eigmin(Hermitian(G)) <= sqrt(eps(Float64)) * maximum(scales)
+    end
+    if fallback
+        return expression_stage(rec, "density_gram_qr_fallback") do
+            C, _ = expression_qr(leaves, W)
+            result = C' * C
+            result[diagind(result)] .= vec(sum(abs2, C; dims = 1))
+            require_finite(result, "nonfinite_expression_qr_gram")
+            result
+        end
+    end
+    G
+end
+
+function difference_norm(x::QTT, y::QTT; rec = nothing, label = "density_difference_norm")
+    expression_stage(rec, label) do
+        residual = linear_expression((x, y), (1, -1))
+        squared = real(only(expression_gram([residual]; rec)))
+        squared >= 0 || error("Negative residual norm after stable contraction")
+        sqrt(squared)
+    end
+end
+
+"Build just the final linear combination, then apply the existing guarded SVD rounding."
+function materialize_expression(x::QTTExpression; tol, cap)
+    algebra_options(tol, cap)
+    isempty(x.terms) && return constant_tt(x.R, 0)
+    length(x.terms) == 1 && return rounded(scale(only(x.terms), only(x.coefficients)); tol, cap)
+    C, cores = expression_qr(x.terms, reshape(x.coefficients, :, 1); keep_cores = true)
+    push!(cores, reshape(C, size(C, 1) ÷ 2, 2, 1))
+    rounded(QTT(cores); tol, cap)
+end
+
+# MPO construction and action; axes are left bond, output site, input site, right bond.
+
+"Circulant C[i,j]=kernel[(i-j) mod N] using a two-state binary borrow automaton."
+function circulant(kernel::QTT)
+    out = Array{ComplexF64,4}[]
+    d = length(kernel)
+    for (k, g) in enumerate(kernel.c)
+        rl, _, rr = size(g)
+        nl = k == 1 ? 1 : 2
+        nr = k == d ? 1 : 2
+        w = zeros(ComplexF64, rl * nl, 2, 2, rr * nr)
+        for bin = 0:(nl - 1), i = 0:1, j = 0:1
+            z = i - j - bin
+            s = mod(z, 2) + 1
+            bout = z < 0 ? 1 : 0
+            left = (1:rl) .+ rl * bin
+            right = (1:rr) .+ rr * (k == d ? 0 : bout)
+            @views w[left, i + 1, j + 1, right] .+= g[:, s, :]
+        end
+        push!(out, w)
+    end
+    out
+end
+function diagonal(x::QTT)
+    [
+        begin
+            w = zeros(ComplexF64, size(g, 1), 2, 2, size(g, 3))
+            w[:, 1, 1, :] = g[:, 1, :]
+            w[:, 2, 2, :] = g[:, 2, :]
+            w
+        end for g in x.c
+    ]
+end
+
+"Unit shift with LSB-first carry states; periodic overflow wraps around."
+function shift_mpo(R::Int, step::Int = 1; boundary = :periodic)
+    1 <= R <= 60 || throw(ArgumentError("Shift needs 1:60 binary sites"))
+    abs(step) == 1 || throw(ArgumentError("Only unit shifts are supported"))
+    boundary in (:periodic, :open) || throw(ArgumentError("Unknown shift boundary"))
+    cores = Array{ComplexF64,4}[]
+    for k = 1:R
+        w = zeros(ComplexF64, k == 1 ? 1 : 2, 2, 2, k == R ? 1 : 2)
+        for carry in (k == 1 ? (1:1) : (0:1)), input = 0:1
+            total = input + carry
+            output, next = mod(total, 2), total ÷ 2
+            k == R && boundary == :open && next != 0 && continue
+            w[k == 1 ? 1 : carry + 1, output + 1, input + 1, k == R ? 1 : next + 1] = 1
+        end
+        push!(cores, step == 1 ? w : permutedims(w, (1, 3, 2, 4)))
+    end
+    cores
+end
+"Apply an MPO with library-owned canonicalization and rank control."
+function apply_mpo(w, x::QTT; tol = 1e-11, cap = 64, algorithm = :zipup)
+    algebra_options(tol, cap)
+    length(w) == length(x) || throw(DimensionMismatch("MPO action lengths"))
+    if algorithm === :TCI
+        product = TCI.contract(
+            TCI.TensorTrain(w),
+            tensortrain(x);
+            algorithm,
+            tolerance = Float64(tol),
+            maxbonddim = cap,
+        )
+        return QTT(product.sitetensors)
+    end
+    algorithm in (:zipup, :naive) || throw(ArgumentError("Unknown MPO algorithm: $algorithm"))
+    result = with_sampling_seed(0) do
+        psi = ITensorMPS.MPS(tensortrain(x))
+        sites = ITensorMPS.siteinds(psi)
+        operator = ITensorMPS.MPO(TCI.TensorTrain(w); sites = [[s', s] for s in sites])
+        exact =
+            iszero(tol) && all(k -> size(w[k], 4) * size(x.c[k], 3) <= cap, 1:(length(x) - 1))
+        product = if exact
+            ITensorMPS.apply(operator, psi; alg = "naive", truncate = false)
+        elseif algorithm === :naive
+            ITensorMPS.apply(operator, psi; alg = "naive", cutoff = tol^2, maxdim = cap)
+        else
+            # ITensor cutoffs bound discarded squared weight, not amplitude error.
+            # zip-up canonicalizes both operands and owns the final truncation.
+            ITensorMPS.apply(
+                operator,
+                psi;
+                alg = "zipup",
+                cutoff = (tol / length(x))^2,
+                maxdim = max(2cap, 16),
+                truncate_kwargs = (; cutoff = tol^2, maxdim = cap),
+            )
+        end
+        QTT(product)
+    end
+    foreach(core -> require_finite(core, "nonfinite_mpo_result"), result.c)
+    result
+end
+function delta_tt(R, j)
+    QTT([reshape(ComplexF64[s == ((j >> (k - 1)) & 1) + 1 for s = 1:2], 1, 2, 1) for k = 1:R])
+end
+function green_kernel(R, h, mu)
+    1 <= R <= 60 || throw(ArgumentError("Green needs 1:60 binary sites"))
+    isfinite(h) && h > 0 && isfinite(mu) && !iszero(mu) && real(mu) >= 0 || throw(
+        ArgumentError(
+            "Green needs positive spacing and a nonzero shift in the closed right half-plane",
+        ),
+    )
+    gamma = 2asinh(h * sqrt(mu / 2))
+    N = 2^R
+    # Two rank-one exponentials; never form a vector of length N.
+    p = QTT([reshape(ComplexF64[1, exp(-gamma * 2^(k - 1))], 1, 2, 1) for k = 1:R])
+    q = QTT([reshape(ComplexF64[exp(-gamma * 2^(k - 1)), 1], 1, 2, 1) for k = 1:R])
+    kern = add(p, scale(q, exp(-gamma)); tol = 1e-14, cap = 2)
+    scale(kern, h^2 / (sinh(gamma) * (-expm1(-gamma * N))))
+end
+green_mpo(R, h, mu) = circulant(green_kernel(R, h, mu))
+
+"Periodic FD2 spectral filter with gain 1 / (1 + (lambda / cutoff)^2)."
+function lowpass_mpo(R, h, cutoff)
+    isfinite(cutoff) && cutoff > 0 ||
+        throw(ArgumentError("Low-pass cutoff must be finite and positive"))
+    scaled_h = h * sqrt(cutoff)
+    isfinite(scaled_h^2) && scaled_h^2 > 0 ||
+        throw(ArgumentError("Invalid scaled low-pass spacing"))
+    # With spacing h*sqrt(cutoff), the Green kernel inverts T/cutoff + iI.
+    kernel = scale(green_kernel(R, scaled_h, im), im)
+    # Carry real and imaginary amplitudes to take the real part of the full product.
+    cores = map(eachindex(kernel.c)) do k
+        re, ii = real.(kernel.c[k]), imag.(kernel.c[k])
+        if R == 1
+            ComplexF64.(re)
+        elseif k == 1
+            ComplexF64.(cat(re, -ii; dims = 3))
+        elseif k == R
+            ComplexF64.(cat(re, ii; dims = 1))
+        else
+            ComplexF64.(cat(cat(re, -ii; dims = 3), cat(ii, re; dims = 3); dims = 1))
+        end
+    end
+    circulant(QTT(cores))
+end
+
+# Interpolate neighboring periodic samples to evaluate a QTT on a finer grid.
+
+"Periodic degree-five interpolation of normalized grid amplitudes, using six TT point queries."
+struct PeriodicRefinement
+    evaluate::Evaluator
+    coarse_size::Int
+    ratio::Int
+    nodes::Vector{Int}
+    weights::Matrix{Float64}
+end
+function PeriodicRefinement(x::QTT, target_R::Int; degree = 5, cachebits = 10)
+    target_R > length(x) || throw(ArgumentError("Refinement requires a finer grid"))
+    q = 1 << (target_R - length(x))
+    nodes = collect((-(degree ÷ 2)):(degree ÷ 2 + 1))
+    weights = [
+        prod((s / q - b) / (a - b) for b in nodes if b != a) / sqrt(q) for a in nodes, s = 0:(q - 1)
+    ]
+    PeriodicRefinement(Evaluator(x; cachebits), 1 << length(x), q, nodes, weights)
+end
+function (p::PeriodicRefinement)(j::Int)
+    coarse, offset = divrem(j, p.ratio)
+    offset == 0 && return p.evaluate(mod(coarse, p.coarse_size)) / sqrt(p.ratio)
+    sum(
+        p.weights[k, offset + 1] * p.evaluate(mod(coarse + p.nodes[k], p.coarse_size)) for
+        k in eachindex(p.nodes)
+    )
 end
