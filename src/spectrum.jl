@@ -636,19 +636,8 @@ function fixed_spectrum(
             o.adaptive_ritz ? max(o.ritz_tolerance, o.max_ritz_tolerance) : o.ritz_tolerance
         initial_cfg = merge(cfg, (orthogonalization_tolerance = initial_tol,))
         subspace = nothing
-        if use_subspace && o.method != :lanczos
-            orbitals, eps, gram_defect = Q.subspace_ritz(
-                orbitals,
-                o.states,
-                project_matrices,
-                cfg,
-                rec;
-                tol = o.ritz_tolerance,
-            )
-            subspace = (; basis = orbitals, energies = eps, gram_defect)
-        elseif o.method == :lanczos
-            orbitals, gram_defect = Q.orthogonalize(orbitals, cfg, rec)
-            eps = zeros(o.states)
+        if use_subspace
+            orbitals = first(Q.orthogonalize(orbitals, cfg, rec))
         elseif resumed === nothing
             orbitals = Q.timed(rec, "initial_orthogonalization") do
                 first(Q.orthogonalize(orbitals, initial_cfg, rec; force = true))
@@ -691,8 +680,23 @@ function fixed_spectrum(
                     # Rotation changes state identities; reset rather than mismatch columns.
                     orbitals, eps = spectrum_ritz(orbitals, H, cfg, rec, o, potential)
                     previous = nothing
+                elseif o.method == :lanczos
+                    orbitals, subspace, metrics = Q.lanczos_step(
+                        orbitals,
+                        subspace,
+                        H,
+                        cfg,
+                        rec;
+                        work_tol = min(
+                            accuracy.work_tolerance,
+                            o.ritz_tolerance,
+                            scf.eigen_tolerance / 10,
+                        ),
+                        ritz_tol = o.ritz_tolerance,
+                        potential = search_field,
+                    )
                 elseif use_subspace
-                    orbitals, subspace, metrics = Q.subspace_step(
+                    orbitals, subspace, metrics = Q.davidson_step(
                         o.method,
                         orbitals,
                         subspace,

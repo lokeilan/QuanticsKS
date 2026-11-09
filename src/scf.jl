@@ -104,8 +104,19 @@ function ground_state(
                         work_tol = accuracy.work_tolerance,
                         potential,
                     )
+                elseif solver == :lanczos
+                    orbitals, subspace, metrics = Q.lanczos_step(
+                        orbitals,
+                        subspace,
+                        H,
+                        cfg,
+                        rec;
+                        work_tol = min(accuracy.work_tolerance, cfg.eigen_tolerance / 10),
+                        ritz_tol = cfg.orthogonalization_tolerance,
+                        potential = subspace_field,
+                    )
                 else
-                    orbitals, subspace, metrics = Q.subspace_step(
+                    orbitals, subspace, metrics = Q.davidson_step(
                         solver,
                         orbitals,
                         subspace,

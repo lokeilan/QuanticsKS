@@ -69,8 +69,10 @@ TensorCrossInterpolation supplies fitting, tensor addition, compression, and
 contraction environments, including the signed 3D kernel suffix. ITensorMPS
 supplies MPO matrix elements, canonical forms, compression recovery, and ordinary
 MPO application through TCI's conversion extension. KrylovKit supplies scalar
-and block Lanczos recurrences and reorthogonalization. Its VectorInterface
-adapter in `solvers.jl` carries QTT working tolerances and rank caps.
+and block Lanczos recurrences and modified Gram-Schmidt for Davidson as well.
+Their shared `QTTVector` adapter in `solvers.jl` implements VectorInterface
+with QTT working tolerances and rank caps. The workflows call `lanczos_step`
+or `davidson_step` directly; both Davidson variants share one implementation.
 Hamiltonian projection reuses converted orbitals and operators within a call.
 Checkpoints store QTT cores and retain their package type identities.
 

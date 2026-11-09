@@ -115,6 +115,11 @@ budget raises an error.
 Lanczos for several orbitals. Each `inner_steps` update advances one recurrence
 step, with an explicit restart when the trial space reaches its size limit.
 The shared working tolerance and rank cap also control its QTT vector algebra.
+`"davidson"` and `"block_davidson"` select generalized Davidson with the
+shifted kinetic inverse, controlled by `scf.green_shift`. The first expands
+with one residual correction; the second uses every unconverged requested
+orbital. `scf.eigen_tolerance` determines which residuals need corrections.
+Independent physical acceptance still uses the reconstructed orbitals.
 
 `[audit]` sets independent final-state numerical budgets. `rank_multiplier`
 scales both inherited and explicitly overridden field caps. `[guess]` controls

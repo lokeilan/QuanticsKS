@@ -50,6 +50,8 @@ The choices are `:lrrap` (default), `:lanczos`, `:davidson`, and
 `fixed_spectrum(state, potential; solver=:lanczos, spectrum=options)`.
 Lanczos uses KrylovKit's scalar or block three-term recurrence, with
 reorthogonalization and explicit restart from the retained Ritz orbitals.
+The Davidson choices use generalized Davidson with a shifted kinetic-inverse
+preconditioner and share KrylovKit's direction orthogonalization.
 
 ## Documentation
 
