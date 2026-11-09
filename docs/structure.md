@@ -66,10 +66,15 @@ operations used by every model. Its files are loaded by `QuanticsKS.jl`.
 | [lrrap.jl](../src/lrrap.jl) | Tangent projection, orbital updates, orthogonalization, mixing, and storage |
 
 TensorCrossInterpolation supplies fitting, tensor addition, compression, and
-contraction environments. ITensorMPS supplies MPO matrix elements, canonical
-forms, and ordinary MPO application through TCI's conversion extension.
+contraction environments, including the signed 3D kernel suffix. ITensorMPS
+supplies MPO matrix elements, canonical forms, compression recovery, and ordinary
+MPO application through TCI's conversion extension.
 Hamiltonian projection reuses converted orbitals and operators within a call.
 Checkpoints store QTT cores and retain their package type identities.
+
+Local tensor loops implement the grid's carry and borrow rules, bounded sample
+caches, and cancellation-sensitive expressions. Dependent SCF, Green, and
+tangent-coordinate updates remain explicit in the solver.
 
 Read `scf.jl` for the ground-state workflow, `hamiltonian.jl` for its physical
 operators, and `lrrap.jl` for the inner orbital update. Dimension-specific methods

@@ -1,5 +1,6 @@
 # Core axes are (left bond, binary site, right bond); inner products use Euclidean weights.
 
+# Keep this stored type stable for checkpoints; library operations use its TensorTrain view.
 struct QTT
     c::Vector{Array{ComplexF64,3}}
 end
@@ -64,13 +65,13 @@ function inner_mpo(x::QTT, w, y::QTT)
     end
 end
 normalize(x::QTT; cfg = (;)) = scale(x, 1 / ttnorm(x; cfg))
-function algebra_options(tol, cap)
+function validate_truncation(tol, cap)
     isfinite(tol) && tol >= 0 || throw(ArgumentError("Invalid QTT tolerance"))
     cap >= 1 || throw(ArgumentError("QTT rank cap must be positive"))
     nothing
 end
 function rounded(x::QTT; tol = 1e-11, cap = 64)
-    algebra_options(tol, cap)
+    validate_truncation(tol, cap)
     tt = with_svd_context(;
         operation = "rounded",
         original_cores = x.c,
@@ -85,18 +86,9 @@ function rounded(x::QTT; tol = 1e-11, cap = 64)
     QTT(tt.sitetensors)
 end
 
-"Establish a right-orthogonal suffix by QR, without tolerance-based truncation."
-function right_canonical(x::QTT)
-    check_compression_shapes(x.c)
-    foreach(g -> require_finite(g, "nonfinite_right_canonical_input"), x.c)
-    with_sampling_seed(0) do
-        psi = ITensorMPS.MPS(tensortrain(x))
-        QTT(ITensorMPS.orthogonalize!(psi, 1))
-    end
-end
 "Pointwise addition uses recorded TCI when rec is supplied, otherwise library TT addition."
 function add(x::QTT, y::QTT; a = 1, b = 1, tol = 1e-11, cap = 64, rec = nothing, label = "add")
-    algebra_options(tol, cap)
+    validate_truncation(tol, cap)
     length(x) == length(y) || throw(DimensionMismatch("QTT addition lengths"))
     if rec !== nothing
         return linear_combination(rec, (x, y), (a, b); tol, cap, label)
@@ -116,28 +108,8 @@ function add(x::QTT, y::QTT; a = 1, b = 1, tol = 1e-11, cap = 64, rec = nothing,
     catch error
         retryable_svd_error(error) || rethrow()
     end
-    # Retry from the original inputs with the existing checked SVD/QR path.
-    d = length(x)
-    result = TCI.TensorTrain([
-        TCI._addtttensor(
-            x.c[k],
-            y.c[k];
-            factorA = k == d ? a : one(ComplexF64),
-            factorB = k == d ? b : one(ComplexF64),
-            lefttensor = k == 1,
-            righttensor = k == d,
-        ) for k = 1:d
-    ])
-    original = copy(result.sitetensors)
-    with_svd_context(;
-        operation = "direct_add",
-        original_cores = original,
-        tolerance = tol,
-        rank_cap = cap,
-    ) do
-        guarded_compress!(result; tolerance = Float64(tol), maxbonddim = cap)
-    end
-    QTT(result.sitetensors)
+    # Reuse the amplitude-space sum when library addition fails numerically.
+    materialize_expression(linear_expression((x, y), (a, b)); tol, cap)
 end
 function constant_tt(R, value = 1)
     c = [ones(ComplexF64, 1, 2, 1) for k = 1:R]
@@ -186,10 +158,9 @@ mutable struct Evaluator
 end
 function Evaluator(x::QTT; cachebits = 10)
     0 <= cachebits <= 16 || throw(ArgumentError("Environment cache bits must be 0:16"))
-    # cachebits is the number of cached binary sites at each end, not a
-    # dictionary-entry budget. Retain only the endpoint environments. R16
-    # with cachebits=8 needs two sets of 256 vectors and one dot product/query.
-    # Larger grids contract the uncached middle cores using reusable buffers.
+    # Cache this many binary sites at each end. At R16, cachebits=8 stores
+    # two sets of 256 vectors and reduces each query to one dot product.
+    # Reusable buffers bound memory for the uncached middle of larger grids.
     p = min(cachebits, length(x) ÷ 2)
     s = min(cachebits, length(x) - p)
     cache = TCI.TTCache(tensortrain(x))
@@ -434,7 +405,7 @@ end
 
 "Build just the final linear combination, then apply the existing guarded SVD rounding."
 function materialize_expression(x::QTTExpression; tol, cap)
-    algebra_options(tol, cap)
+    validate_truncation(tol, cap)
     isempty(x.terms) && return constant_tt(x.R, 0)
     length(x.terms) == 1 && return rounded(scale(only(x.terms), only(x.coefficients)); tol, cap)
     C, cores = expression_qr(x.terms, reshape(x.coefficients, :, 1); keep_cores = true)
@@ -496,7 +467,7 @@ function shift_mpo(R::Int, step::Int = 1; boundary = :periodic)
 end
 "Apply an MPO with library-owned canonicalization and rank control."
 function apply_mpo(w, x::QTT; tol = 1e-11, cap = 64, algorithm = :zipup)
-    algebra_options(tol, cap)
+    validate_truncation(tol, cap)
     length(w) == length(x) || throw(DimensionMismatch("MPO action lengths"))
     if algorithm === :TCI
         product = TCI.contract(
@@ -609,10 +580,7 @@ function (p::PeriodicRefinement)(j::Int)
     )
 end
 
-
-# Compression diagnostics and recovery.
-
-# SVD checks, failure records, and retries; diagnostic context is local to the current task.
+# SVD failure records and recovery; diagnostic context belongs to the current task.
 
 using Serialization, Dates, JSON3
 
@@ -724,27 +692,6 @@ function checked_svd(A; full = false, factorize = svd)
     end
 end
 
-"TCI 0.9.19 SVD factorization, preserving its local tail criterion exactly."
-function guarded_svd_factorize(A; tolerance, maxbonddim, leftorthogonal, normalizeerror = true)
-    f = checked_svd(A)
-    reltol, abstol = normalizeerror ? (tolerance, 0.0) : (1e-14, tolerance)
-    err = [sum(f.S[(n + 1):end] .^ 2) for n = 1:length(f.S)]
-    normalized_err = err ./ sum(f.S .^ 2)
-    # The library keeps all available singular vectors at tolerance=0,
-    # including the all-zero case. Keep its strict comparisons and cap.
-    rank = min(
-        something(findfirst(<(abstol^2), err), length(err)),
-        something(findfirst(<(reltol^2), normalized_err), length(err)),
-        maxbonddim,
-    )
-    left, right =
-        leftorthogonal ? (f.U[:, 1:rank], Diagonal(f.S[1:rank]) * f.Vt[1:rank, :]) :
-        (f.U[:, 1:rank] * Diagonal(f.S[1:rank]), f.Vt[1:rank, :])
-    require_finite(left, "nonfinite_left_svd_factor"; details = (; input = A, S = f.S))
-    require_finite(right, "nonfinite_right_svd_factor"; details = (; input = A, S = f.S))
-    left, right, rank
-end
-
 "Validate bond shapes before a TensorTrain constructor can discard diagnostic context."
 function check_compression_shapes(cores)
     for (k, g) in enumerate(cores)
@@ -761,63 +708,53 @@ function check_compression_shapes(cores)
     nothing
 end
 
-"Use library compression; replay with diagnostics only after a numerical failure."
-function guarded_compress!(tt; tolerance = 1e-12, maxbonddim = typemax(Int), normalizeerror = true)
+"Compress with TCI; recover from the preserved cores through ITensorMPS."
+function guarded_compress!(
+    tt;
+    tolerance = 1e-12,
+    maxbonddim = typemax(Int),
+    compress = TCI.compress!,
+)
     check_compression_shapes(tt.sitetensors)
-    for (k, g) in enumerate(tt.sitetensors)
-        with_svd_context(; site = k, direction = "input") do
-            require_finite(g, "nonfinite_compression_input")
+    for (site, core) in enumerate(tt.sitetensors)
+        with_svd_context(; site, direction = "input") do
+            require_finite(core, "nonfinite_compression_input")
         end
     end
     # TCI replaces cores without mutating the originals, so a shallow copy is enough.
     original_cores = copy(tt.sitetensors)
-    try
-        TCI.compress!(tt, :SVD; tolerance, maxbonddim, normalizeerror)
+    failure = try
+        compress(tt, :SVD; tolerance, maxbonddim)
         all(core -> all(isfinite, core), tt.sitetensors) && return nothing
-    catch error
+        "TCI compression returned nonfinite cores"
+    catch exception
         intermediate_nonfinite =
-            error isa ArgumentError &&
-            occursin("matrix contains Infs or NaNs", sprint(showerror, error))
-        retryable_svd_error(error) || intermediate_nonfinite || rethrow()
+            exception isa ArgumentError &&
+            occursin("matrix contains Infs or NaNs", sprint(showerror, exception))
+        retryable_svd_error(exception) || intermediate_nonfinite || rethrow()
+        sprint(showerror, exception)
     end
     tt.sitetensors .= original_cores
-    # The pinned library has no factorization callback for checked QR recovery.
-    for k = 1:(length(tt) - 1)
-        with_svd_context(; site = k, direction = "forward") do
-            sh = size(tt.sitetensors[k])
-            A = reshape(tt.sitetensors[k], prod(sh[1:(end - 1)]), sh[end])
-            left, right, rank = guarded_svd_factorize(
-                A;
-                tolerance = 0.0,
-                maxbonddim = typemax(Int),
-                leftorthogonal = true,
-            )
-            tt.sitetensors[k] = reshape(left, sh[1:(end - 1)]..., rank)
-            sn = size(tt.sitetensors[k + 1])
-            neighbor = reshape(tt.sitetensors[k + 1], sn[1], prod(sn[2:end]))
-            next = right * neighbor
-            require_finite(next, "nonfinite_forward_contraction"; details = (; right, neighbor))
-            tt.sitetensors[k + 1] = reshape(next, rank, sn[2:end]...)
+    event = save_svd_event(
+        first(original_cores),
+        "tci_compression_failed";
+        details = (; original_cores, failure),
+    )
+    try
+        recovered = with_sampling_seed(0) do
+            psi = ITensorMPS.MPS(TCI.TensorTrain(original_cores))
+            # ITensor's SVD backend retries failed factorizations with QR iteration.
+            # Its cutoff is a discarded squared weight; our tolerance is an amplitude.
+            ITensorMPS.truncate!(psi; cutoff = tolerance^2, maxdim = maxbonddim)
+            QTT(psi)
         end
-    end
-    for k = length(tt):-1:2
-        with_svd_context(; site = k, direction = "backward") do
-            sh = size(tt.sitetensors[k])
-            A = reshape(tt.sitetensors[k], sh[1], prod(sh[2:end]))
-            left, right, rank = guarded_svd_factorize(
-                A;
-                tolerance,
-                maxbonddim,
-                normalizeerror,
-                leftorthogonal = false,
-            )
-            tt.sitetensors[k] = reshape(right, rank, sh[2:end]...)
-            sp = size(tt.sitetensors[k - 1])
-            neighbor = reshape(tt.sitetensors[k - 1], prod(sp[1:(end - 1)]), sp[end])
-            next = neighbor * left
-            require_finite(next, "nonfinite_backward_contraction"; details = (; neighbor, left))
-            tt.sitetensors[k - 1] = reshape(next, sp[1:(end - 1)]..., rank)
-        end
+        all(core -> all(isfinite, core), recovered.c) ||
+            error("ITensorMPS compression returned nonfinite cores")
+        tt.sitetensors .= recovered.c
+        finish_svd_event(event, "recovered_with_itensormps")
+    catch exception
+        finish_svd_event(event, "recovery_failed"; error = sprint(showerror, exception))
+        rethrow()
     end
     nothing
 end

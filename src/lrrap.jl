@@ -20,9 +20,6 @@ function canonical_frame(x::QTT; cfg = (;))
     off = cumsum(vcat(0, [prod(s) for s in sh]))
     Frame(u, v, sh, off)
 end
-function pack_delta(f::Frame, gs)
-    reduce(vcat, vec.(gs))
-end
 function unpack_delta(f::Frame, z)
     [reshape(view(z, (f.offsets[k] + 1):f.offsets[k + 1]), f.shapes[k]) for k = 1:length(f.shapes)]
 end
@@ -35,6 +32,7 @@ function gauge!(g, u)
 end
 "Project an MPO action directly into tangent coordinates, without constructing W*x."
 function project(f::Frame, x::QTT, w = nothing)
+    # The frame and trial orbital can differ, so environments carry separate bonds.
     d = length(x)
     if w === nothing
         w = [reshape(Matrix{ComplexF64}(I, 2, 2), 1, 2, 2, 1) for k = 1:d]
@@ -68,7 +66,7 @@ function project(f::Frame, x::QTT, w = nothing)
             left = e
         end
     end
-    pack_delta(f, ds)
+    reduce(vcat, vec.(ds))
 end
 function tangent_tt(f::Frame, z)
     ds = unpack_delta(f, z)
@@ -108,26 +106,6 @@ Hamiltonian(v, d, plus, minus, h) = Hamiltonian(v, d, plus, minus, Float64(h), n
 "Share the fixed local field across all sampled actions of one Hamiltonian."
 potential_samples(H::Hamiltonian, rec) =
     H.samples === nothing ? memoized_sample(H.potential, rec) : H.samples
-struct HamiltonianEvaluator{X,V}
-    orbital::X
-    potential::V
-    N::Int
-    inverse_two_h_squared::Float64
-end
-
-function h_evaluator(H, psi, rec; potential = nothing)
-    ev = potential === nothing ? potential_samples(H, rec) : potential
-    HamiltonianEvaluator(evaluate(psi, rec), ev, 2^length(psi), 1 / (2H.h^2))
-end
-
-# Take neighboring differences before adding the local potential/residual term.
-function residual_value(e::HamiltonianEvaluator, j::Int, energy)
-    center = e.orbital(j)
-    gradient = (center - e.orbital(mod(j - 1, e.N))) + (center - e.orbital(mod(j + 1, e.N)))
-    gradient * e.inverse_two_h_squared + (e.potential(j) - energy) * center
-end
-(e::HamiltonianEvaluator)(j::Int) = residual_value(e, j, 0)
-
 # Used only when every initial pivot cancels. Preserve a core-algebra fallback
 # instead of declaring an unsampled large-grid function globally zero.
 function h_core_fallback(H, psi, energy; tol, cap)
@@ -154,7 +132,7 @@ function h_residual(
     label = "orbital_residual",
     potential = nothing,
 )
-    algebra_options(tol, cap)
+    validate_truncation(tol, cap)
     isfinite(energy) || throw(ArgumentError("Nonfinite orbital energy"))
     orbital = sampled(psi, rec)
     field =
@@ -214,11 +192,11 @@ function h_expectation(H, psi)
     real(only(h_gram([psi], H)))
 end
 
-function h_projection_gradient(H, psi)
+function shift_difference(shift, psi)
     # Exact low-rank shift, used only for cancellation-prone kinetic entries.
     # No sampled fit or finite-tolerance truncation enters this fallback.
-    cap = maximum(size(w, 4) * size(g, 3) for (w, g) in zip(H.plus, psi.c))
-    shifted = apply_mpo(H.plus, psi; tol = 0.0, cap)
+    cap = maximum(size(w, 4) * size(g, 3) for (w, g) in zip(shift, psi.c))
+    shifted = apply_mpo(shift, psi; tol = 0.0, cap)
     materialize_expression(
         linear_expression((shifted, psi), (1, -1));
         tol = 0.0,
@@ -254,7 +232,7 @@ function h_gram(orbitals, H; cfg = (;))
         gradients = Vector{QTT}(undef, b)
         foreach_independent(length(needed), cfg) do k
             i = needed[k]
-            gradients[i] = h_projection_gradient(H, orbitals[i])
+            gradients[i] = shift_difference(H.plus, orbitals[i])
         end
         foreach_independent(b, cfg) do j
             for i = 1:j
@@ -267,7 +245,6 @@ function h_gram(orbitals, H; cfg = (;))
         A
     end
 end
-
 
 # Orbital updates, orthogonalization, and density mixing.
 
@@ -471,6 +448,7 @@ function coefficients(
         a[2:end, 2:end] = HV
         as[i] = a
     end
+    # Each orbital's constraints use the coefficients already updated in this sweep.
     for sweep = 1:nsweeps, i = 1:b
         ids = vcat(i, (b + 1):(b + m))
         other = [j for j = 1:b if j != i]

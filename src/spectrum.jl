@@ -259,24 +259,6 @@ function spectrum_ritz(
     end
     updated_orbitals, fac.values[1:keep]
 end
-function spectrum_actions(orbitals, H, cfg, rec, o, potential; tol = o.diagnostic_tolerance)
-    # Compatibility entry for consumers explicitly requesting final H*x cores.
-    # Search and diagnostic residuals bypass this intermediate representation.
-    projected_H = spectrum_projection_hamiltonian(H, potential, cfg, rec; tol)
-    Q.recorded_map(Q.QTT, length(orbitals), cfg, rec) do i, localrec
-        Q.h_residual(
-            projected_H,
-            orbitals[i],
-            0.0,
-            cfg,
-            localrec;
-            tol,
-            cap = cfg.workcap,
-            label = "fixed_Hpsi_$i",
-            potential = j -> potential[j + 1],
-        )
-    end
-end
 function spectrum_residuals(orbitals, H, cfg, o, rec, potential)
     o.diagnostics == :streaming_grid &&
         return spectrum_grid_residuals(orbitals, H, potential, cfg, rec, o)
@@ -323,12 +305,7 @@ function simple_green_step(orbitals, energies, H, green, cfg, rec, o, potential,
             )
         end
         y = Q.timed(localrec, "green_mpo"; item = string(i)) do
-            Q.apply_mpo(
-                green,
-                rhs;
-                tol = accuracy.algebra_tolerance,
-                cap = accuracy.orbital_cap,
-            )
+            Q.apply_mpo(green, rhs; tol = accuracy.algebra_tolerance, cap = accuracy.orbital_cap)
         end
         Q.timed(localrec, "orbital_normalization"; item = string(i)) do
             Q.ttnorm(y) > 1e-14 || error("Green update produced a zero orbital")
@@ -393,12 +370,7 @@ function residual_subspace_step(
         green_tol =
             o.search_basis == :direct ?
             min(work_tolerance, o.green_tolerance_factor * ritz_tolerance) : work_tolerance
-        z = Q.apply_mpo(
-            green,
-            r;
-            tol = green_tol,
-            cap = cfg.workcap,
-        )
+        z = Q.apply_mpo(green, r; tol = green_tol, cap = cfg.workcap)
         Q.ttnorm(z) > 1e-14 ? Q.normalize(z) : nothing
     end
     zs = Q.QTT[z for z in candidates if z !== nothing]

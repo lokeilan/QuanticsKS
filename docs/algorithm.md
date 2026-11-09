@@ -86,6 +86,8 @@ operation uses truncated QTT conjugate gradients. It accepts a result only when
 the residual of the stored state meets `green_relative_tolerance`. That residual
 uses exact open shifts and an untruncated linear expression, with a QR fallback
 for cancellation. Fine 3D grids can require many CG iterations and large ranks.
+The Green action and its residual share one FD2 expression. Its exact shift
+terms are combined before the working result is compressed.
 
 ## Tensor construction and rank control
 
@@ -99,6 +101,13 @@ final truncation. For `d` binary sites, the amplitude tolerance `tol` maps to
 local squared-weight cutoff `(tol/d)^2` and final cutoff `tol^2`. The outer
 solver does not append another rounding sweep. Rank caps can still limit the
 achieved accuracy. Zero tolerance and sufficient rank use an untruncated product.
+
+Ordinary tensor rounding and addition use TCI. If TCI compression fails
+numerically, ITensorMPS retries from the original cores using `truncate!`, with
+cutoff `tol^2` and the same rank cap. Failure records retain the original cores
+and the recovery outcome. Linear-combination fallbacks use a common QR basis
+and combine amplitudes before rounding, preserving small differences between
+nearly equal terms.
 
 Field construction, working orbitals, and stored orbitals have separate rank
 and tolerance controls. TCI pivot error is distinct from global approximation

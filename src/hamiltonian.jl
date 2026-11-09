@@ -159,7 +159,8 @@ function effective_hamiltonian(problem, rho, ops, accuracy, rec; time = 0.0, dri
     # Core projections need one shared field representation; sampled residuals
     # and Green sources consume the original local expression directly.
     Veff =
-        problem.model isa LocalPotential1D && drive isa NoDrive &&
+        problem.model isa LocalPotential1D &&
+        drive isa NoDrive &&
         Q.rank(ops.external) <= field_caps(accuracy).effective_potential_cap ? ops.external :
         Q.cross(
             rec,
@@ -239,7 +240,6 @@ function total_energy(problem, orbitals, rho, ops, accuracy, rec; time = 0.0, dr
     )
 end
 
-
 # Cartesian operators for isolated 3D systems.
 
 "Lift a one-axis MPO into interleaved Cartesian sites with identity spectators."
@@ -268,20 +268,15 @@ function cartesian_toeplitz(kernel::Q.QTT, R::Int)
     length(kernel) == 3(R + 1) || throw(DimensionMismatch("Signed kernel grid"))
     d = 3R
     # The final three kernel bits encode the sign of each coordinate difference.
-    tail = Matrix{ComplexF64}(undef, size(kernel.c[d], 3), 8)
-    for mask = 0:7
-        value = Matrix{ComplexF64}(I, size(tail, 1), size(tail, 1))
-        for axis = 1:3
-            value = value * kernel.c[d + axis][:, ((mask >> (axis - 1)) & 1) + 1, :]
-        end
-        tail[:, mask + 1] = vec(value)
-    end
+    cache = Q.TCI.TTCache(Q.tensortrain(kernel))
+    tail = hcat([Q.TCI.evaluateright(cache, Q.bits(mask, 3)) for mask = 0:7]...)
     out = Array{ComplexF64,4}[]
     for k = 1:d
         g = kernel.c[k]
         rl, _, rr = size(g)
         axis = mod1(k, 3)
         w = zeros(ComplexF64, k == 1 ? 1 : 8rl, 2, 2, k == d ? 1 : 8rr)
+        # One borrow bit per axis implements signed displacement without periodic wrap.
         for mask in (k == 1 ? (0:0) : (0:7)), i = 0:1, j = 0:1
             z = i - j - ((mask >> (axis - 1)) & 1)
             next = (mask & ~(1 << (axis - 1))) | ((z < 0 ? 1 : 0) << (axis - 1))
@@ -428,7 +423,6 @@ function build_operators(p::Problem{<:AbstractModel3D}, a, rec, physics::Physics
     )
 end
 
-
 # Cartesian fields, Hamiltonian actions, and Green solves.
 
 struct MPOContractionSamples <: Q.SampledFunction
@@ -528,17 +522,18 @@ function effective_hamiltonian(p::Problem{<:AbstractModel3D}, rho, ops, a, rec; 
     CartesianHamiltonian(v, Q.diagonal(v), ops.plus, ops.minus, p.grid, p.mass, field)
 end
 
-function kinetic_action(H::CartesianHamiltonian, psi; tol, cap)
+"Keep all FD2 terms until the caller combines and truncates its final expression."
+function kinetic_expression(H::CartesianHamiltonian, psi)
     weights = Float64[sum(1 ./ (H.mass .* spacing(H.grid) .^ 2))]
     terms = Q.QTT[psi]
     for a = 1:3, w in (H.plus[a], H.minus[a])
         push!(terms, Q.apply_mpo(w, psi; tol = 0.0, cap = 2Q.rank(psi)))
         push!(weights, -1 / (2H.mass * spacing(H.grid)[a]^2))
     end
-    Q.materialize_expression(Q.linear_expression(terms, weights); tol, cap)
+    Q.linear_expression(terms, weights)
 end
 function Q.h_core_fallback(H::CartesianHamiltonian, psi, energy; tol, cap)
-    kinetic = kinetic_action(H, psi; tol, cap)
+    kinetic = kinetic_expression(H, psi)
     potential = Q.apply_mpo(H.diagonal, psi; tol, cap)
     Q.materialize_expression(
         Q.linear_expression((kinetic, potential, psi), (1, 1, -energy));
@@ -557,7 +552,7 @@ function Q.h_residual(
     label = "orbital_residual",
     potential = nothing,
 )
-    Q.algebra_options(tol, cap)
+    Q.validate_truncation(tol, cap)
     isfinite(energy) || throw(ArgumentError("Nonfinite orbital energy"))
     ev = Q.evaluate(psi, rec)
     v = potential === nothing ? H.samples : potential
@@ -609,13 +604,7 @@ function Q.h_gram(orbitals, H::CartesianHamiltonian; cfg = (;))
         gradients = Dict{Tuple{Int,Int},Q.QTT}()
         gradient(i, a) =
             get!(gradients, (i, a)) do
-                psi = orbitals[i]
-                shifted = Q.apply_mpo(H.plus[a], psi; tol = 0.0, cap = 2Q.rank(psi))
-                Q.materialize_expression(
-                    Q.linear_expression((shifted, psi), (1, -1));
-                    tol = 0.0,
-                    cap = Q.rank(shifted) + Q.rank(psi),
-                )
+                Q.shift_difference(H.plus[a], orbitals[i])
             end
         faces = ntuple(a -> axis_mpo(Q.diagonal(Q.delta_tt(H.grid.R, (1 << H.grid.R) - 1)), a), 3)
         out = zeros(ComplexF64, length(orbitals), length(orbitals))
@@ -670,25 +659,17 @@ end
 
 "Residual of the stored state under the untruncated discrete Green operator."
 function green_residual(G::CartesianGreen, psi, rhs)
-    h = spacing(G.kinetic.grid)
-    terms = Q.QTT[rhs, psi]
-    weights = Float64[1, -G.shift - sum(1 ./ (G.kinetic.mass .* h .^ 2))]
-    for axis = 1:3, shift in (G.kinetic.plus[axis], G.kinetic.minus[axis])
-        push!(terms, Q.apply_mpo(shift, psi; tol = 0.0, cap = 2Q.rank(psi)))
-        push!(weights, 1 / (2G.kinetic.mass * h[axis]^2))
-    end
-    Q.linear_expression(terms, weights)
+    Q.linear_expression((rhs, kinetic_expression(G.kinetic, psi), psi), (1, -1, -G.shift))
 end
 
 function Q.apply_mpo(G::CartesianGreen, rhs::Q.QTT; tol = 1e-11, cap = G.cap, kwargs...)
-    Q.algebra_options(tol, cap)
+    Q.validate_truncation(tol, cap)
     target = G.tolerance
     worktol = min(max(tol, eps(Float64)), target / 100)
     workcap = max(cap, G.cap)
     combine(xs, ws) =
         Q.materialize_expression(Q.linear_expression(xs, ws); tol = worktol, cap = workcap)
-    action(x) =
-        combine((kinetic_action(G.kinetic, x; tol = worktol, cap = workcap), x), (1, G.shift))
+    action(x) = combine((kinetic_expression(G.kinetic, x), x), (1, G.shift))
     normrhs = Q.ttnorm(rhs)
     normrhs == 0 && return Q.constant_tt(length(rhs), 0)
     x, r, direction = Q.constant_tt(length(rhs), 0), rhs, rhs

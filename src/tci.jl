@@ -1,5 +1,6 @@
 # Dense addressing on small grids; bounded CLOCK eviction on larger grids.
 # A cache belongs to one fixed input function, never to a changing SCF label.
+# TCI's cached functions retain all samples; this cache enforces the run's memory budget.
 mutable struct SampleCache{T}
     values::Vector{T}
     valid::BitVector
@@ -88,7 +89,6 @@ function map_slice(f, ::Type{T}, R, left, right, ::Val{M}) where {T,M}
     end
     reshape(out, length(left), ntuple(_ -> 2, M)..., length(right))
 end
-slice_indices(R, left, right, middle::Val) = map_slice(identity, Int, R, left, right, middle)
 
 "Fill missing entries in rectangular batches without reevaluating cached points."
 function cached_slice!(compute, cache::SampleCache{T}, R, left, right, middle::Val{M}) where {T,M}
@@ -481,7 +481,6 @@ function (f::Union{SynchronizedSamples,SynchronizedBlockOracle})(left, right, mi
 end
 block_cache_stats(f::SynchronizedBlockOracle) = block_cache_stats(f.input)
 
-
 # TCI fitting, pivot reuse, and fit records.
 
 # Only geometry survives a fit. Values, LU factors, and input environments are refreshed.
@@ -744,8 +743,8 @@ function cross(
     rounding_tolerance = iszero(r.options.post_rounding_factor) ? nothing :
                          tol * r.options.post_rounding_factor,
 )
-    algebra_options(tol, cap)
-    rounding_tolerance === nothing || algebra_options(rounding_tolerance, cap)
+    validate_truncation(tol, cap)
+    rounding_tolerance === nothing || validate_truncation(rounding_tolerance, cap)
     1 <= R <= 60 || throw(ArgumentError("Binary grid must have 1:60 sites"))
     oracle = RecordedSamples(sampled(fn, R), r.options)
     key = (String(label), Int(R))
@@ -777,8 +776,8 @@ function cross(
         end
     if iszero(max(initial_max, old_max))
         if initial_zero_fallback !== nothing
-            # Addition may cancel at every initial pivot. Use library algebra
-            # rather than declaring the unsampled function globally zero.
+            # Zero initial samples do not establish global cancellation.
+            # The caller supplies a reconstruction from the original cores.
             x = initial_zero_fallback()
             dt = (time_ns() - tic) / 1e9
             r.samples += oracle.evaluations
@@ -794,7 +793,7 @@ function cross(
                     seconds = dt,
                     oracle_evaluations = oracle.evaluations,
                     rank = rank(x),
-                    construction = "library_tt_add_zero_initial_pivots",
+                    construction = "core_algebra_zero_initial_pivots",
                 ),
             )
             return x
@@ -930,7 +929,7 @@ function linear_combination(
     oracle = nothing,
     shared_pivots = "",
 )
-    algebra_options(tol, cap)
+    validate_truncation(tol, cap)
     isempty(xs) && throw(ArgumentError("A QTT linear combination needs at least one term"))
     length(xs) == length(coefficients) || throw(DimensionMismatch("QTT coefficient count"))
     R = length(first(xs))
@@ -941,14 +940,9 @@ function linear_combination(
     trains = [xs[i] for i in active]
     weights = ComplexF64[coefficients[i] for i in active]
     length(trains) == 1 && return rounded(scale(only(trains), only(weights)); tol, cap)
-    function library_sum()
-        result = scale(first(trains), first(weights))
-        for i = 2:length(trains)
-            result = add(result, trains[i]; b = weights[i], tol, cap)
-        end
-        result
-    end
-    R == 1 && return library_sum()
+    # Combine all amplitudes before rounding so intermediate sums cannot lose cancellation.
+    core_sum() = materialize_expression(linear_expression(trains, weights); tol, cap)
+    R == 1 && return core_sum()
     samples = if oracle === nothing
         LinearSamples(block_oracle(trains, rec), weights)
     elseif oracle isa Union{BlockOracle,SynchronizedBlockOracle}
@@ -956,7 +950,7 @@ function linear_combination(
     else
         sampled(j -> sum(w * v for (w, v) in zip(weights, view(oracle(j), active))), R)
     end
-    cross(rec, R, samples; tol, cap, label, shared_pivots, initial_zero_fallback = library_sum)
+    cross(rec, R, samples; tol, cap, label, shared_pivots, initial_zero_fallback = core_sum)
 end
 
 # Fit batches own their recorder and RNG; only ordered receipts reach the parent.
@@ -1103,7 +1097,6 @@ function recorded_map(
     )
     result
 end
-
 
 # Task scheduling and sampling RNG scope.
 
