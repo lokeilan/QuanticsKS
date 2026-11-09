@@ -76,7 +76,7 @@ function initial_state(problem, accuracy, rec, guess::InitialGuess)
             guess.slow_cosine_amplitude * cos(2pi * guess.slow_cosine_mode * j / ngrid) +
             guess.slow_sine_amplitude * sin(2pi * guess.slow_sine_mode * j / ngrid),
         );
-        tol = accuracy.field_tolerance / 10,
+        tol = cfg.orbital_tolerance / 10,
         cap = accuracy.orbital_cap,
         label = "initial_envelope",
     )
@@ -96,48 +96,48 @@ function initial_state(problem, accuracy, rec, guess::InitialGuess)
     OrbitalState(problem, first(Q.orthogonalize(orbitals, cfg, rec)))
 end
 
-function initial_state(p::Problem{<:AbstractModel3D}, a, rec, guess::InitialGuess)
+function initial_state(problem::Problem{<:AbstractModel3D}, accuracy, rec, guess::InitialGuess)
     validate(guess)
     option_dict(guess) == option_dict(InitialGuess()) || throw(
         ArgumentError(
             "3D initial guesses use nuclear envelopes; supply an explicit initial state for customization",
         ),
     )
-    g = p.grid
-    centers = p.model isa AllElectronLDA3D ? p.model.positions : [(0.0, 0.0, 0.0)]
-    b = length(p.occupations)
-    mode_limit = ceil(Int, cbrt(b))
+    grid = problem.grid
+    centers = problem.model isa AllElectronLDA3D ? problem.model.positions : [(0.0, 0.0, 0.0)]
+    norbitals = length(problem.occupations)
+    mode_limit = ceil(Int, cbrt(norbitals))
     modes = sort(
         vec(collect(Iterators.product(1:mode_limit, 1:mode_limit, 1:mode_limit)));
         by = t -> sum(abs2, t),
     )
-    cfg = solver_config(p, a)
+    cfg = solver_config(problem, accuracy)
     orbitals = Q.QTT[]
-    for i = 1:b
+    for i = 1:norbitals
         mode = modes[i]
         fn = j -> begin
-            r = grid_position(g, j)
+            r = grid_position(grid, j)
             envelope = sum(exp(-sqrt(sum(abs2, r .- c))) for c in centers)
-            envelope * prod(sinpi(mode[k] * (r[k] / g.L[k] + 0.5)) for k = 1:3)
+            envelope * prod(sinpi(mode[k] * (r[k] / grid.L[k] + 0.5)) for k = 1:3)
         end
         push!(
             orbitals,
             Q.normalize(
                 Q.cross(
                     rec,
-                    nsites(g),
+                    nsites(grid),
                     fn;
-                    tol = a.orthogonalization_tolerance,
-                    cap = a.orbital_cap,
+                    tol = accuracy.orthogonalization_tolerance,
+                    cap = accuracy.orbital_cap,
                     label = "initial_orbital_$i",
                 ),
             ),
         )
     end
-    OrbitalState(p, first(Q.orthogonalize(orbitals, cfg, rec)))
+    OrbitalState(problem, first(Q.orthogonalize(orbitals, cfg, rec)))
 end
 
-"Periodic six-point degree-five refinement; creates a warm start, not an SCF-history continuation."
+"Periodic six-point degree-five interpolation for an orbital warm start on a finer grid."
 function refine_state(
     state::OrbitalState,
     target::Problem;
@@ -172,7 +172,7 @@ function refine_state(
         )
     end
     orbitals = first(Q.orthogonalize(orbitals, cfg, rec))
-    orbitals = first(Q.pack_orbitals(orbitals, cfg; tol = accuracy.storage_tolerance))
+    orbitals = first(Q.compress_orbitals(orbitals, cfg; tol = accuracy.storage_tolerance))
     OrbitalState(target, orbitals; time = state.time)
 end
 
@@ -228,7 +228,7 @@ function refine_state(
         )
     end
     orbitals = first(Q.orthogonalize(orbitals, cfg, rec))
-    orbitals = first(Q.pack_orbitals(orbitals, cfg; tol = accuracy.storage_tolerance))
+    orbitals = first(Q.compress_orbitals(orbitals, cfg; tol = accuracy.storage_tolerance))
     OrbitalState(target, orbitals; time = state.time)
 end
 

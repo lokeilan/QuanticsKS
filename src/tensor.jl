@@ -80,7 +80,7 @@ function rounded(x::QTT; tol = 1e-11, cap = 64)
     ) do
         check_compression_shapes(x.c)
         result = deepcopy(tensortrain(x))
-        guarded_compress!(result; tolerance = Float64(tol), maxbonddim = cap)
+        compress_with_recovery!(result; tolerance = Float64(tol), maxbonddim = cap)
         result
     end
     QTT(tt.sitetensors)
@@ -109,7 +109,7 @@ function add(x::QTT, y::QTT; a = 1, b = 1, tol = 1e-11, cap = 64, rec = nothing,
         retryable_svd_error(error) || rethrow()
     end
     # Reuse the amplitude-space sum when library addition fails numerically.
-    materialize_expression(linear_expression((x, y), (a, b)); tol, cap)
+    reconstruct_expression(linear_expression((x, y), (a, b)); tol, cap)
 end
 function constant_tt(R, value = 1)
     c = [ones(ComplexF64, 1, 2, 1) for k = 1:R]
@@ -149,8 +149,8 @@ end
 
 mutable struct Evaluator
     x::QTT
-    a::Vector{ComplexF64}
-    b::Vector{ComplexF64}
+    buffer::Vector{ComplexF64}
+    next_buffer::Vector{ComplexF64}
     left::Matrix{ComplexF64}
     right::Matrix{ComplexF64}
     prefix::Int
@@ -175,23 +175,23 @@ function (e::Evaluator)(j::Int)
     if e.prefix + e.suffix == length(e.x)
         return transpose(view(e.left, :, li)) * view(e.right, :, ri)
     end
-    copyto!(e.a, 1, e.left, 1 + (li - 1) * size(e.left, 1), size(e.left, 1))
+    copyto!(e.buffer, 1, e.left, 1 + (li - 1) * size(e.left, 1), size(e.left, 1))
     for site = (e.prefix + 1):(length(e.x) - e.suffix)
         core = e.x.c[site]
         digit = ((j >> (site - 1)) & 1) + 1
         mul!(
-            view(e.b, 1:size(core, 3)),
+            view(e.next_buffer, 1:size(core, 3)),
             transpose(view(core, :, digit, :)),
-            view(e.a, 1:size(core, 1)),
+            view(e.buffer, 1:size(core, 1)),
         )
-        e.a, e.b = e.b, e.a
+        e.buffer, e.next_buffer = e.next_buffer, e.buffer
     end
-    transpose(view(e.a, 1:size(e.right, 1))) * view(e.right, :, ri)
+    transpose(view(e.buffer, 1:size(e.right, 1))) * view(e.right, :, ri)
 end
 bits(j, R) = [((j >> (k - 1)) & 1) + 1 for k = 1:R]
 indexof(v) = sum(((v[k] - 1) << (k - 1) for k = 1:length(v)); init = 0)
 
-# Flat linear expressions retain QTT cores until a consumer needs new cores.
+# A linear expression stores coefficients and QTT terms until reconstruction is required.
 
 struct QTTExpression
     terms::Vector{QTT}
@@ -247,7 +247,7 @@ function compensated_sum(values)
 end
 
 struct ExpressionEvaluator
-    evals::Vector{Evaluator}
+    evaluators::Vector{Evaluator}
     coefficients::Vector{ComplexF64}
     R::Int
 end
@@ -255,41 +255,41 @@ Evaluator(x::QTTExpression; cachebits = 10) =
     ExpressionEvaluator([Evaluator(t; cachebits) for t in x.terms], x.coefficients, x.R)
 function (e::ExpressionEvaluator)(j::Int)
     0 <= j < (1 << e.R) || throw(BoundsError(e, j))
-    compensated_sum(c * f(j) for (c, f) in zip(e.coefficients, e.evals))
+    compensated_sum(c * f(j) for (c, f) in zip(e.coefficients, e.evaluators))
 end
 
 function expression_components(xs)
     isempty(xs) && throw(ArgumentError("Empty expression collection"))
     R = length(first(xs))
-    leaves = QTT[]
+    terms = QTT[]
     positions = IdDict{Vector{Array{ComplexF64,3}},Int}()
     for x in xs
         length(x) == R || throw(DimensionMismatch("Expression grid lengths"))
         for term in x.terms
             if !haskey(positions, term.c)
-                push!(leaves, term)
-                positions[term.c] = length(leaves)
+                push!(terms, term)
+                positions[term.c] = length(terms)
             end
         end
     end
-    weights = zeros(ComplexF64, length(leaves), length(xs))
+    weights = zeros(ComplexF64, length(terms), length(xs))
     for (j, x) in enumerate(xs), (term, c) in zip(x.terms, x.coefficients)
         weights[positions[term.c], j] += c
     end
-    leaves, weights
+    terms, weights
 end
 
 expression_stage(f, rec, label) = rec === nothing ? f() : timed(f, rec, label)
 
-"Stream an untruncated common QR basis; retain its cores only for final materialization."
-function expression_qr(leaves, weights; keep_cores = false)
-    isempty(leaves) && throw(ArgumentError("QR needs at least one nonzero term"))
+"Stream an untruncated common QR basis; retain its cores only for final reconstruction."
+function expression_qr(terms, weights; keep_cores = false)
+    isempty(terms) && throw(ArgumentError("QR needs at least one nonzero term"))
     with_svd_context(;
         operation = "linear_expression_qr",
-        original_cores = [x.c for x in leaves],
+        original_cores = [x.c for x in terms],
         expression_coefficients = weights,
     ) do
-        for x in leaves
+        for x in terms
             check_compression_shapes(x.c)
             !isempty(x.c) &&
                 size(first(x.c), 1) == size(last(x.c), 3) == 1 &&
@@ -298,20 +298,20 @@ function expression_qr(leaves, weights; keep_cores = false)
             )
         end
         require_finite(weights, "nonfinite_expression_coefficients")
-        carry = [ones(ComplexF64, 1, 1) for _ in leaves]
+        right_factors = [ones(ComplexF64, 1, 1) for _ in terms]
         cores = Array{ComplexF64,3}[]
-        R = length(first(leaves))
+        R = length(first(terms))
         p = 1
         for k = 1:R
-            widths = [size(x.c[k], 3) for x in leaves]
+            widths = [size(x.c[k], 3) for x in terms]
             A = zeros(ComplexF64, 2p, sum(widths))
             offset = 0
-            for (i, x) in enumerate(leaves)
+            for (i, x) in enumerate(terms)
                 columns = (offset + 1):(offset + widths[i])
                 for s = 1:2
                     mul!(
                         view(A, ((s - 1) * p + 1):(s * p), columns),
-                        carry[i],
+                        right_factors[i],
                         view(x.c[k], :, s, :),
                     )
                 end
@@ -322,7 +322,7 @@ function expression_qr(leaves, weights; keep_cores = false)
                 # Each final right bond is one. Combine in amplitude space,
                 # not by subtracting almost equal squared norms.
                 C = [
-                    compensated_sum(A[i, t] * weights[t, j] for t in eachindex(leaves)) for
+                    compensated_sum(A[i, t] * weights[t, j] for t in eachindex(terms)) for
                     i in axes(A, 1), j in axes(weights, 2)
                 ]
                 require_finite(C, "nonfinite_expression_amplitudes")
@@ -348,8 +348,8 @@ function expression_qr(leaves, weights; keep_cores = false)
                 push!(cores, reshape(basis, p, 2, q))
             end
             offset = 0
-            for i in eachindex(leaves)
-                carry[i] = triangular[:, (offset + 1):(offset + widths[i])]
+            for i in eachindex(terms)
+                right_factors[i] = triangular[:, (offset + 1):(offset + widths[i])]
                 offset += widths[i]
             end
             p = q
@@ -360,11 +360,11 @@ end
 
 "Gram from original TCI inner products, with QR fallback for cancellation or near dependence."
 function expression_gram(xs; rec = nothing)
-    leaves, W = expression_components(xs)
+    terms, W = expression_components(xs)
     m = length(xs)
-    isempty(leaves) && return zeros(ComplexF64, m, m)
+    isempty(terms) && return zeros(ComplexF64, m, m)
     K = expression_stage(rec, "density_gram_core_inner") do
-        result = gram(leaves; cfg = rec === nothing ? (;) : rec.options)
+        result = gram(terms; cfg = rec === nothing ? (;) : rec.options)
         require_finite(result, "nonfinite_expression_core_gram")
         result
     end
@@ -384,7 +384,7 @@ function expression_gram(xs; rec = nothing)
     end
     if fallback
         return expression_stage(rec, "density_gram_qr_fallback") do
-            C, _ = expression_qr(leaves, W)
+            C, _ = expression_qr(terms, W)
             result = C' * C
             result[diagind(result)] .= vec(sum(abs2, C; dims = 1))
             require_finite(result, "nonfinite_expression_qr_gram")
@@ -403,8 +403,8 @@ function difference_norm(x::QTT, y::QTT; rec = nothing, label = "density_differe
     end
 end
 
-"Build just the final linear combination, then apply the existing guarded SVD rounding."
-function materialize_expression(x::QTTExpression; tol, cap)
+"Reconstruct the linear combination, then round it with numerical failure recovery."
+function reconstruct_expression(x::QTTExpression; tol, cap)
     validate_truncation(tol, cap)
     isempty(x.terms) && return constant_tt(x.R, 0)
     length(x.terms) == 1 && return rounded(scale(only(x.terms), only(x.coefficients)); tol, cap)
@@ -709,7 +709,7 @@ function check_compression_shapes(cores)
 end
 
 "Compress with TCI; recover from the preserved cores through ITensorMPS."
-function guarded_compress!(
+function compress_with_recovery!(
     tt;
     tolerance = 1e-12,
     maxbonddim = typemax(Int),

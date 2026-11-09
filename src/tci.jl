@@ -144,10 +144,11 @@ end
 # Use endpoint dot products when both ends cover the grid; contract larger-grid slices.
 abstract type SampledFunction <: TCI.BatchEvaluator{ComplexF64} end
 (f::SampledFunction)(q::AbstractVector{Int}) = f(indexof(q))
-native_batch(::SampledFunction) = false
-scalar_fastpath(::SampledFunction) = false
+uses_batch_contraction(::SampledFunction) = false
+uses_scalar_evaluation(::SampledFunction) = false
 sampling_method(f::SampledFunction) =
-    scalar_fastpath(f) ? "cached_scalar" : native_batch(f) ? "tt_slices" : "coordinate"
+    uses_scalar_evaluation(f) ? "cached_scalar" :
+    uses_batch_contraction(f) ? "tt_slices" : "coordinate"
 
 struct CoordinateSamples{F} <: SampledFunction
     f::F
@@ -158,29 +159,32 @@ sampled(f, R::Int) = CoordinateSamples(f, R)
 sampled(f::SampledFunction, R::Int) =
     sample_length(f) == R ? f : throw(DimensionMismatch("Sample grid"))
 sample_length(f::CoordinateSamples) = f.R
-scalar_fastpath(::CoordinateSamples) = true
+uses_scalar_evaluation(::CoordinateSamples) = true
 function (f::CoordinateSamples)(left, right, middle::Val)
     map_slice(f, ComplexF64, f.R, left, right, middle)
 end
 
 struct TensorSamples <: SampledFunction
     evaluator::Evaluator
-    frames::Union{Nothing,TCI.TTCache{ComplexF64}}
-    frame_capacity::Int
+    tt_cache::Union{Nothing,TCI.TTCache{ComplexF64}}
+    tt_cache_capacity::Int
 end
-function TensorSamples(e::Evaluator; frame_capacity = 2048)
-    frames = e.prefix + e.suffix == length(e.x) ? nothing : TCI.TTCache(e.x.c)
-    TensorSamples(e, frames, frame_capacity)
+function TensorSamples(e::Evaluator; tt_cache_capacity = 2048)
+    tt_cache = e.prefix + e.suffix == length(e.x) ? nothing : TCI.TTCache(e.x.c)
+    TensorSamples(e, tt_cache, tt_cache_capacity)
 end
-sampled(x::QTT, rec) =
-    TensorSamples(evaluate(x, rec); frame_capacity = get(rec.options, :slice_cache_capacity, 2048))
+sampled(x::QTT, rec) = TensorSamples(
+    evaluate(x, rec);
+    tt_cache_capacity = get(rec.options, :slice_cache_capacity, 2048),
+)
 sample_length(f::TensorSamples) = length(f.evaluator.x)
-native_batch(::TensorSamples) = true
-scalar_fastpath(f::TensorSamples) = f.evaluator.prefix + f.evaluator.suffix == sample_length(f)
+uses_batch_contraction(::TensorSamples) = true
+uses_scalar_evaluation(f::TensorSamples) =
+    f.evaluator.prefix + f.evaluator.suffix == sample_length(f)
 (f::TensorSamples)(j::Int) = f.evaluator(j)
 
-function trim_frames!(frames, capacity)
-    caches = (frames.cacheleft..., frames.cacheright...)
+function trim_tt_cache!(tt_cache, capacity)
+    caches = (tt_cache.cacheleft..., tt_cache.cacheright...)
     remaining = sum(length, caches)
     while remaining > capacity
         for cache in caches
@@ -193,11 +197,11 @@ function trim_frames!(frames, capacity)
     end
 end
 function (f::TensorSamples)(left, right, middle::Val)
-    frames = f.frames
-    frames === nothing &&
+    tt_cache = f.tt_cache
+    tt_cache === nothing &&
         return map_slice(f.evaluator, ComplexF64, sample_length(f), left, right, middle)
-    result = TCI.batchevaluate(frames, left, right, middle)
-    trim_frames!(frames, f.frame_capacity)
+    result = TCI.batchevaluate(tt_cache, left, right, middle)
+    trim_tt_cache!(tt_cache, f.tt_cache_capacity)
     result
 end
 
@@ -212,8 +216,8 @@ function pointwise(f, args::SampledFunction...)
     PointwiseSamples(f, args)
 end
 sample_length(f::PointwiseSamples) = sample_length(first(f.arguments))
-native_batch(f::PointwiseSamples) = any(native_batch, f.arguments)
-scalar_fastpath(f::PointwiseSamples) = all(scalar_fastpath, f.arguments)
+uses_batch_contraction(f::PointwiseSamples) = any(uses_batch_contraction, f.arguments)
+uses_scalar_evaluation(f::PointwiseSamples) = all(uses_scalar_evaluation, f.arguments)
 (f::PointwiseSamples)(j::Int) = ComplexF64(f.f(map(a -> a(j), f.arguments)...))
 function (f::PointwiseSamples)(left, right, middle::Val)
     values = map(a -> a(left, right, middle), f.arguments)
@@ -226,8 +230,8 @@ struct ShiftedSamples{F} <: SampledFunction
 end
 shifted(f::SampledFunction, offset::Int) = ShiftedSamples(f, offset)
 sample_length(f::ShiftedSamples) = sample_length(f.input)
-native_batch(f::ShiftedSamples) = native_batch(f.input)
-scalar_fastpath(f::ShiftedSamples) = scalar_fastpath(f.input)
+uses_batch_contraction(f::ShiftedSamples) = uses_batch_contraction(f.input)
+uses_scalar_evaluation(f::ShiftedSamples) = uses_scalar_evaluation(f.input)
 (f::ShiftedSamples)(j::Int) = f.input(mod(j + f.offset, 1 << sample_length(f)))
 function (f::ShiftedSamples)(left, right, ::Val{M}) where {M}
     if isempty(left) || isempty(right)
@@ -276,8 +280,8 @@ function RecordedSamples(f::SampledFunction, options)
     RecordedSamples(f, cache, R, 0, 0, 0, 0, 0)
 end
 sample_length(f::RecordedSamples) = f.R
-native_batch(f::RecordedSamples) = native_batch(f.input)
-scalar_fastpath(f::RecordedSamples) = scalar_fastpath(f.input)
+uses_batch_contraction(f::RecordedSamples) = uses_batch_contraction(f.input)
+uses_scalar_evaluation(f::RecordedSamples) = uses_scalar_evaluation(f.input)
 function (f::RecordedSamples)(j::Int)
     0 <= j < (1 << f.R) || throw(BoundsError(f, j))
     f.requests += 1
@@ -292,7 +296,7 @@ function (f::RecordedSamples)(j::Int)
 end
 function (f::RecordedSamples)(left, right, middle::Val{M}) where {M}
     f.batches += 1
-    if scalar_fastpath(f)
+    if uses_scalar_evaluation(f)
         # Endpoint dot products are cheaper than grouping sparse misses and
         # building TTCache environments for every cross cut on small grids.
         before = f.evaluations
@@ -316,16 +320,16 @@ end
 memoized_sample(x::QTT, rec) = RecordedSamples(sampled(x, rec), rec.options)
 memoized_sample(x::SampledFunction, rec) = RecordedSamples(x, rec.options)
 
-uses_tt_frames(::SampledFunction) = false
-uses_tt_frames(f::TensorSamples) = f.frames !== nothing
-uses_tt_frames(f::PointwiseSamples) = any(uses_tt_frames, f.arguments)
-uses_tt_frames(f::ShiftedSamples) = uses_tt_frames(f.input)
-uses_tt_frames(f::RecordedSamples) = uses_tt_frames(f.input)
+uses_tt_cache(::SampledFunction) = false
+uses_tt_cache(f::TensorSamples) = f.tt_cache !== nothing
+uses_tt_cache(f::PointwiseSamples) = any(uses_tt_cache, f.arguments)
+uses_tt_cache(f::ShiftedSamples) = uses_tt_cache(f.input)
+uses_tt_cache(f::RecordedSamples) = uses_tt_cache(f.input)
 
 # The warm-start scale must see the current function on every old slice before
 # optimize! starts. Stream endpoint values without allocating a result tensor.
 function maximum_slice(f::RecordedSamples, left, right, middle::Val{M}) where {M}
-    scalar_fastpath(f) || return maximum(abs, f(left, right, middle); init = 0.0)
+    uses_scalar_evaluation(f) || return maximum(abs, f(left, right, middle); init = 0.0)
     f.batches += 1
     before = f.evaluations
     result = 0.0
@@ -346,56 +350,58 @@ function maximum_slice(f::RecordedSamples, left, right, middle::Val{M}) where {M
     result
 end
 
-mutable struct BlockOracle
-    evals::Vector{Evaluator}
+# Evaluate a block of tensor trains at shared grid indices.
+# Scalar values and TCI batch contractions have separate bounded caches.
+mutable struct BlockEvaluator
+    evaluators::Vector{Evaluator}
     samples::Vector{TensorSamples}
     cache::SampleCache{Vector{ComplexF64}}
     cap::Int
     requests::Int
     evaluations::Int
-    endpoint_fastpath::Bool
+    uses_endpoint_contraction::Bool
     parallel_tasks::Int
 end
-function BlockOracle(
+function BlockEvaluator(
     xs;
     cap = 8192,
     cachebits = 10,
-    frame_capacity = 2048,
+    tt_cache_capacity = 2048,
     dense_limit = 0,
     max_bytes = 64 * 1024^2,
     parallel_tasks = 1,
 )
-    evals = [Evaluator(x; cachebits) for x in xs]
-    samples = [TensorSamples(e; frame_capacity) for e in evals]
+    evaluators = [Evaluator(x; cachebits) for x in xs]
+    samples = [TensorSamples(e; tt_cache_capacity) for e in evaluators]
     R = length(first(xs))
     # Include vector headers and references; values are populated only on demand.
-    bytes_per_point = sizeof(ComplexF64) * length(evals) + 64
+    bytes_per_point = sizeof(ComplexF64) * length(evaluators) + 64
     limit = min(dense_limit, max_bytes ÷ bytes_per_point)
     cache = SampleCache{Vector{ComplexF64}}(R; capacity = cap, dense_limit = limit)
-    BlockOracle(
-        evals,
+    BlockEvaluator(
+        evaluators,
         samples,
         cache,
         isempty(cache.values) ? cap : length(cache.values),
         0,
         0,
-        all(scalar_fastpath, samples),
+        all(uses_scalar_evaluation, samples),
         parallel_tasks,
     )
 end
-scalar_fastpath(o::BlockOracle) = o.endpoint_fastpath
-function (o::BlockOracle)(j::Int)
+uses_scalar_evaluation(o::BlockEvaluator) = o.uses_endpoint_contraction
+function (o::BlockEvaluator)(j::Int)
     o.requests += 1
     value = cache_get(o.cache, j)
     if value === nothing
-        value = cache_put!(o.cache, j, [e(j) for e in o.evals])
+        value = cache_put!(o.cache, j, [e(j) for e in o.evaluators])
         o.evaluations += 1
     end
     value
 end
-function (o::BlockOracle)(left, right, middle::Val{M}) where {M}
+function (o::BlockEvaluator)(left, right, middle::Val{M}) where {M}
     R = sample_length(first(o.samples))
-    scalar_fastpath(o) && return map_slice(o, Vector{ComplexF64}, R, left, right, middle)
+    uses_scalar_evaluation(o) && return map_slice(o, Vector{ComplexF64}, R, left, right, middle)
     o.requests += length(left) * (1 << M) * length(right)
     result, evaluations, _ = cached_slice!(o.cache, R, left, right, middle) do l, r, m
         columns = independent_map(
@@ -414,7 +420,7 @@ function (o::BlockOracle)(left, right, middle::Val{M}) where {M}
     o.evaluations += evaluations
     result
 end
-block_cache_stats(o::BlockOracle) = (;
+block_cache_stats(o::BlockEvaluator) = (;
     block_cache_mode = isempty(o.cache.values) ? "bounded_clock" : "dense_addressed",
     block_cache_capacity = o.cap,
     block_cache_evictions = o.cache.evictions,
@@ -423,67 +429,68 @@ block_cache_stats(o::BlockOracle) = (;
 )
 
 struct LinearSamples{O} <: SampledFunction
-    oracle::O
+    evaluator::O
     weights::Vector{ComplexF64}
 end
-sample_length(f::LinearSamples) = sample_length(f.oracle)
-native_batch(::LinearSamples) = true
-scalar_fastpath(f::LinearSamples) = scalar_fastpath(f.oracle)
+sample_length(f::LinearSamples) = sample_length(f.evaluator)
+uses_batch_contraction(::LinearSamples) = true
+uses_scalar_evaluation(f::LinearSamples) = uses_scalar_evaluation(f.evaluator)
 # Linear-combination coefficients are not conjugated.
-(f::LinearSamples)(j::Int) = transpose(f.weights) * f.oracle(j)
+(f::LinearSamples)(j::Int) = transpose(f.weights) * f.evaluator(j)
 function (f::LinearSamples)(left, right, middle::Val)
-    values = f.oracle(left, right, middle)
+    values = f.evaluator(left, right, middle)
     isempty(values) && return zeros(ComplexF64, size(values))
     map(v -> transpose(f.weights) * v, values)
 end
 
 struct DensitySamples{O} <: SampledFunction
-    oracle::O
+    evaluator::O
     weights::Vector{Float64}
 end
-sample_length(f::DensitySamples) = sample_length(f.oracle)
-native_batch(::DensitySamples) = true
-scalar_fastpath(f::DensitySamples) = scalar_fastpath(f.oracle)
+sample_length(f::DensitySamples) = sample_length(f.evaluator)
+uses_batch_contraction(::DensitySamples) = true
+uses_scalar_evaluation(f::DensitySamples) = uses_scalar_evaluation(f.evaluator)
 weighted_density(weights, values) =
     ComplexF64(sum(weights[i] * abs2(values[i]) for i in eachindex(weights, values)))
-(f::DensitySamples)(j::Int) = weighted_density(f.weights, f.oracle(j))
+(f::DensitySamples)(j::Int) = weighted_density(f.weights, f.evaluator(j))
 function (f::DensitySamples)(left, right, middle::Val)
-    map(v -> weighted_density(f.weights, v), f.oracle(left, right, middle))
+    map(v -> weighted_density(f.weights, v), f.evaluator(left, right, middle))
 end
 
-sample_length(o::BlockOracle) = sample_length(first(o.samples))
+sample_length(o::BlockEvaluator) = sample_length(first(o.samples))
 
 struct SynchronizedSamples{F<:SampledFunction} <: SampledFunction
     input::F
     mutex::ReentrantLock
 end
-struct SynchronizedBlockOracle
-    input::BlockOracle
+struct SynchronizedBlockEvaluator
+    input::BlockEvaluator
     mutex::ReentrantLock
 end
 synchronized(f::SampledFunction) = SynchronizedSamples(f, ReentrantLock())
-synchronized(f::BlockOracle) = SynchronizedBlockOracle(f, ReentrantLock())
-synchronized(f::Union{SynchronizedSamples,SynchronizedBlockOracle}) = f
-sample_length(f::Union{SynchronizedSamples,SynchronizedBlockOracle}) = sample_length(f.input)
-native_batch(f::SynchronizedSamples) = native_batch(f.input)
-scalar_fastpath(f::Union{SynchronizedSamples,SynchronizedBlockOracle}) = scalar_fastpath(f.input)
+synchronized(f::BlockEvaluator) = SynchronizedBlockEvaluator(f, ReentrantLock())
+synchronized(f::Union{SynchronizedSamples,SynchronizedBlockEvaluator}) = f
+sample_length(f::Union{SynchronizedSamples,SynchronizedBlockEvaluator}) = sample_length(f.input)
+uses_batch_contraction(f::SynchronizedSamples) = uses_batch_contraction(f.input)
+uses_scalar_evaluation(f::Union{SynchronizedSamples,SynchronizedBlockEvaluator}) =
+    uses_scalar_evaluation(f.input)
 sampling_method(f::SynchronizedSamples) = sampling_method(f.input)
-uses_tt_frames(f::SynchronizedSamples) = uses_tt_frames(f.input)
-function (f::Union{SynchronizedSamples,SynchronizedBlockOracle})(j::Int)
+uses_tt_cache(f::SynchronizedSamples) = uses_tt_cache(f.input)
+function (f::Union{SynchronizedSamples,SynchronizedBlockEvaluator})(j::Int)
     lock(f.mutex) do
         f.input(j)
     end
 end
-function (f::Union{SynchronizedSamples,SynchronizedBlockOracle})(left, right, middle::Val)
+function (f::Union{SynchronizedSamples,SynchronizedBlockEvaluator})(left, right, middle::Val)
     lock(f.mutex) do
         f.input(left, right, middle)
     end
 end
-block_cache_stats(f::SynchronizedBlockOracle) = block_cache_stats(f.input)
+block_cache_stats(f::SynchronizedBlockEvaluator) = block_cache_stats(f.input)
 
 # TCI fitting, pivot reuse, and fit records.
 
-# Only geometry survives a fit. Values, LU factors, and input environments are refreshed.
+# Only pivot index sets survive a fit. Values, LU factors, and input environments are refreshed.
 struct CrossState
     R::Int
     left::Vector{Vector{Vector{Int}}}
@@ -498,7 +505,7 @@ function remember_cross!(rec, keys::Tuple{Vararg{CrossKey}}, ci, ranks, errors)
     get(rec.options, :reuse_pivots, true) || return
     all(key -> isempty(first(key)), keys) && return
     # One read-only snapshot per fit. Each label retains its own usage count;
-    # cross() copies the geometry before TCI is allowed to modify it.
+    # cross() copies the pivot index sets before TCI is allowed to modify it.
     left, right = deepcopy(ci.Iset), deepcopy(ci.Jset)
     saved_ranks, saved_errors = copy(ranks), copy(errors)
     for key in unique(keys)
@@ -718,11 +725,11 @@ debug_snapshot(r::Recorder, name, data) =
     r.dir === nothing ? nothing : serialize(joinpath(r.dir, name), data)
 
 evaluate(x, r::Recorder) = Evaluator(x; cachebits = r.options.environment_cache_bits)
-block_oracle(xs, r::Recorder) = BlockOracle(
+block_evaluator(xs, r::Recorder) = BlockEvaluator(
     xs;
     cap = r.options.orbital_cache_capacity,
     cachebits = r.options.environment_cache_bits,
-    frame_capacity = get(r.options, :slice_cache_capacity, 2048),
+    tt_cache_capacity = get(r.options, :slice_cache_capacity, 2048),
     dense_limit = get(r.options, :dense_cache_max_points, 262144),
     max_bytes = get(r.options, :orbital_cache_max_bytes, 64 * 1024^2),
     parallel_tasks = get(r.options, :parallel_tasks, 1),
@@ -746,7 +753,7 @@ function cross(
     validate_truncation(tol, cap)
     rounding_tolerance === nothing || validate_truncation(rounding_tolerance, cap)
     1 <= R <= 60 || throw(ArgumentError("Binary grid must have 1:60 sites"))
-    oracle = RecordedSamples(sampled(fn, R), r.options)
+    evaluator = RecordedSamples(sampled(fn, R), r.options)
     key = (String(label), Int(R))
     shared_key = (String(shared_pivots), Int(R))
     saved =
@@ -769,10 +776,11 @@ function cross(
     all(j -> 0 <= j < 2^R, pts) || throw(ArgumentError("Initial pivot outside the grid"))
     r.calls += 1
     tic = time_ns()
-    initial_max = maximum(j -> abs(oracle(j)), pts; init = 0.0)
+    initial_max = maximum(j -> abs(evaluator(j)), pts; init = 0.0)
     old_max =
-        saved === nothing ? 0.0 : maximum(1:R) do k
-            maximum_slice(oracle, saved.left[k], saved.right[k], Val(1))
+        saved === nothing ? 0.0 :
+        maximum(1:R) do k
+            maximum_slice(evaluator, saved.left[k], saved.right[k], Val(1))
         end
     if iszero(max(initial_max, old_max))
         if initial_zero_fallback !== nothing
@@ -780,7 +788,7 @@ function cross(
             # The caller supplies a reconstruction from the original cores.
             x = initial_zero_fallback()
             dt = (time_ns() - tic) / 1e9
-            r.samples += oracle.evaluations
+            r.samples += evaluator.evaluations
             r.tci_time += dt
             event!(
                 r.tci_io,
@@ -791,7 +799,7 @@ function cross(
                     stage = r.stage,
                     label,
                     seconds = dt,
-                    oracle_evaluations = oracle.evaluations,
+                    function_evaluations = evaluator.evaluations,
                     rank = rank(x),
                     construction = "core_algebra_zero_initial_pivots",
                 ),
@@ -803,10 +811,10 @@ function cross(
         2^R <= r.options.zero_check_limit || error(
             "All initial TCI pivots are zero for $label. Supply informative pivots, an analytic constant potential, or increase zero_check_limit for a full scalar scan.",
         )
-        nonzero = findfirst(j -> !iszero(oracle(bits(j, R))), 0:(2^R - 1))
+        nonzero = findfirst(j -> !iszero(evaluator(bits(j, R))), 0:(2^R - 1))
         if nonzero === nothing
             dt = (time_ns() - tic) / 1e9
-            r.samples += oracle.evaluations
+            r.samples += evaluator.evaluations
             r.tci_time += dt
             event!(
                 r.tci_io,
@@ -814,7 +822,7 @@ function cross(
                     call = r.calls,
                     label = label,
                     seconds = dt,
-                    oracle_evaluations = oracle.evaluations,
+                    function_evaluations = evaluator.evaluations,
                     rank = 1,
                     reported_converged = true,
                     verified_zero = true,
@@ -827,7 +835,7 @@ function cross(
     reused = saved !== nothing && old_max > 0
     tci = nothing
     if R == 1
-        train = QTT([reshape(ComplexF64[oracle(0), oracle(1)], 1, 2, 1)])
+        train = QTT([reshape(ComplexF64[evaluator(0), evaluator(1)], 1, 2, 1)])
         rs, err = [1], [0.0]
     else
         if reused
@@ -838,11 +846,11 @@ function cross(
             TCI.addglobalpivots!(tci, bits.(pts, R))
             TCI.invalidatesitetensors!(tci)
         else
-            tci = TCI.TensorCI2{ComplexF64}(oracle, fill(2, R), bits.(pts, R))
+            tci = TCI.TensorCI2{ComplexF64}(evaluator, fill(2, R), bits.(pts, R))
         end
         rs, err = TCI.optimize!(
             tci,
-            oracle;
+            evaluator;
             tolerance = Float64(tol),
             maxbonddim = cap,
             maxiter = r.options.max_iterations,
@@ -853,7 +861,7 @@ function cross(
         train = QTT(TCI.TensorTrain(tci).sitetensors)
     end
     dt = (time_ns() - tic) / 1e9
-    r.samples += oracle.evaluations
+    r.samples += evaluator.evaluations
     r.tci_time += dt
     rounding_start = time_ns()
     x =
@@ -881,18 +889,18 @@ function cross(
             seconds = dt,
             post_rounding_seconds = rounding_seconds,
             interpolation_and_rounding_seconds = dt + rounding_seconds,
-            oracle_evaluations = oracle.evaluations,
-            requests = oracle.requests,
-            cache_mode = isempty(oracle.cache.values) ? "bounded_clock" : "dense_addressed",
-            cache_peak_cap = isempty(oracle.cache.values) ? oracle.cache.capacity :
-                             length(oracle.cache.values),
-            cache_evictions = oracle.cache.evictions,
-            retained_sample_points = length(oracle.cache),
-            batch_calls = oracle.batches,
-            computed_batches = oracle.computed_batches,
-            batch_evaluations = oracle.batch_evaluations,
-            native_batch = native_batch(oracle),
-            sampling_method = sampling_method(oracle),
+            function_evaluations = evaluator.evaluations,
+            requests = evaluator.requests,
+            cache_mode = isempty(evaluator.cache.values) ? "bounded_clock" : "dense_addressed",
+            cache_peak_cap = isempty(evaluator.cache.values) ? evaluator.cache.capacity :
+                             length(evaluator.cache.values),
+            cache_evictions = evaluator.cache.evictions,
+            retained_sample_points = length(evaluator.cache),
+            batch_calls = evaluator.batches,
+            computed_batches = evaluator.computed_batches,
+            batch_evaluations = evaluator.batch_evaluations,
+            uses_batch_contraction = uses_batch_contraction(evaluator),
+            sampling_method = sampling_method(evaluator),
             pivot_reused = reused,
             pivot_source = reused ? reuse_source : "cold",
             search_ranks = rs,
@@ -926,7 +934,7 @@ function linear_combination(
     tol = 1e-11,
     cap = 64,
     label = "linear_combination",
-    oracle = nothing,
+    evaluator = nothing,
     shared_pivots = "",
 )
     validate_truncation(tol, cap)
@@ -941,19 +949,19 @@ function linear_combination(
     weights = ComplexF64[coefficients[i] for i in active]
     length(trains) == 1 && return rounded(scale(only(trains), only(weights)); tol, cap)
     # Combine all amplitudes before rounding so intermediate sums cannot lose cancellation.
-    core_sum() = materialize_expression(linear_expression(trains, weights); tol, cap)
+    core_sum() = reconstruct_expression(linear_expression(trains, weights); tol, cap)
     R == 1 && return core_sum()
-    samples = if oracle === nothing
-        LinearSamples(block_oracle(trains, rec), weights)
-    elseif oracle isa Union{BlockOracle,SynchronizedBlockOracle}
-        LinearSamples(oracle, ComplexF64[coefficients...])
+    samples = if evaluator === nothing
+        LinearSamples(block_evaluator(trains, rec), weights)
+    elseif evaluator isa Union{BlockEvaluator,SynchronizedBlockEvaluator}
+        LinearSamples(evaluator, ComplexF64[coefficients...])
     else
-        sampled(j -> sum(w * v for (w, v) in zip(weights, view(oracle(j), active))), R)
+        sampled(j -> sum(w * v for (w, v) in zip(weights, view(evaluator(j), active))), R)
     end
     cross(rec, R, samples; tol, cap, label, shared_pivots, initial_zero_fallback = core_sum)
 end
 
-# Fit batches own their recorder and RNG; only ordered receipts reach the parent.
+# Fit batches own their recorder and RNG; fit records are merged in input order.
 
 function fork_recorder(rec::Recorder)
     Recorder(

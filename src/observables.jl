@@ -27,19 +27,20 @@ end
 function observe_state(
     state::OrbitalState{<:Problem{<:AbstractModel3D}},
     ops,
-    a,
+    accuracy,
     rec;
     drive = NoDrive(),
 )
-    p = state.problem
+    problem = state.problem
     S = Q.gram(state.orbitals; cfg = rec.options)
     norms = real.(diag(S))
-    rho = density(p, state.orbitals, a, rec)
-    energy = total_energy(p, state.orbitals, rho, ops, a, rec; time = state.time, drive)
+    rho = density(problem, state.orbitals, accuracy, rec)
+    energy =
+        total_energy(problem, state.orbitals, rho, ops, accuracy, rec; time = state.time, drive)
     (;
         time = state.time,
         energy,
-        electron_number = sum(p.occupations .* norms),
+        electron_number = sum(problem.occupations .* norms),
         norms,
         gram_defect = norm(S - I),
         max_bond_dimension = maximum(Q.rank.(state.orbitals)),
@@ -112,7 +113,7 @@ function postprocess(
     problem = final.problem
     grid = problem.grid
     dx = volume_element(grid)
-    oracle = Q.BlockOracle(
+    evaluator = Q.BlockEvaluator(
         final.orbitals;
         cap = tci.orbital_cache_capacity,
         cachebits = tci.environment_cache_bits,
@@ -124,7 +125,7 @@ function postprocess(
             j = round(Int, (big(length(grid)) - 1) * index // (count - 1))
             position = grid_position(grid, j)
             coordinates = position isa Tuple ? join(position, ",") : string(position)
-            println(io, "$coordinates,$(sum(problem.occupations.*abs2.(oracle(j)))/dx)")
+            println(io, "$coordinates,$(sum(problem.occupations.*abs2.(evaluator(j)))/dx)")
         end
     end
     cap =

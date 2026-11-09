@@ -80,7 +80,7 @@ function ground_state(
                 rec,
             )
             # Hartree is the first consumer requiring independent density cores.
-            rho = Q.materialize_density(rho, cfg, rec)
+            rho = Q.reconstruct_density(rho, cfg, rec)
             H = effective_hamiltonian(problem, rho, ops, accuracy, rec)
             # Only the fixed potential survives all inner stages. Orbitals get
             # new evaluators after every update; a new SCF H gets a new cache.
@@ -113,8 +113,8 @@ function ground_state(
                         green,
                         cfg,
                         rec;
-                        work_tol = min(accuracy.work_tolerance, cfg.eigen_tol / 10),
-                        ritz_tol = cfg.ortho_tol,
+                        work_tol = min(accuracy.work_tolerance, cfg.eigen_tolerance / 10),
+                        ritz_tol = cfg.orthogonalization_tolerance,
                         potential = subspace_field,
                     )
                 end
@@ -134,18 +134,18 @@ function ground_state(
                     requests = potential.requests,
                     evaluations = potential.evaluations,
                     cache_evictions = potential.cache.evictions,
-                    tt_frames_constructed = Q.uses_tt_frames(potential),
+                    tt_cache_constructed = Q.uses_tt_cache(potential),
                 ),
             )
             # Compress to storage accuracy and recompute the density from the stored orbitals.
             rec.inner = 0
-            orbitals, pack = Q.pack_orbitals(
+            orbitals, compression = Q.compress_orbitals(
                 orbitals,
                 cfg;
                 tol = accuracy.storage_tolerance,
                 input_gram_defect = metrics.gram_defect,
             )
-            stored_gram_defect = pack.packed_gram_defect
+            stored_gram_defect = compression.stored_gram_defect
             state = OrbitalState(problem, orbitals)
             output_density = density(
                 problem,
@@ -200,7 +200,7 @@ function ground_state(
                 ),
                 energy,
                 metrics,
-                pack,
+                compression,
                 canonical,
                 (
                     gram_defect = stored_gram_defect,
@@ -307,7 +307,7 @@ function canonicalize_output_orbitals(problem, orbitals, ops, accuracy, cfg, rec
     # The complete operator path is used for this final projected matrix.
     # No spatial symmetry reduction or dense reference enters the solver.
     ys, offdiag = Q.ritz_rotate(orbitals, Hout, cfg, rec; work_tol = 0.0, force = true)
-    ys, pack = Q.pack_orbitals(ys, cfg; tol = accuracy.storage_tolerance)
+    ys, compression = Q.compress_orbitals(ys, cfg; tol = accuracy.storage_tolerance)
     after =
         density(problem, ys, accuracy, rec; renormalize = true, label = "canonical_output_density")
     density_change =
@@ -319,7 +319,7 @@ function canonicalize_output_orbitals(problem, orbitals, ops, accuracy, cfg, rec
         final_ritz_offdiagonal_before = offdiag,
         final_ritz_density_relative_change = density_change,
         final_ritz_direction_history_reset = true,
-        canonical_gram_defect = pack.packed_gram_defect,
+        canonical_gram_defect = compression.stored_gram_defect,
     )
 end
 

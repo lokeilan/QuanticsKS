@@ -160,7 +160,7 @@ function spectrum_projection_hamiltonian(H, potential, cfg, rec; tol)
             cfg.R,
             j -> potential[j + 1];
             tol,
-            cap = cfg.opcap,
+            cap = cfg.effective_potential_cap,
             label = "fixed_projection_potential",
             pivots = [argmax(j -> abs(potential[j]), eachindex(potential)) - 1],
         )
@@ -177,7 +177,7 @@ function spectrum_ritz(
     potential;
     keep = length(orbitals),
     tol = o.ritz_tolerance,
-    reveal_metric = false,
+    remove_dependent_directions = false,
 )
     if o.projection == :streaming_grid
         A, S = Q.timed(rec, "ritz_projection") do
@@ -195,7 +195,7 @@ function spectrum_ritz(
             Q.h_gram(orbitals, projected_H; cfg), Q.gram(orbitals; cfg)
         end
     end
-    if reveal_metric
+    if remove_dependent_directions
         # Preserve every current Ritz vector. Dropping eigenvectors of the raw
         # trial Gram can rotate away part of X and destroy monotonic convergence.
         XZ = view(S, 1:keep, (keep + 1):size(S, 2))
@@ -209,7 +209,7 @@ function spectrum_ritz(
         else
             S[(keep + 1):end, (keep + 1):end] - XZ' * projection
         end
-        W = Q.metric_whitener(
+        W = Q.canonical_orthogonalizer(
             schur,
             o.metric_relative_cutoff,
             max(o.direction_norm_floor^2, o.metric_absolute_cutoff),
@@ -243,7 +243,7 @@ function spectrum_ritz(
             cfg,
             rec;
             tol,
-            cap = cfg.rankcap,
+            cap = cfg.orbital_cap,
             label = "fixed_ritz",
         )
     end
@@ -266,7 +266,7 @@ function spectrum_residuals(orbitals, H, cfg, o, rec, potential)
                     cfg,
                     localrec;
                     tol = o.diagnostic_tolerance,
-                    cap = cfg.workcap,
+                    cap = cfg.work_cap,
                     label = "fixed_diagnostic_residual_$i",
                     potential = j -> potential[j + 1],
                 ),
@@ -349,7 +349,7 @@ function residual_subspace_step(
             cfg,
             localrec;
             tol = work_tolerance,
-            cap = cfg.workcap,
+            cap = cfg.work_cap,
             label = "fixed_search_residual_$i",
             potential = j -> potential[j + 1],
         )
@@ -360,7 +360,7 @@ function residual_subspace_step(
         green_tol =
             o.search_basis == :direct ?
             min(work_tolerance, o.green_tolerance_factor * ritz_tolerance) : work_tolerance
-        z = Q.apply_mpo(green, r; tol = green_tol, cap = cfg.workcap)
+        z = Q.apply_mpo(green, r; tol = green_tol, cap = cfg.work_cap)
         Q.ttnorm(z) > 1e-14 ? Q.normalize(z) : nothing
     end
     zs = Q.QTT[z for z in candidates if z !== nothing]
@@ -368,7 +368,7 @@ function residual_subspace_step(
     o.use_previous_subspace && previous !== nothing && append!(zs, previous)
     isempty(zs) && return orbitals, (directions = 0, trial_dimension = length(orbitals))
     if o.search_basis == :direct
-        # Equivalent subspace without fitting projected/whitened directions.
+        # Equivalent subspace without fitting projected, orthonormal directions.
         # Resolve linear dependence in the small overlap matrix at Rayleigh–Ritz.
         trial = vcat(orbitals, zs)
         rec.stage = "rayleigh_ritz"
@@ -381,7 +381,7 @@ function residual_subspace_step(
             potential;
             keep = o.states,
             tol = ritz_tolerance,
-            reveal_metric = true,
+            remove_dependent_directions = true,
         )
         return updated_orbitals,
         (
@@ -395,7 +395,7 @@ function residual_subspace_step(
     end
     raw_overlaps = Q.gram(orbitals, zs; cfg)
     overlaps = Hermitian(Q.gram(orbitals; cfg)) \ raw_overlaps
-    ox = Q.synchronized(Q.block_oracle(orbitals, rec))
+    orbital_evaluator = Q.synchronized(Q.block_evaluator(orbitals, rec))
     rec.stage = "residual_projection"
     candidates = Q.recorded_map(Union{Nothing,Q.QTT}, length(zs), cfg, rec) do i, localrec
         z = zs[i]
@@ -408,14 +408,14 @@ function residual_subspace_step(
             )
             remaining < o.previous_projection_floor && return nothing
         end
-        ez = Q.evaluate(z, localrec)
+        direction_evaluator = Q.evaluate(z, localrec)
         q = Q.linear_combination(
             localrec,
             vcat([z], orbitals),
             vcat(1, -view(overlaps, :, i));
-            oracle = j -> vcat(ez(j), ox(j)),
+            evaluator = j -> vcat(direction_evaluator(j), orbital_evaluator(j)),
             tol = work_tolerance,
-            cap = cfg.workcap,
+            cap = cfg.work_cap,
             label = "residual_projection_$i",
         )
         Q.ttnorm(q) > 1e-12 ? Q.normalize(q) : nothing
@@ -429,16 +429,16 @@ function residual_subspace_step(
         f.values,
     )
     C = f.vectors[:, good] * Diagonal(1 ./ sqrt.(f.values[good]))
-    oracle = Q.synchronized(Q.block_oracle(projected, rec))
+    evaluator = Q.synchronized(Q.block_evaluator(projected, rec))
     rec.stage = "residual_basis"
     directions = Q.recorded_map(Q.QTT, size(C, 2), cfg, rec) do i, localrec
         Q.linear_combination(
             localrec,
             projected,
             view(C, :, i);
-            oracle,
+            evaluator,
             tol = work_tolerance,
-            cap = cfg.workcap,
+            cap = cfg.work_cap,
             label = "residual_basis_$i",
         )
     end
@@ -491,7 +491,7 @@ function fixed_spectrum(
     spectrum = FixedSpectrumOptions(),
     accuracy = Accuracy(),
     solver = nothing,
-    scf = SCFOptions(green_polish_every = 1),
+    scf = SCFOptions(green_update_interval = 1),
     tci = TCIOptions(),
     output = nothing,
     resume_from = nothing,
@@ -634,7 +634,7 @@ function fixed_spectrum(
         end
         initial_tol =
             o.adaptive_ritz ? max(o.ritz_tolerance, o.max_ritz_tolerance) : o.ritz_tolerance
-        initial_cfg = merge(cfg, (ortho_tol = initial_tol,))
+        initial_cfg = merge(cfg, (orthogonalization_tolerance = initial_tol,))
         subspace = nothing
         if use_subspace
             orbitals, eps, gram_defect = Q.subspace_ritz(
@@ -645,7 +645,8 @@ function fixed_spectrum(
                 rec;
                 tol = o.ritz_tolerance,
             )
-            subspace = (; basis = orbitals, frontier = 1:(o.states), energies = eps, gram_defect)
+            subspace =
+                (; basis = orbitals, expansion_indices = 1:(o.states), energies = eps, gram_defect)
         elseif resumed === nothing
             orbitals = Q.timed(rec, "initial_orthogonalization") do
                 first(Q.orthogonalize(orbitals, initial_cfg, rec; force = true))

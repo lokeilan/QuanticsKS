@@ -2,7 +2,8 @@
 
 # Model-specific interactions supply the shared SCF and propagation workflows.
 kernel_value(model::SoftCoulombLSDA1D, x, L) =
-    model.coupling * Q.soft(x / model.softening, L / model.softening) / model.softening
+    model.coupling * Q.periodic_soft_coulomb(x / model.softening, L / model.softening) /
+    model.softening
 external_value(model::SoftCoulombLSDA1D, x, L) =
     -sum(
         charge * kernel_value(model, x - position, L) for
@@ -100,7 +101,7 @@ green_operator(p, a, s, physics, ops) =
 # Cores store sqrt(dV)*psi, so divide by the volume element to recover density.
 function density(problem, orbitals, accuracy, rec; renormalize = false, label = "density")
     dx = volume_element(problem.grid)
-    orbital_samples = Q.block_oracle(orbitals, rec)
+    orbital_samples = Q.block_evaluator(orbitals, rec)
     rho = Q.cross(
         rec,
         nsites(problem.grid),
@@ -242,7 +243,7 @@ end
 
 # Cartesian operators for isolated 3D systems.
 
-"Lift a one-axis MPO into interleaved Cartesian sites with identity spectators."
+"Lift a one-axis MPO into interleaved Cartesian sites with identity operators on the other axes."
 function axis_mpo(w, axis::Int)
     1 <= axis <= 3 || throw(ArgumentError("Axis must be 1:3"))
     out = Array{ComplexF64,4}[]
@@ -326,6 +327,8 @@ end
 function lda_pz81(rho::Real)
     isfinite(rho) || throw(ArgumentError("Nonfinite electron density"))
     rho <= 0 && return (0.0, 0.0)
+    # rs is the Wigner-Seitz radius; ex/ec are energies per electron.
+    # Perdew-Zunger correlation: https://doi.org/10.1103/PhysRevB.23.5048
     rs = cbrt(3 / (4pi * rho))
     ex = -0.75cbrt(3rho / pi)
     ec, derivative = if rs < 1
@@ -367,59 +370,70 @@ nuclear_energy(m::AllElectronLDA3D, g::BoxGrid3D) = sum(
     init = 0.0,
 )
 
-function build_operators(p::Problem{<:AbstractModel3D}, a, rec, physics::PhysicsNumerics)
+function build_operators(
+    problem::Problem{<:AbstractModel3D},
+    accuracy,
+    rec,
+    physics::PhysicsNumerics,
+)
     validate(physics)
-    g = p.grid
-    m = deepcopy(p.model)
-    samples =
-        Q.memoized_sample(Q.sampled(j -> external_value(m, grid_position(g, j), g), nsites(g)), rec)
+    grid = problem.grid
+    model = deepcopy(problem.model)
+    samples = Q.memoized_sample(
+        Q.sampled(j -> external_value(model, grid_position(grid, j), grid), nsites(grid)),
+        rec,
+    )
     pivots =
-        m isa AllElectronLDA3D ?
+        model isa AllElectronLDA3D ?
         [
             grid_index(
-                g,
+                grid,
                 ntuple(
-                    a -> clamp(floor(Int, (r[a] + g.L[a] / 2) / spacing(g)[a]), 0, (1 << g.R) - 1),
+                    a -> clamp(
+                        floor(Int, (r[a] + grid.L[a] / 2) / spacing(grid)[a]),
+                        0,
+                        (1 << grid.R) - 1,
+                    ),
                     3,
                 ),
-            ) for r in m.positions
+            ) for r in model.positions
         ] : Int[]
-    ext = Q.cross(
+    external = Q.cross(
         rec,
-        nsites(g),
+        nsites(grid),
         samples;
-        tol = a.external_tolerance,
-        cap = field_caps(a).external_cap,
+        tol = accuracy.external_tolerance,
+        cap = field_caps(accuracy).external_cap,
         label = "external",
         pivots,
     )
-    interaction = if m isa AllElectronLDA3D
-        n = 1 << g.R
+    interaction = if model isa AllElectronLDA3D
+        n = 1 << grid.R
         kernel = Q.cross(
             rec,
-            nsites(g) + 3,
+            nsites(grid) + 3,
             j -> begin
-                q = ntuple(a -> sum(((j >> (3b + a - 1)) & 1) << b for b = 0:(g.R)), 3)
-                r = ntuple(a -> (q[a] < n ? q[a] : q[a] - 2n) * spacing(g)[a], 3)
-                coulomb_cell_average(r, spacing(g))
+                q = ntuple(a -> sum(((j >> (3b + a - 1)) & 1) << b for b = 0:(grid.R)), 3)
+                r = ntuple(a -> (q[a] < n ? q[a] : q[a] - 2n) * spacing(grid)[a], 3)
+                coulomb_cell_average(r, spacing(grid))
             end;
-            tol = a.kernel_tolerance,
-            cap = field_caps(a).kernel_cap,
+            tol = accuracy.kernel_tolerance,
+            cap = field_caps(accuracy).kernel_cap,
             label = "interaction",
             pivots = [0],
         )
-        cartesian_toeplitz(kernel, g.R)
+        cartesian_toeplitz(kernel, grid.R)
     else
         nothing
     end
     CartesianOperators(
-        ext,
+        external,
         interaction,
-        m isa AllElectronLDA3D && m.xc == :pz81 ? PZ81Table() : nothing,
-        ntuple(axis -> axis_mpo(Q.shift_mpo(g.R, 1; boundary = :open), axis), 3),
-        ntuple(axis -> axis_mpo(Q.shift_mpo(g.R, -1; boundary = :open), axis), 3),
+        model isa AllElectronLDA3D && model.xc == :pz81 ? PZ81Table() : nothing,
+        ntuple(axis -> axis_mpo(Q.shift_mpo(grid.R, 1; boundary = :open), axis), 3),
+        ntuple(axis -> axis_mpo(Q.shift_mpo(grid.R, -1; boundary = :open), axis), 3),
         samples,
-        nuclear_energy(m, g),
+        nuclear_energy(model, grid),
     )
 end
 
@@ -431,8 +445,8 @@ struct MPOContractionSamples <: Q.SampledFunction
     cache_bytes::Int
 end
 Q.sample_length(f::MPOContractionSamples) = f.R
-Q.native_batch(::MPOContractionSamples) = true
-Q.uses_tt_frames(::MPOContractionSamples) = true
+Q.uses_batch_contraction(::MPOContractionSamples) = true
+Q.uses_tt_cache(::MPOContractionSamples) = true
 Q.sampling_method(::MPOContractionSamples) = "mpo_contraction"
 function trim_contraction_cache!(f::MPOContractionSamples)
     caches = (f.contraction.leftcache, f.contraction.rightcache)
@@ -452,39 +466,45 @@ function (f::MPOContractionSamples)(left, right, middle::Val)
     value
 end
 
-function hartree(rho, p::Problem{<:AbstractModel3D}, ops, a, rec = recorder(nothing, TCIOptions()))
-    ops.interaction === nothing && return Q.constant_tt(nsites(p.grid), 0)
-    # Contract complete samples before truncating; a raw borrow-MPO prefix is not isometric.
+function hartree(
+    rho,
+    problem::Problem{<:AbstractModel3D},
+    ops,
+    accuracy,
+    rec = recorder(nothing, TCIOptions()),
+)
+    ops.interaction === nothing && return Q.constant_tt(nsites(problem.grid), 0)
+    # Contract complete samples before truncating; a partial displacement-MPO contraction is not isometric.
     column = Q.TCI.TensorTrain([reshape(c, size(c, 1), 2, 1, size(c, 3)) for c in rho.c])
     samples = MPOContractionSamples(
         Q.TCI.Contraction(Q.TCI.TensorTrain(ops.interaction), column),
-        nsites(p.grid),
+        nsites(problem.grid),
         rec.options.orbital_cache_max_bytes,
     )
     Q.scale(
         Q.cross(
             rec,
-            nsites(p.grid),
+            nsites(problem.grid),
             samples;
-            tol = a.algebra_tolerance,
-            cap = field_caps(a).hartree_cap,
+            tol = accuracy.algebra_tolerance,
+            cap = field_caps(accuracy).hartree_cap,
             label = "hartree",
         ),
-        volume_element(p.grid),
+        volume_element(problem.grid),
     )
 end
 function local_potential_samples(
-    p::Problem{<:AbstractModel3D},
+    problem::Problem{<:AbstractModel3D},
     rho,
     ops,
-    a,
+    accuracy,
     rec;
     time = 0.0,
     drive = NoDrive(),
 )
     drive isa NoDrive || throw(ArgumentError("3D time-dependent drives are not implemented"))
-    p.model isa LocalPotential3D && return ops.external_samples
-    vh = Q.memoized_sample(hartree(rho, p, ops, a, rec), rec)
+    problem.model isa LocalPotential3D && return ops.external_samples
+    vh = Q.memoized_sample(hartree(rho, problem, ops, accuracy, rec), rec)
     Q.memoized_sample(
         Q.pointwise(
             (v, h, n) -> real(v + h) + (ops.xc_table === nothing ? 0.0 : lda_pz81(real(n))[2]),
@@ -506,20 +526,27 @@ struct CartesianHamiltonian{S}
     samples::S
 end
 Q.potential_samples(H::CartesianHamiltonian, rec) = H.samples
-function effective_hamiltonian(p::Problem{<:AbstractModel3D}, rho, ops, a, rec; kwargs...)
-    field = local_potential_samples(p, rho, ops, a, rec; kwargs...)
+function effective_hamiltonian(
+    problem::Problem{<:AbstractModel3D},
+    rho,
+    ops,
+    accuracy,
+    rec;
+    kwargs...,
+)
+    field = local_potential_samples(problem, rho, ops, accuracy, rec; kwargs...)
     v =
-        p.model isa LocalPotential3D &&
-        Q.rank(ops.external) <= field_caps(a).effective_potential_cap ? ops.external :
+        problem.model isa LocalPotential3D &&
+        Q.rank(ops.external) <= field_caps(accuracy).effective_potential_cap ? ops.external :
         Q.cross(
             rec,
-            nsites(p.grid),
+            nsites(problem.grid),
             field;
-            tol = a.field_tolerance,
-            cap = field_caps(a).effective_potential_cap,
+            tol = accuracy.field_tolerance,
+            cap = field_caps(accuracy).effective_potential_cap,
             label = "effective_potential",
         )
-    CartesianHamiltonian(v, Q.diagonal(v), ops.plus, ops.minus, p.grid, p.mass, field)
+    CartesianHamiltonian(v, Q.diagonal(v), ops.plus, ops.minus, problem.grid, problem.mass, field)
 end
 
 "Keep all FD2 terms until the caller combines and truncates its final expression."
@@ -535,7 +562,7 @@ end
 function Q.h_core_fallback(H::CartesianHamiltonian, psi, energy; tol, cap)
     kinetic = kinetic_expression(H, psi)
     potential = Q.apply_mpo(H.diagonal, psi; tol, cap)
-    Q.materialize_expression(
+    Q.reconstruct_expression(
         Q.linear_expression((kinetic, potential, psi), (1, 1, -energy));
         tol,
         cap,
@@ -547,8 +574,8 @@ function Q.h_residual(
     energy,
     cfg,
     rec;
-    tol = cfg.round_tol,
-    cap = cfg.workcap,
+    tol = cfg.algebra_tolerance,
+    cap = cfg.work_cap,
     label = "orbital_residual",
     potential = nothing,
 )
@@ -593,7 +620,7 @@ function Q.h_project(f, psi, H::CartesianHamiltonian)
     end
     result
 end
-Q.h_project_tangent(f, z, H::CartesianHamiltonian) = Q.h_project(f, Q.tangent_tt(f, z), H)
+Q.h_project_tangent(f, z, H::CartesianHamiltonian) = Q.h_project(f, Q.tangent_vector(f, z), H)
 
 function Q.h_gram(orbitals, H::CartesianHamiltonian; cfg = (;))
     Q.with_sampling_seed(0) do
@@ -665,92 +692,103 @@ end
 function Q.apply_mpo(G::CartesianGreen, rhs::Q.QTT; tol = 1e-11, cap = G.cap, kwargs...)
     Q.validate_truncation(tol, cap)
     target = G.tolerance
-    worktol = min(max(tol, eps(Float64)), target / 100)
-    workcap = max(cap, G.cap)
+    work_tolerance = min(max(tol, eps(Float64)), target / 100)
+    work_cap = max(cap, G.cap)
     combine(xs, ws) =
-        Q.materialize_expression(Q.linear_expression(xs, ws); tol = worktol, cap = workcap)
+        Q.reconstruct_expression(Q.linear_expression(xs, ws); tol = work_tolerance, cap = work_cap)
     action(x) = combine((kinetic_expression(G.kinetic, x), x), (1, G.shift))
-    normrhs = Q.ttnorm(rhs)
-    normrhs == 0 && return Q.constant_tt(length(rhs), 0)
+    rhs_norm = Q.ttnorm(rhs)
+    rhs_norm == 0 && return Q.constant_tt(length(rhs), 0)
     x, r, direction = Q.constant_tt(length(rhs), 0), rhs, rhs
-    rr = real(Q.inner(r, r))
-    relative = 1.0
+    residual_norm_squared = real(Q.inner(r, r))
+    relative_residual = 1.0
     for iteration = 1:(G.max_iterations)
-        ad = action(direction)
-        curvature = real(Q.inner(direction, ad))
+        applied_direction = action(direction)
+        curvature = real(Q.inner(direction, applied_direction))
         curvature > 0 || error("3D Green CG lost positive curvature; increase work_cap")
-        alpha = rr / curvature
+        alpha = residual_norm_squared / curvature
         x = combine((x, direction), (1, alpha))
-        residual = combine((r, ad), (1, -alpha))
-        next_rr = real(Q.inner(residual, residual))
-        relative = sqrt(max(next_rr, 0)) / normrhs
-        if sqrt(max(next_rr, 0)) <= target * normrhs
+        residual = combine((r, applied_direction), (1, -alpha))
+        next_residual_norm_squared = real(Q.inner(residual, residual))
+        relative_residual = sqrt(max(next_residual_norm_squared, 0)) / rhs_norm
+        if sqrt(max(next_residual_norm_squared, 0)) <= target * rhs_norm
             result = Q.rounded(x; tol, cap)
             expression = green_residual(G, result, rhs)
-            relative = sqrt(real(only(Q.expression_gram([expression])))) / normrhs
-            relative <= target && return result
+            relative_residual = sqrt(real(only(Q.expression_gram([expression])))) / rhs_norm
+            relative_residual <= target && return result
             # Truncation is allowed for the next search direction, not for acceptance.
-            true_residual = Q.materialize_expression(expression; tol = worktol, cap = workcap)
+            true_residual =
+                Q.reconstruct_expression(expression; tol = work_tolerance, cap = work_cap)
             x, r, direction = result, true_residual, true_residual
-            rr = real(Q.inner(r, r))
+            residual_norm_squared = real(Q.inner(r, r))
         else
-            direction = combine((residual, direction), (1, next_rr / rr))
-            r, rr = residual, next_rr
+            direction = combine(
+                (residual, direction),
+                (1, next_residual_norm_squared / residual_norm_squared),
+            )
+            r, residual_norm_squared = residual, next_residual_norm_squared
         end
     end
     result = Q.rounded(x; tol, cap)
     expression = green_residual(G, result, rhs)
-    relative = sqrt(real(only(Q.expression_gram([expression])))) / normrhs
-    relative <= target && return result
+    relative_residual = sqrt(real(only(Q.expression_gram([expression])))) / rhs_norm
+    relative_residual <= target && return result
     error(
-        "3D Green CG residual $relative exceeds tolerance $(G.tolerance) after $(G.max_iterations) iterations; work cap=$workcap",
+        "3D Green CG residual $relative_residual exceeds tolerance $(G.tolerance) after $(G.max_iterations) iterations; work cap=$work_cap",
     )
 end
-Q.project(f::Q.Frame, psi::Q.QTT, G::CartesianGreen) =
+Q.project(f::Q.TangentSpace, psi::Q.QTT, G::CartesianGreen) =
     Q.project(f, Q.apply_mpo(G, psi; tol = G.tolerance / 100, cap = G.cap))
 
 function total_energy(
-    p::Problem{<:AbstractModel3D},
+    problem::Problem{<:AbstractModel3D},
     orbitals,
     rho,
     ops,
-    a,
+    accuracy,
     rec;
     time = 0.0,
     drive = NoDrive(),
 )
     drive isa NoDrive || throw(ArgumentError("3D drives are not implemented"))
-    zero = Q.constant_tt(nsites(p.grid), 0)
-    kinetic_h =
-        CartesianHamiltonian(zero, Q.diagonal(zero), ops.plus, ops.minus, p.grid, p.mass, nothing)
+    zero = Q.constant_tt(nsites(problem.grid), 0)
+    kinetic_operator = CartesianHamiltonian(
+        zero,
+        Q.diagonal(zero),
+        ops.plus,
+        ops.minus,
+        problem.grid,
+        problem.mass,
+        nothing,
+    )
     kinetic = sum(
         Q.recorded_map(Float64, length(orbitals), rec.options, rec; random = false) do i, localrec
-            p.occupations[i] * Q.h_expectation(kinetic_h, orbitals[i])
+            problem.occupations[i] * Q.h_expectation(kinetic_operator, orbitals[i])
         end,
     )
-    dv = volume_element(p.grid)
-    external = dv * real(Q.inner(rho, ops.external))
-    vh = hartree(rho, p, ops, a, rec)
-    eh = dv / 2 * real(Q.inner(rho, vh))
-    exc = if ops.xc_table === nothing
+    dV = volume_element(problem.grid)
+    external = dV * real(Q.inner(rho, ops.external))
+    Vhartree = hartree(rho, problem, ops, accuracy, rec)
+    hartree_energy = dV / 2 * real(Q.inner(rho, Vhartree))
+    xc_energy = if ops.xc_table === nothing
         0.0
     else
-        e = Q.cross(
+        xc_energy_density = Q.cross(
             rec,
-            nsites(p.grid),
+            nsites(problem.grid),
             Q.pointwise(n -> lda_pz81(real(n))[1], Q.sampled(rho, rec));
-            tol = a.xc_energy_tolerance,
-            cap = field_caps(a).xc_energy_cap,
+            tol = accuracy.xc_energy_tolerance,
+            cap = field_caps(accuracy).xc_energy_cap,
             label = "xc_energy_density",
         )
-        dv * real(sum(Q.tensortrain(e)))
+        dV * real(sum(Q.tensortrain(xc_energy_density)))
     end
     (;
-        total = kinetic + external + eh + exc + ops.nuclear,
+        total = kinetic + external + hartree_energy + xc_energy + ops.nuclear,
         kinetic,
         external,
-        hartree = eh,
-        xc = exc,
+        hartree = hartree_energy,
+        xc = xc_energy,
         nuclear = ops.nuclear,
         drive = 0.0,
     )

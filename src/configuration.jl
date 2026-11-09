@@ -79,7 +79,7 @@ function validate(s::SCFOptions)
         throw(ArgumentError("SCF criterion must be :energy or :strict"))
     min(s.max_iterations, s.inner_steps, s.coefficient_sweeps, s.anderson_history) > 0 &&
         0 < s.mixing <= 1 || throw(ArgumentError("Invalid SCF iteration/mixing settings"))
-    s.green_polish_every >= 0 || throw(ArgumentError("Negative polish interval"))
+    s.green_update_interval >= 0 || throw(ArgumentError("Negative Green update interval"))
     for key in (
         :energy_tolerance,
         :eigen_tolerance,
@@ -100,8 +100,8 @@ function validate(s::SCFOptions)
         value = getfield(s, key)
         isfinite(value) && value > 0 || throw(ArgumentError("Invalid SCF $key"))
     end
-    isfinite(s.green_polish_residual) && s.green_polish_residual >= 0 ||
-        throw(ArgumentError("Invalid polish residual"))
+    isfinite(s.green_update_residual_threshold) && s.green_update_residual_threshold >= 0 ||
+        throw(ArgumentError("Invalid Green update residual threshold"))
     s
 end
 function prepare_run(output, kind, p; options...)
@@ -265,9 +265,9 @@ function problem_from_config3d(gd, sd)
 end
 
 "Parse and validate model settings without constructing fields or orbitals."
-function configured_options(d::AbstractDict)
+function configured_options(settings::AbstractDict)
     require_keys(
-        d,
+        settings,
         [
             "run",
             "grid",
@@ -284,45 +284,48 @@ function configured_options(d::AbstractDict)
         ],
         "top-level",
     )
-    run = get(d, "run", Dict())
+    run = get(settings, "run", Dict())
     require_keys(run, ["kind", "output", "checkpoint", "blas_threads"], "run")
     kind = get(run, "kind", "scf")
     kind in ("scf", "propagation") || throw(ArgumentError("Unknown run kind: $kind"))
     threads = get(run, "blas_threads", 1)
     threads isa Integer && threads >= 1 || throw(ArgumentError("Invalid BLAS thread count"))
-    p = problem_from_config(d)
-    p.grid isa BoxGrid3D &&
+    problem = problem_from_config(settings)
+    problem.grid isa BoxGrid3D &&
         kind != "scf" &&
         throw(ArgumentError("3D configuration currently supports ground-state SCF"))
-    a = options_from_dict(Accuracy, get(d, "accuracy", Dict()))
-    tci = options_from_dict(TCIOptions, get(d, "tci", Dict()))
-    guess = options_from_dict(InitialGuess, get(d, "guess", Dict()))
-    physics = options_from_dict(PhysicsNumerics, get(d, "physics", Dict()))
-    scf = options_from_dict(SCFOptions, get(d, "scf", Dict()))
-    audit = options_from_dict(AuditOptions, get(d, "audit", Dict()))
-    ref = options_from_dict(RefinementOptions, get(d, "refinement", Dict()))
-    to = options_from_dict(TimeOptions, get(d, "time", Dict()))
-    dd = copy(get(d, "drive", Dict()))
-    dk = pop!(dd, "kind", "none")
+    accuracy = options_from_dict(Accuracy, get(settings, "accuracy", Dict()))
+    tci = options_from_dict(TCIOptions, get(settings, "tci", Dict()))
+    guess = options_from_dict(InitialGuess, get(settings, "guess", Dict()))
+    physics = options_from_dict(PhysicsNumerics, get(settings, "physics", Dict()))
+    scf = options_from_dict(SCFOptions, get(settings, "scf", Dict()))
+    audit = options_from_dict(AuditOptions, get(settings, "audit", Dict()))
+    refinement = options_from_dict(RefinementOptions, get(settings, "refinement", Dict()))
+    time_options = options_from_dict(TimeOptions, get(settings, "time", Dict()))
+    drive_settings = copy(get(settings, "drive", Dict()))
+    drive_kind = pop!(drive_settings, "kind", "none")
     drive =
-        dk == "none" ?
-        (isempty(dd) ? NoDrive() : throw(ArgumentError("NoDrive accepts no extra parameters"))) :
-        dk == "cosine_pulse" ? options_from_dict(CosinePulse, dd) :
+        drive_kind == "none" ?
+        (
+            isempty(drive_settings) ? NoDrive() :
+            throw(ArgumentError("NoDrive accepts no extra parameters"))
+        ) :
+        drive_kind == "cosine_pulse" ? options_from_dict(CosinePulse, drive_settings) :
         throw(ArgumentError("Unknown drive kind"))
     kind == "scf" &&
         !(drive isa NoDrive) &&
         throw(ArgumentError("SCF has no time-dependent drive; put static fields in the model"))
-    foreach(validate, (a, tci, guess, physics, scf, audit, ref, to, drive))
+    foreach(validate, (accuracy, tci, guess, physics, scf, audit, refinement, time_options, drive))
     (;
-        problem = p,
-        accuracy = a,
+        problem,
+        accuracy,
         tci,
         guess,
         physics,
         scf,
         audit,
-        refinement = ref,
-        time = to,
+        refinement,
+        time = time_options,
         drive,
         kind,
         blas_threads = threads,
@@ -331,109 +334,127 @@ end
 
 "Validate a TOML input and describe its grid, occupations, and execution settings."
 function configuration_plan(path)
-    d = TOML.parsefile(path)
-    c = configured_options(d)
-    p = c.problem
-    tasks = c.kind == "scf" ? c.scf.parallel_tasks : c.time.parallel_tasks
+    settings = TOML.parsefile(path)
+    options = configured_options(settings)
+    problem = options.problem
+    tasks = options.kind == "scf" ? options.scf.parallel_tasks : options.time.parallel_tasks
     plan = Dict(
-        "kind" => c.kind,
-        "system" => get(get(d, "system", Dict()), "kind", "hydrogen_chain"),
-        "grid_points" => length(p.grid),
-        "occupied_orbitals" => length(p.occupations),
-        "electrons" => sum(p.occupations),
-        "cell" => p.grid.L isa Tuple ? collect(p.grid.L) : p.grid.L,
-        "qtt_sites" => nsites(p.grid),
-        "spatial_dimensions" => p.grid isa BoxGrid3D ? 3 : 1,
+        "kind" => options.kind,
+        "system" => get(get(settings, "system", Dict()), "kind", "hydrogen_chain"),
+        "grid_points" => length(problem.grid),
+        "occupied_orbitals" => length(problem.occupations),
+        "electrons" => sum(problem.occupations),
+        "cell" => problem.grid.L isa Tuple ? collect(problem.grid.L) : problem.grid.L,
+        "qtt_sites" => nsites(problem.grid),
+        "spatial_dimensions" => problem.grid isa BoxGrid3D ? 3 : 1,
         "julia_threads" => Threads.nthreads(:default),
         "parallel_tasks" => tasks,
         "parallel_workers_for_orbitals" =>
-            Q.parallel_workers((; parallel_tasks = tasks), length(p.occupations)),
-        "blas_threads" => c.blas_threads,
+            Q.parallel_workers((; parallel_tasks = tasks), length(problem.occupations)),
+        "blas_threads" => options.blas_threads,
         "calculation_started" => false,
-        "resolved_field_caps" => option_dict(field_caps(c.accuracy)),
+        "resolved_field_caps" => option_dict(field_caps(options.accuracy)),
         "dense_orbital_bytes" =>
-            big(sizeof(ComplexF64)) * length(p.grid) * length(p.occupations),
+            big(sizeof(ComplexF64)) * length(problem.grid) * length(problem.occupations),
         "note" => "Dense storage comparison only; not an estimate of peak memory.",
     )
-    c.kind == "scf" && (plan["solver"] = string(c.scf.solver))
+    options.kind == "scf" && (plan["solver"] = string(options.scf.solver))
     plan
 end
 
 "Run a TOML experiment. Output directories are fresh; checkpoint states are warm starts."
 run_config(path; kwargs...) = run_config(TOML.parsefile(path), path; kwargs...)
 
-function run_config(d::AbstractDict, path; output = nothing, checkpoint = nothing)
-    c = configured_options(d)
-    p, a, tci, guess, physics = c.problem, c.accuracy, c.tci, c.guess, c.physics
-    scf, audit, ref, to, drive, kind = c.scf, c.audit, c.refinement, c.time, c.drive, c.kind
-    run = get(d, "run", Dict())
-    out = output === nothing ? get(run, "output", nothing) : output
-    out === nothing && throw(ArgumentError("Specify a fresh output directory"))
-    ispath(out) && throw(ArgumentError("Run output already exists: $out; choose a fresh directory"))
-    cp = checkpoint === nothing ? get(run, "checkpoint", nothing) : checkpoint
-    cp !== nothing && !isabspath(cp) && (cp = normpath(joinpath(dirname(abspath(path)), cp)))
-    oldthreads = BLAS.get_num_threads()
-    BLAS.set_num_threads(c.blas_threads)
+function run_config(settings::AbstractDict, path; output = nothing, checkpoint = nothing)
+    options = configured_options(settings)
+    problem, accuracy, tci, guess, physics =
+        options.problem, options.accuracy, options.tci, options.guess, options.physics
+    scf, audit, refinement, time_options, drive, kind =
+        options.scf, options.audit, options.refinement, options.time, options.drive, options.kind
+    run = get(settings, "run", Dict())
+    output_directory = output === nothing ? get(run, "output", nothing) : output
+    output_directory === nothing && throw(ArgumentError("Specify a fresh output directory"))
+    ispath(output_directory) && throw(
+        ArgumentError("Run output already exists: $output_directory; choose a fresh directory"),
+    )
+    checkpoint_path = checkpoint === nothing ? get(run, "checkpoint", nothing) : checkpoint
+    checkpoint_path !== nothing &&
+        !isabspath(checkpoint_path) &&
+        (checkpoint_path = normpath(joinpath(dirname(abspath(path)), checkpoint_path)))
+    previous_blas_threads = BLAS.get_num_threads()
+    BLAS.set_num_threads(options.blas_threads)
     # Include checkpoint import/refinement in the externally visible configured-run timer.
     start = time_ns()
     try
-        initial = cp === nothing ? nothing : load_checkpoint(cp; model = p.model)
-        if initial !== nothing && initial.problem.grid.R < p.grid.R
-            tasks = kind == "scf" ? scf.parallel_tasks : to.parallel_tasks
+        initial =
+            checkpoint_path === nothing ? nothing :
+            load_checkpoint(checkpoint_path; model = problem.model)
+        if initial !== nothing && initial.problem.grid.R < problem.grid.R
+            tasks = kind == "scf" ? scf.parallel_tasks : time_options.parallel_tasks
             initial = refine_state(
                 initial,
-                p;
-                accuracy = a,
+                problem;
+                accuracy = accuracy,
                 tci,
-                refinement = ref,
+                refinement = refinement,
                 parallel_tasks = tasks,
             )
         end
         initial !== nothing &&
-            !compatible_problem(initial.problem, p) &&
+            !compatible_problem(initial.problem, problem) &&
             throw(ArgumentError("Checkpoint problem mismatch"))
         result = if kind == "scf"
-            pivot_file = cp === nothing ? nothing : joinpath(dirname(cp), "cross-state.jls")
+            pivot_file =
+                checkpoint_path === nothing ? nothing :
+                joinpath(dirname(checkpoint_path), "cross-state.jls")
             pivot_state =
                 tci.reuse_pivots && pivot_file !== nothing && isfile(pivot_file) ? pivot_file :
                 nothing
             ground_state(
-                p;
+                problem;
                 initial,
                 pivot_state,
-                accuracy = a,
+                accuracy = accuracy,
                 scf,
                 tci,
                 guess,
                 physics,
                 audit,
-                output = out,
+                output = output_directory,
             )
         else
             initial === nothing && (
                 initial = initial_state(
-                    p,
-                    a,
-                    recorder(nothing, tci; parallel_tasks = to.parallel_tasks),
+                    problem,
+                    accuracy,
+                    recorder(nothing, tci; parallel_tasks = time_options.parallel_tasks),
                     guess,
                 )
             )
-            propagate(initial; time = to, drive, accuracy = a, tci, physics, output = out)
+            propagate(
+                initial;
+                time = time_options,
+                drive,
+                accuracy = accuracy,
+                tci,
+                physics,
+                output = output_directory,
+            )
         end
-        Base.cp(path, joinpath(out, "input.toml"))
+        Base.cp(path, joinpath(output_directory, "input.toml"))
         write_json(
-            joinpath(out, "workflow.json"),
+            joinpath(output_directory, "workflow.json"),
             (
                 elapsed_seconds = (time_ns() - start) / 1e9,
                 scope = "configuration through refinement/initialization, solver and output; excludes process startup and postprocessing",
-                initial_checkpoint = cp,
-                refinement = option_dict(ref),
+                initial_checkpoint = checkpoint_path,
+                refinement = option_dict(refinement),
                 guess = option_dict(guess),
             ),
         )
         result
     finally
-        BLAS.set_num_threads(oldthreads)
+        BLAS.set_num_threads(previous_blas_threads)
     end
 end
 

@@ -9,6 +9,8 @@ struct XCTable
     quadrature_rtol::Float64
 end
 function correlation(rho)
+    # Helbig et al., Eq. (5) and Table 1: unpolarized 1D gas, unit softening.
+    # A, C, D, E, alpha, beta, and m retain the parametrization's symbols.
     rs = 1 / (2rho)
     A = 18.40
     C = 7.501
@@ -83,7 +85,7 @@ function xc(table::XCTable, rho)
 end
 const IMAGE_ZETA = [zeta(2m + 1) for m = 1:28]
 "Smooth periodic soft Coulomb: symmetric image sum with 2/(mL) constants subtracted."
-function soft(x, L)
+function periodic_soft_coulomb(x, L)
     x = mod(x + L / 2, L) - L / 2
     r = sqrt(1 + x * x)
     t = x / r

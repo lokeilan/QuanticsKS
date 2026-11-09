@@ -63,7 +63,7 @@ operations used by every model. Its files are loaded by `QuanticsKS.jl`.
 | [tensor.jl](../src/tensor.jl) | QTT algebra, MPO operations, linear expressions, and compression recovery |
 | [tci.jl](../src/tci.jl) | Sample caches, TCI fitting, pivot reuse, fit records, and task scheduling |
 | [physics.jl](../src/physics.jl) | Periodic soft-Coulomb kernel and scalar 1D XC formulas |
-| [solvers.jl](../src/solvers.jl) | LRRAP, restarted Lanczos and Davidson updates, shared orbital algebra, mixing, and storage |
+| [solvers.jl](../src/solvers.jl) | LRRAP, restarted Krylov and Davidson updates, shared orbital algebra, mixing, and storage |
 
 TensorCrossInterpolation supplies fitting, tensor addition, compression, and
 contraction environments, including the signed 3D kernel suffix. ITensorMPS
@@ -79,3 +79,22 @@ tangent-coordinate updates remain explicit in the solver.
 Read `scf.jl` for the ground-state workflow, `hamiltonian.jl` for its physical
 operators, and `solvers.jl` for orbital updates and their shared numerical
 functions. Dimension-specific methods sit with the operation they implement.
+
+## Naming
+
+Use the [algorithm vocabulary](algorithm.md#terminology-and-notation) when naming
+physical quantities and numerical operations. Follow the reference repository's
+`psi`, potential, kinetic, grid-spacing, and tolerance notation, and ITensor's
+MPS/MPO, site, link/bond, canonicalization, and contraction vocabulary.
+Use `snake_case` for functions and variables, and `PascalCase` for types.
+Keep short mathematical symbols inside a clearly identified formula; use
+`problem`, `accuracy`, `orbitals`, `energies`, and operation-specific names
+across longer workflows. Configuration names retain the same meaning in the
+solver. Spell out the represented operation when no established term applies.
+
+Sampling functions use `evaluator` or `samples`; cached contractions use
+`tt_cache` or `environment`; tangent coordinates use `tangent_basis` and
+`tangent_vector`. Name reconstruction, orthogonalization, and compression
+separately. Comments explain a physical quantity, equation, numerical choice,
+or library constraint. A project adaptation must be described as such, with
+its equation or source, rather than presented as a published algorithm name.

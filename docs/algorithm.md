@@ -35,7 +35,8 @@ samples, half a voxel outside the nominal box faces.
 
 For 1D soft-Coulomb systems, external and Hartree potentials use the same
 periodic interaction kernel. Hartree is a cyclic MPO contraction times `h`.
-The unpolarized LSDA table interpolates XC energy density and returns its
+The unpolarized LSDA table uses the correlation parametrization of
+[Helbig et al., Eq. (5) and Table 1][lsda-1d]. It interpolates XC energy density and returns its
 density derivative as the XC potential. This parametrization requires unit
 softening, coupling, and electron mass.
 
@@ -44,7 +45,8 @@ averages of `1/r`, including a finite self term. Near-field values use a
 rectangular-prism integral; far-field values use Gaussian quadrature. Hartree
 is a free-space block-Toeplitz convolution times `dV`. TCI samples the complete
 MPO contraction environments, then fits the resulting field under its rank
-budget. XC uses Slater exchange and original unpolarized PZ81 correlation.
+budget. XC uses Slater exchange and original unpolarized [Perdew-Zunger (PZ81)
+correlation][pz81].
 `xc="none"` retains Hartree and disables XC. Custom local-potential models are
 noninteracting.
 
@@ -72,11 +74,11 @@ not added as an XC energy term.
 | Stage | Operation |
 |---|---|
 | L1 | Contract Rayleigh values and fit the complete residual `H*u_i - epsilon_i*u_i`. |
-| L2 | Build a common canonical tangent frame from a rotating occupied orbital. |
-| L3 | Project orbitals, Green-preconditioned residuals, and history directions into that frame. |
+| L2 | Build a common tangent space from a rotating occupied orbital. |
+| L3 | Project orbitals, Green-preconditioned residuals, and history directions into that tangent space. |
 | L4 | Remove small singular directions and contract the reduced Hamiltonian, retaining orbital-direction coupling. |
 | L5 | Solve the small coefficient problem with occupied-orbital orthogonality constraints. |
-| L6 | Reconstruct QTT orbitals from the correction. Clear history when Green polishing is scheduled. |
+| L6 | Reconstruct QTT orbitals from the correction. Clear history when a Green update is scheduled. |
 | L6G | Optionally apply `(T + mu*I)^-1` to `(mu + epsilon_i - V)*u_i` and normalize. |
 | L7 | Restore orthogonality and apply the required Ritz rotation. |
 
@@ -91,8 +93,10 @@ terms are combined before the working result is compressed.
 
 ## Restarted orbital subspace solvers
 
-`lanczos` applies the forward Hamiltonian to the latest basis block and
-orthogonalizes the result against the retained space. `davidson` adds the
+`lanczos` selects restarted block Krylov expansion: apply the Hamiltonian
+to the latest basis block and project out the retained space. The implementation
+uses a full generalized Ritz problem; it does not form a three-term Lanczos
+recurrence or assume a tridiagonal projected matrix. `davidson` adds the
 Green-preconditioned residual of the Ritz orbital with the largest residual.
 `block_davidson` expands with a block of preconditioned residuals.
 The two Davidson variants use the shifted kinetic inverse as their
@@ -157,3 +161,59 @@ step, and a second potential half step. Each potential step uses the density of
 its input orbitals; the external drive is evaluated at the time midpoint.
 Orbital norms and Gram drift are recorded. The 3D implementation currently
 supports ground-state SCF only.
+
+## Terminology and notation
+
+Names follow the physical quantity or mathematical operation. The main code
+references are [Gross-Pitaevskii-TCI's numerical functions][gp-code] and
+[ITensorMPS's MPS/MPO examples][itensor]. The following vocabulary connects
+the implementation to its sources.
+
+| Term | Meaning and use here | Source |
+|---|---|---|
+| Tensor train (TT), matrix product state (MPS), core or site tensor | A chain of tensors with contracted bond indices. `QTT.c` stores the cores; this stored field retains its name for checkpoint compatibility. | [TCI paper][tci-paper], [ITensorMPS][itensor] |
+| Quantics tensor train (QTT), binary site | Binary digits encode grid coordinates. `grid.R` is bits per axis; `nsites(grid)` counts all binary sites. | [Quantics TCI][qtt-paper] |
+| Bond dimension, TT rank | Size of an internal tensor index. `cap` limits that size; it is separate from an error tolerance. | [TCI paper][tci-paper], [ITensorMPS][itensor] |
+| Tensor cross interpolation (TCI), pivot index sets, prrLU | Adaptive entry sampling and partially rank-revealing LU. Cached pivot indices are reused, while function values are reevaluated. | [TCI paper][tci-paper] |
+| Function evaluation, batch evaluation, contraction environment | Values at selected indices and partial tensor contractions used to compute them. `BlockEvaluator` evaluates several trains; `tt_cache` is a library `TTCache`. | [TCI library][tci-library] |
+| Canonical form, orthogonality center, gauge condition | Tensor representation properties. Moving the orthogonality center is distinct from rank truncation. | [ITensorMPS][itensor], [TT geometry][tt-geometry] |
+| Tangent space, tangent vector, tangent projection | Variations at a fixed TT, represented by left/right orthogonal cores and gauge-constrained core variations. `TangentSpace` stores those bases and coordinate offsets. | [LRRAP, Sec. 3][lrrap-paper] |
+| LRRAP | Low-rank Riemannian alternating projection. The implementation adapts the paper's common tangent-space and constrained coefficient update to Kohn-Sham SCF. | [LRRAP, Eqs. (23)-(29)][lrrap-paper] |
+| Gram/overlap matrix, canonical orthogonalization | `S = X'X`; `canonical_orthogonalizer` returns retained overlap eigenvectors scaled by inverse square roots. Its columns satisfy `W'SW = I`. Orbital symmetric orthogonalization instead uses the full `S^(-1/2)`. | [PySCF orthogonalization][orthogonalization] |
+| Rayleigh quotient, Ritz values/vectors, Krylov subspace, Davidson correction | Projected eigenproblems and trial-space expansion. Davidson directions use preconditioned residuals. | [SLEPc eigensolver guide][eigensolvers] |
+| Rounding, compression, truncation | Approximation at a specified TT rank/tolerance. `compress_orbitals` also checks the Gram matrix after compression. | [TT arithmetic][tt-arithmetic] |
+
+`psi` denotes an orbital, `rho` a density, `H` the Hamiltonian, and `V` a
+potential when used in a physical expression. In the LRRAP coefficient problem,
+`X` and `V` instead denote orbital and tangent-direction matrices, following
+the paper: `S_xx = X'X`, `S_vx = V'X`, `H_vx = V'HX`, and `H_vv = V'HV`.
+The local comment states this meaning. `c` and `C` are the corresponding
+orbital and tangent coefficients. Short loop indices and factorization symbols
+such as `U`, `S`, and `V` remain local to the formula they express.
+
+`Block Green` denotes the explicit Green fixed-point update written in L6G
+above. It is a descriptive project method label. The 3D inverse uses [conjugate
+gradient iterations][cg] with TT compression and a separately evaluated residual.
+`FD2` means second-order central finite differences; displacement operators
+are named `shift_mpo`. These are spatial discretization choices, independent
+of QTT encoding. Density feedback uses regularized [Anderson mixing][anderson].
+Propagation uses [Strang splitting][strang] with a Cayley approximation to the kinetic
+exponential; the [reference GPE paper][gp-paper] motivates the QTT split-step
+organization, while this project's kinetic discretization is stated above.
+
+[gp-code]: https://github.com/MarcelNiedermeier/Gross-Pitaevskii-TCI/blob/main/working_example/utilities.jl
+[gp-paper]: https://arxiv.org/abs/2507.04262
+[itensor]: https://docs.itensor.org/ITensorMPS/stable/examples/MPSandMPO.html
+[tci-paper]: https://doi.org/10.21468/SciPostPhys.18.3.104
+[qtt-paper]: https://arxiv.org/abs/2303.11819
+[tci-library]: https://tensor4all.org/TensorCrossInterpolation.jl/dev/
+[tt-geometry]: https://arxiv.org/abs/1407.2042
+[lrrap-paper]: https://arxiv.org/abs/1811.11049
+[orthogonalization]: https://pyscf.org/_modules/pyscf/scf/addons.html#canonical_orth_
+[eigensolvers]: https://slepc.upv.es/release/documentation/manual/eps.html
+[tt-arithmetic]: https://arxiv.org/abs/2011.06532
+[anderson]: https://doi.org/10.1145/321296.321305
+[lsda-1d]: https://pure.mpg.de/rest/items/item_1351618_5/component/file_1383643/content
+[pz81]: https://doi.org/10.1103/PhysRevB.23.5048
+[cg]: https://petsc.org/release/manualpages/KSP/KSPCG/
+[strang]: https://doi.org/10.1137/0705041

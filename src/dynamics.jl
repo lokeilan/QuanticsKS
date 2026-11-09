@@ -22,16 +22,16 @@ function potential_half_step(problem, orbitals, ops, accuracy, rec, t, drive, op
         )
     end
 end
-function kinetic_step(orbitals, green, mu, t, rec)
-    Q.recorded_map(Q.QTT, length(orbitals), t, rec) do i, localrec
+function kinetic_step(orbitals, green, mu, options, rec)
+    Q.recorded_map(Q.QTT, length(orbitals), options, rec) do i, localrec
         psi = orbitals[i]
         Q.add(
-            Q.apply_mpo(green, psi; tol = t.kinetic_tolerance, cap = t.kinetic_cap),
+            Q.apply_mpo(green, psi; tol = options.kinetic_tolerance, cap = options.kinetic_cap),
             psi;
             a = 2mu,
             b = -1,
-            tol = t.output_tolerance,
-            cap = t.output_cap,
+            tol = options.output_tolerance,
+            cap = options.output_cap,
             rec = localrec,
             label = "kinetic_step_$i",
         )

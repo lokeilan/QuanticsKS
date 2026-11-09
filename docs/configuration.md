@@ -46,8 +46,13 @@ helium example is a coarse discretization, not a converged continuum result.
 | `density_tolerance` | `1e-10` | Density fitting |
 | `xc_energy_tolerance` | `1e-10` | XC energy-density fitting |
 | `work_tolerance` | `1e-6` | Orbital update tensors |
-| `storage_tolerance` | `1e-8` | Stored orbitals |
+| `storage_tolerance` | `1e-10` | Stored orbitals |
 | `algebra_tolerance` | `1e-12` | Tensor algebra and Hartree construction |
+| `orbital_tolerance` | inherits `field_tolerance` | LRRAP orbital reconstruction; initial envelope uses one tenth of this value |
+| `orthogonalization_tolerance` | `1e-11` | Orthogonalization and Ritz reconstruction |
+| `green_rhs_tolerance` | `1e-9` | Green right-hand-side fitting |
+| `mixing_tolerance` | inherits `algebra_tolerance` | Reconstruction of mixed density |
+| `storage_gram_tolerance` | `1e-7` | Gram-defect acceptance for stored orbitals |
 | `orbital_cap` | `48` | Orbital rank limit |
 | `work_cap` | `96` | Intermediate rank limit |
 | `field_cap` | `64` | Default field rank limit |
@@ -57,6 +62,29 @@ Optional `external_cap`, `kernel_cap`, `density_cap`, `hartree_cap`,
 limit for the corresponding field. Unset values inherit `field_cap`.
 `plan` and `config.json` show the resolved values. A static local potential is
 reused only when it satisfies the effective-potential rank limit.
+
+Set `orbital_tolerance` explicitly when relaxing `field_tolerance` independently
+of orbital reconstruction. The LRRAP update uses the smaller of the working and
+orbital tolerances. An unset value inherits `field_tolerance`. Density residuals use direct
+contractions and have no fitting-tolerance option.
+
+TCI tolerances measure sampled fitting errors, while SVD truncation tolerances
+control tensor compression. Neither directly bounds a Hamiltonian residual.
+Relax numerical budgets using measured errors in the quantity of interest;
+keep SCF stopping, Gram acceptance, and final audit criteria separate. In
+particular, fine-grid kinetic operators can amplify small storage errors.
+
+Storage orthogonality uses `storage_gram_tolerance` and
+`storage_compression_attempts`. Optional Green updates use
+`green_update_interval` and `green_update_residual_threshold`. TOML inputs,
+Julia constructors, solver controls, and generated records use these names.
+Unknown option names are rejected.
+
+`green_update_interval=5` schedules updates in every fifth SCF iteration;
+zero disables that schedule. An orbital residual below
+`green_update_residual_threshold=0.1` can also trigger an update. These controls
+set the update schedule, independently of Green-solve accuracy and physical
+acceptance.
 
 `[tci].post_rounding_factor=0` keeps the prrLU result. A positive value requests
 an additional SVD rounding at that fraction of the fitting tolerance.

@@ -282,15 +282,16 @@ end
 Base.@kwdef struct Accuracy
     field_tolerance::Float64 = 1e-8
     work_tolerance::Float64 = 1e-6
-    storage_tolerance::Float64 = 1e-8
+    storage_tolerance::Float64 = 1e-10
     algebra_tolerance::Float64 = 1e-12
     # Optional SCF sampling budgets; nothing retains the algebra/work defaults.
     mixing_tolerance::Union{Nothing,Float64} = nothing
-    density_residual_tolerance::Union{Nothing,Float64} = nothing
+    # Unset orbital tolerance inherits the field tolerance.
+    orbital_tolerance::Union{Nothing,Float64} = nothing
     green_rhs_cap::Union{Nothing,Int} = nothing
     orbital_cap::Int = 48
     field_cap::Int = 64
-    # Unset component caps inherit the legacy field budget.
+    # Unset component caps inherit the shared field budget.
     external_cap::Union{Nothing,Int} = nothing
     kernel_cap::Union{Nothing,Int} = nothing
     density_cap::Union{Nothing,Int} = nothing
@@ -305,10 +306,10 @@ Base.@kwdef struct Accuracy
     xc_energy_tolerance::Float64 = 1e-10
     orthogonalization_tolerance::Float64 = 1e-11
     green_rhs_tolerance::Float64 = 1e-9
-    pack_gram_tolerance::Float64 = 1e-7
-    pack_attempts::Int = 4
+    storage_gram_tolerance::Float64 = 1e-7
+    storage_compression_attempts::Int = 4
 end
-"Resolve independent field budgets without changing legacy inputs."
+"Resolve each field's rank cap from its override or the shared field cap."
 field_caps(a::Accuracy) = (
     external_cap = something(a.external_cap, a.field_cap),
     kernel_cap = something(a.kernel_cap, a.field_cap),
@@ -389,8 +390,8 @@ Base.@kwdef struct SCFOptions
     anderson_history::Int = 5
     anderson_regularization::Float64 = 1e-6
     anderson_coefficient_limit::Float64 = 5.0
-    green_polish_every::Int = 5
-    green_polish_residual::Float64 = 0.1
+    green_update_interval::Int = 5
+    green_update_residual_threshold::Float64 = 0.1
     tangent_relative_cutoff::Float64 = 1e-7
     tangent_absolute_cutoff::Float64 = 1e-12
     metric_relative_cutoff::Float64 = 1e-11
@@ -415,10 +416,10 @@ function validate(a::Accuracy)
             a.xc_energy_tolerance,
             a.orthogonalization_tolerance,
             a.green_rhs_tolerance,
-            a.pack_gram_tolerance,
+            a.storage_gram_tolerance,
         ),
     ) || throw(ArgumentError("Tolerances must be positive and finite"))
-    for tol in (a.mixing_tolerance, a.density_residual_tolerance)
+    for tol in (a.mixing_tolerance, a.orbital_tolerance)
         tol === nothing ||
             (isfinite(tol) && tol > 0) ||
             throw(ArgumentError("SCF sampling tolerances must be positive and finite"))
@@ -428,43 +429,42 @@ function validate(a::Accuracy)
         throw(ArgumentError("Green RHS rank cap must be positive"))
     isfinite(a.storage_tolerance) && a.storage_tolerance >= 0 ||
         throw(ArgumentError("Invalid storage tolerance"))
-    min(a.orbital_cap, a.field_cap, a.work_cap, a.pack_attempts) > 0 ||
+    min(a.orbital_cap, a.field_cap, a.work_cap, a.storage_compression_attempts) > 0 ||
         throw(ArgumentError("Bond caps and attempts must be positive"))
     for (name, cap) in pairs(field_caps(a))
         cap > 0 || throw(ArgumentError("$name must be positive"))
     end
     a
 end
-function solver_config(p, a, s = SCFOptions())
-    validate(a)
+function solver_config(problem, accuracy, scf = SCFOptions())
+    validate(accuracy)
     merge(
         (;
-            R = nsites(p.grid),
-            cell = cell_volume(p.grid),
-            volume_element = volume_element(p.grid),
-            electrons = sum(p.occupations),
-            rankcap = a.orbital_cap,
-            opcap = field_caps(a).effective_potential_cap,
-            density_cap = field_caps(a).density_cap,
-            workcap = a.work_cap,
-            tci_tol = a.field_tolerance,
-            round_tol = a.algebra_tolerance,
-            eigen_tol = s.eigen_tolerance,
-            inner_steps = s.inner_steps,
-            coefficient_sweeps = s.coefficient_sweeps,
-            green_shift = s.green_shift,
-            mixing = s.mixing,
-            anderson = s.anderson,
+            R = nsites(problem.grid),
+            cell = cell_volume(problem.grid),
+            volume_element = volume_element(problem.grid),
+            electrons = sum(problem.occupations),
+            orbital_cap = accuracy.orbital_cap,
+            effective_potential_cap = field_caps(accuracy).effective_potential_cap,
+            density_cap = field_caps(accuracy).density_cap,
+            work_cap = accuracy.work_cap,
+            orbital_tolerance = something(accuracy.orbital_tolerance, accuracy.field_tolerance),
+            algebra_tolerance = accuracy.algebra_tolerance,
+            eigen_tolerance = scf.eigen_tolerance,
+            inner_steps = scf.inner_steps,
+            coefficient_sweeps = scf.coefficient_sweeps,
+            green_shift = scf.green_shift,
+            mixing = scf.mixing,
+            anderson = scf.anderson,
         ),
-        (; (k => getfield(s, k) for k in fieldnames(SCFOptions))...),
+        (; (k => getfield(scf, k) for k in fieldnames(SCFOptions))...),
         (;
-            ortho_tol = a.orthogonalization_tolerance,
-            rhs_tol = a.green_rhs_tolerance,
-            rhs_cap = something(a.green_rhs_cap, a.work_cap),
-            mixing_tol = something(a.mixing_tolerance, a.algebra_tolerance),
-            density_residual_tol = something(a.density_residual_tolerance, a.algebra_tolerance),
-            pack_gram_tolerance = a.pack_gram_tolerance,
-            pack_attempts = a.pack_attempts,
+            orthogonalization_tolerance = accuracy.orthogonalization_tolerance,
+            green_rhs_tolerance = accuracy.green_rhs_tolerance,
+            green_rhs_cap = something(accuracy.green_rhs_cap, accuracy.work_cap),
+            mixing_tolerance = something(accuracy.mixing_tolerance, accuracy.algebra_tolerance),
+            storage_gram_tolerance = accuracy.storage_gram_tolerance,
+            storage_compression_attempts = accuracy.storage_compression_attempts,
         ),
     )
 end
