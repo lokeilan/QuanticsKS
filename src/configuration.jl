@@ -235,6 +235,31 @@ function problem_from_config(d)
     end
     throw(ArgumentError("Unsupported system kind: $kind"))
 end
+function problem_from_config3d(gd, sd)
+    kind = get(sd, "kind", "hydrogen_cluster")
+    if kind == "hydrogen_cluster"
+        require_keys(sd, ["kind", "shape", "distance", "padding", "xc"], "3D system")
+        return hydrogen_cluster(;
+            R = get(gd, "R", 7),
+            shape = Tuple(get(sd, "shape", [3, 2, 2])),
+            distance = get(sd, "distance", 2ANGSTROM_TO_BOHR),
+            padding = get(sd, "padding", 10.0),
+            cell = get(gd, "cell", nothing),
+            xc = Symbol(get(sd, "xc", "pz81")),
+        )
+    elseif kind == "all_electron"
+        require_keys(sd, ["kind", "positions", "charges", "occupations", "mass", "xc"], "3D system")
+        m = AllElectronLDA3D(sd["positions"], sd["charges"]; xc = Symbol(get(sd, "xc", "pz81")))
+        return Problem(
+            BoxGrid3D(gd["R"], gd["cell"]),
+            m,
+            sd["occupations"];
+            mass = get(sd, "mass", 1.0),
+        )
+    end
+    throw(ArgumentError("Unsupported 3D system kind: $kind"))
+end
+
 "Parse and validate model settings without constructing fields or orbitals."
 function configured_options(d::AbstractDict)
     require_keys(

@@ -9,19 +9,14 @@ using LinearAlgebra, Random, Serialization, TensorOperations
 import TensorCrossInterpolation as TCI
 import ITensors, ITensorMPS
 
-include("numerics/svd_safety.jl")
-include("numerics/parallel.jl")
-include("numerics/tensor.jl")
-include("numerics/sampling.jl")
-include("numerics/tci.jl")
-include("numerics/physics.jl")
-include("numerics/hamiltonian.jl")
-include("numerics/lrrap.jl")
+include("tensor.jl")
+include("tci.jl")
+include("physics.jl")
+include("lrrap.jl")
 end
 const Q = Numerics
 
 include("models.jl")
-include("models3d.jl")
 include("states.jl")
 include("hamiltonian.jl")
 include("scf.jl")
@@ -29,7 +24,6 @@ include("dynamics.jl")
 include("observables.jl")
 include("spectrum.jl")
 include("configuration.jl")
-include("three_dimensional.jl")
 
 export PeriodicGrid1D, SoftCoulombLSDA1D, LocalPotential1D, Problem, hydrogen_chain
 export Accuracy, SCFOptions, TimeOptions, OrbitalState, SCFResult, TimeResult

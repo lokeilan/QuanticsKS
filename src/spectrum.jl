@@ -831,3 +831,6 @@ function fixed_spectrum(
         close(rec)
     end
 end
+
+fixed_spectrum(::OrbitalState{<:Problem{<:AbstractModel3D}}, ::AbstractVector{<:Real}; kwargs...) =
+    throw(ArgumentError("The fixed-spectrum interface is currently 1D only"))

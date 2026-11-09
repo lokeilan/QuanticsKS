@@ -23,6 +23,30 @@ function observe_state(state, ops, accuracy, rec; drive = NoDrive())
         orbital_bytes = sum(Q.storage, orbitals),
     )
 end
+
+function observe_state(
+    state::OrbitalState{<:Problem{<:AbstractModel3D}},
+    ops,
+    a,
+    rec;
+    drive = NoDrive(),
+)
+    p = state.problem
+    S = Q.gram(state.orbitals; cfg = rec.options)
+    norms = real.(diag(S))
+    rho = density(p, state.orbitals, a, rec)
+    energy = total_energy(p, state.orbitals, rho, ops, a, rec; time = state.time, drive)
+    (;
+        time = state.time,
+        energy,
+        electron_number = sum(p.occupations .* norms),
+        norms,
+        gram_defect = norm(S - I),
+        max_bond_dimension = maximum(Q.rank.(state.orbitals)),
+        orbital_bytes = sum(Q.storage, state.orbitals),
+    )
+end
+
 function observe(
     state::OrbitalState;
     accuracy = Accuracy(),

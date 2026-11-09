@@ -1,45 +1,130 @@
-# 配置与输出
+# Configuration
 
-3D extension: [models, parameters, numerical conventions, and limitations](three-dimensional.md). `src/models3d.jl` defines geometry and models; `src/three_dimensional.jl` supplies Cartesian operators and adapters to the shared SCF workflow.
+Inputs are TOML files. Unknown sections and options raise an error. Start from
+[h4.toml](../inputs/h4.toml), [helium.toml](../inputs/helium.toml), or
+[propagation.toml](../inputs/propagation.toml).
 
+```sh
+julia --project=. run.jl plan inputs/helium.toml
+julia --project=. run.jl solve inputs/helium.toml results/helium
+```
 
-TOML 使用唯一的一维格式，不再接受 `[calculation]` 分发段。`[system].kind` 支持 `hydrogen_chain`、`soft_coulomb` 和 `cosine_potential`。示例见 `inputs/`；未知选项会报错。
+## Physical system
 
-`[run].kind` 为 `scf` 或 `propagation`。SCF 使用 `[scf]`，传播使用 `[time]` 和可选 `[drive]`；其余可用段落为 `[grid]`、`[accuracy]`、`[tci]`、`[guess]`、`[physics]`、`[audit]`、`[refinement]`。
+`[run].kind` is `scf` or `propagation`. `[grid].dimensions` defaults to `1`;
+set it to `3` for an isolated Cartesian box. `R` is the number of bits per axis.
+Lengths are in bohr, energies in Hartree, and times in atomic units.
 
-| 设置 | 含义 |
+| Dimension | `[system].kind` | Main parameters |
+|---|---|---|
+| 1D | `hydrogen_chain` | `natoms`, `distance`; double occupations are assigned automatically |
+| 1D | `soft_coulomb` | `positions`, `charges`, `occupations`, `softening`, `coupling`, `xc` |
+| 1D | `cosine_potential` | `amplitude`, integer `mode`, `phase`, `offset`, `occupations` |
+| 3D | `all_electron` | Cartesian `positions`, `charges`, double `occupations`, `xc` |
+| 3D | `hydrogen_cluster` | Integer `shape`, `distance`, `padding`, `xc`; neutral hydrogen cluster |
+
+`[grid].cell` is the periodic length in 1D, or a scalar or three box lengths in
+3D. A hydrogen cluster can derive its box from nuclear extent and padding.
+The 1D cosine potential is `offset + amplitude*cos(2*pi*mode*x/cell + phase)`.
+
+The 1D interacting model accepts `xc="lsda"` or `"none"`; LSDA requires
+`softening=coupling=mass=1`. The 3D model accepts `xc="pz81"` or `"none"`.
+Explicit occupations allow charged isolated systems. Custom callable potentials
+use `LocalPotential1D` or `LocalPotential3D` through Julia.
+
+3D inputs support SCF only. The grid index representation permits `2 <= R <= 19`
+in 3D, but computational cost usually becomes limiting much earlier. The basic
+helium example is a coarse discretization, not a converged continuum result.
+
+## Accuracy and ranks
+
+| `[accuracy]` setting | Default | Purpose |
+|---|---:|---|
+| `field_tolerance` | `1e-8` | Effective-potential construction |
+| `external_tolerance` | `1e-12` | Static external potential |
+| `kernel_tolerance` | `1e-12` | Interaction kernel |
+| `density_tolerance` | `1e-10` | Density fitting |
+| `xc_energy_tolerance` | `1e-10` | XC energy-density fitting |
+| `work_tolerance` | `1e-6` | Orbital update tensors |
+| `storage_tolerance` | `1e-8` | Stored orbitals |
+| `algebra_tolerance` | `1e-12` | Tensor algebra and Hartree construction |
+| `orbital_cap` | `48` | Orbital rank limit |
+| `work_cap` | `96` | Intermediate rank limit |
+| `field_cap` | `64` | Default field rank limit |
+
+Optional `external_cap`, `kernel_cap`, `density_cap`, `hartree_cap`,
+`effective_potential_cap`, `xc_energy_cap`, and `drive_cap` override the rank
+limit for the corresponding field. Unset values inherit `field_cap`.
+`plan` and `config.json` show the resolved values. A static local potential is
+reused only when it satisfies the effective-potential rank limit.
+
+`[tci].post_rounding_factor=0` keeps the prrLU result. A positive value requests
+an additional SVD rounding at that fraction of the fitting tolerance.
+`require_convergence=true` rejects a fit that does not meet the TCI stopping
+conditions; the default is `false`. Neither option establishes physical accuracy.
+
+For the 3D Green solve, `[physics].green_relative_tolerance` defaults to `1e-8`
+and `green_max_iterations` to `300`. Failure to meet the stored-state residual
+budget raises an error.
+
+## SCF, propagation, and threads
+
+| Setting | Meaning |
 |---|---|
-| `accuracy.field_tolerance` | 势场构建精度 |
-| `accuracy.work_tolerance` | 轨道修正工作张量预算 |
-| `accuracy.storage_tolerance` | 保存轨道精度 |
-| `accuracy.density_tolerance` / `xc_energy_tolerance` | 密度及 XC 能量密度的 TCI 容差，默认均为 `1e-10` |
-| `tci.post_rounding_factor` | 可选的 TCI 后置 SVD 容差系数；默认 `0` 关闭，正值才启用 |
-| `scf.criterion` | `energy` 或需额外接受条件的 `strict` |
-| `scf.energy_tolerance` | 相邻轮全体系总能量变化阈值，默认 `1e-6 Ha` |
-| `scf.parallel_tasks` / `time.parallel_tasks` | 独立工作并发预算 |
+| `scf.criterion` | `energy` (default) or `strict` |
+| `scf.energy_tolerance` | Total-energy change threshold; default `1e-6 Ha` |
+| `scf.max_iterations` | SCF iteration limit |
+| `scf.inner_steps` | Orbital updates at a fixed input density |
+| `scf.mixing` | Density mixing weight |
+| `scf.anderson` | Enable Anderson mixing |
+| `scf.eigen_tolerance` | Final orbital residual threshold |
+| `scf.density_tolerance` | Density self-consistency threshold |
+| `time.dt`, `time.steps` | Time step and number of propagation steps |
+| `time.observe_every`, `time.snapshot_every` | Observation and saved-state intervals |
 
-`accuracy.field_cap` 是兼容旧输入的默认场上限。下面的可选参数未设置时均继承它；显式设置后只控制对应对象：
+`[audit]` sets independent final-state numerical budgets. `rank_multiplier`
+scales both inherited and explicitly overridden field caps. `[guess]` controls
+the 1D initial guess; 3D uses nuclear-envelope orbitals unless an initial state
+is supplied through Julia. `[drive]` accepts `kind="none"` or
+`kind="cosine_pulse"` for 1D propagation. Complete option fields are defined in
+[models.jl](../src/models.jl).
 
-| 参数 | 消费者 |
+Start Julia with `--threads=4,1` to allocate four worker threads. Set
+`scf.parallel_tasks` or `time.parallel_tasks` to `0` to use available workers,
+`1` for serial execution, or a positive concurrency limit. The default is `1`.
+Use `[run].blas_threads=1` when parallelizing independent orbitals.
+
+## Restart and output
+
+`[run].checkpoint` is resolved relative to the input file. It imports orbitals
+as a warm start; SCF mixing history starts again. A compatible `cross-state.jls`
+beside the checkpoint can supply cached pivots. `[refinement]` controls
+interpolation when the target grid is finer. Refinement adjusts volume weights
+and restores orbital orthogonality; it does not establish convergence.
+
+Output paths are relative to the launch directory. The command-line output path
+overrides `[run].output`, and existing output directories are rejected.
+
+| Output | Contents |
 |---|---|
-| `external_cap` | 静态外势的 QTT 构造 |
-| `kernel_cap` | 相互作用核 QTT；循环 MPO 的内部 bond 为核 bond 的两倍 |
-| `density_cap` | 输入/输出密度拟合及混合密度生成 |
-| `hartree_cap` | 核 MPO 作用于密度后的 Hartree 势 |
-| `effective_potential_cap` | 有效势 QTT/对角 MPO，以及固定势求解的势表示 |
-| `xc_energy_cap` | XC 能量密度的 QTT 构造 |
-| `drive_cap` | 计算外场能量时的外场 QTT；传播相位仍由 `time.phase_cap` 控制 |
+| `input.toml`, `config.json` | Input and resolved model/options |
+| `status.json` | Completion state, SCF stopping, and physical audit |
+| `checkpoint.jls`, `snapshots/` | Stored orbitals and problem metadata |
+| `cross-state.jls` | Reusable TCI pivot geometry |
+| `scf.jsonl`, `lrrap.jsonl` | Iteration energies, residuals, ranks, and timings |
+| `workflow.json` | Configured-run elapsed time and restart information |
+| `source/` | Runnable source and dependency snapshot |
 
-例如保持 `field_cap=128`，只设置 `external_cap=48`、`kernel_cap=16`，其余场仍继承 128。这是分开预算的配置示例，不代表这些值已通过完整 SCF 精度验收。`plan` 和 `config.json` 的 `resolved_field_caps` 列出全部实际生效的上限。审计的 `rank_multiplier` 同时放大继承值和显式覆盖值。
+`status.json.converged` means the selected stopping condition was reached;
+`status.json.audit.passed` records physical acceptance. SCF exits with code `0`
+when its stopping condition is met, `2` at an unconverged iteration limit, and
+`1` on input or execution errors. Propagation returns `0` after completing its
+configured steps.
 
-局域势模型在已有外势 rank 满足有效势上限时直接复用外势核心；显式要求更小的有效势上限时才重新拟合。XC 势目前作为密度的标量函数进入总有效势，没有单独的 XC 势 MPO。
+Logged ranks distinguish inner-update output from stored orbitals. Parallel
+subtask times may overlap; their sum is not wall time. Tensor storage, cumulative
+allocation, and peak process memory are separate quantities.
 
-`[run].checkpoint` 相对于输入文件目录解析。它导入轨道，SCF 历史从第一轮重新开始；同目录有效的 `cross-state.jls` 可用于 pivot 热启动。细化目标网格时使用 `[refinement]`。输出路径相对于启动目录；命令行 `NEW_OUTPUT` 优先于输入中的 `run.output`。
-
-每次运行保存 `input.toml`、`config.json`、`status.json`、迭代日志和数据检查点。`workflow.json` 记录配置运行的时间范围；`source/` 保存完整包的 `src/`、依赖声明及 `run.jl`。可以将 `source/` 作为 Julia 项目启动，并以保存的输入进行新的计算；重启所引用的外部检查点须继续可用。
-
-SCF 的 `scf.jsonl` 每行是一轮墙钟时间，初始化、检查点写入及末尾审计不都包含在这一行内。并行子任务时间可能重叠，不能相加后当作整轮墙钟时间。轨道核存储、累计分配和峰值内存是不同量。
-
-轨道上限 `accuracy.orbital_cap` 与实际 bond dimension 分开记录：`inner_output_max_rank` 是 L7 后、保存压缩前的最大 bond；`orbital_rank_before_pack` 是本轮首次保存压缩的输入最大 bond；`stored_max_rank` 是最终输出轨道的最大 bond（包括 strict 模式输出 Ritz 后的再次保存）。兼容字段 `lrrap.jsonl.max_rank` 仍表示内层输出，`scf.jsonl.max_rank` 仍表示最终保存轨道。关闭 TCI 后置 SVD 不会关闭由 `storage_tolerance` 控制的输出压缩。
-
-能量停止与物理接受分别保存在 `status.json` 的 `converged` 与 `audit.passed`。`criterion=energy` 可以在物理审计未通过时停止；首轮没有相邻能量差。命令行同时显示停止结果和审计结果，不合并成含义不明的“已接受”。
+`postprocess("results/helium")` writes `observables/trajectory.json`,
+`density.csv`, and `bond_profiles.csv`. The 3D density output samples the Morton
+index order; it is not a dense volume or a plane slice.

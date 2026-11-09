@@ -1,4 +1,4 @@
-# Small-grid execution check; not a continuum helium benchmark.
+# Isolated helium on a coarse grid; refine the grid and box for physical accuracy.
 [run]
 kind = "scf"
 blas_threads = 1

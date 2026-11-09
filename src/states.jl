@@ -95,6 +95,48 @@ function initial_state(problem, accuracy, rec, guess::InitialGuess)
         Q.independent_map(i -> Q.normalize(Q.phase_tt(envelope, wavevectors[i])), Q.QTT, b, cfg)
     OrbitalState(problem, first(Q.orthogonalize(orbitals, cfg, rec)))
 end
+
+function initial_state(p::Problem{<:AbstractModel3D}, a, rec, guess::InitialGuess)
+    validate(guess)
+    option_dict(guess) == option_dict(InitialGuess()) || throw(
+        ArgumentError(
+            "3D initial guesses use nuclear envelopes; supply an explicit initial state for customization",
+        ),
+    )
+    g = p.grid
+    centers = p.model isa AllElectronLDA3D ? p.model.positions : [(0.0, 0.0, 0.0)]
+    b = length(p.occupations)
+    mode_limit = ceil(Int, cbrt(b))
+    modes = sort(
+        vec(collect(Iterators.product(1:mode_limit, 1:mode_limit, 1:mode_limit)));
+        by = t -> sum(abs2, t),
+    )
+    cfg = solver_config(p, a)
+    orbitals = Q.QTT[]
+    for i = 1:b
+        mode = modes[i]
+        fn = j -> begin
+            r = grid_position(g, j)
+            envelope = sum(exp(-sqrt(sum(abs2, r .- c))) for c in centers)
+            envelope * prod(sinpi(mode[k] * (r[k] / g.L[k] + 0.5)) for k = 1:3)
+        end
+        push!(
+            orbitals,
+            Q.normalize(
+                Q.cross(
+                    rec,
+                    nsites(g),
+                    fn;
+                    tol = a.orthogonalization_tolerance,
+                    cap = a.orbital_cap,
+                    label = "initial_orbital_$i",
+                ),
+            ),
+        )
+    end
+    OrbitalState(p, first(Q.orthogonalize(orbitals, cfg, rec)))
+end
+
 "Periodic six-point degree-five refinement; creates a warm start, not an SCF-history continuation."
 function refine_state(
     state::OrbitalState,
@@ -133,6 +175,63 @@ function refine_state(
     orbitals = first(Q.pack_orbitals(orbitals, cfg; tol = accuracy.storage_tolerance))
     OrbitalState(target, orbitals; time = state.time)
 end
+
+function refine_state(
+    state::OrbitalState{<:Problem{<:AbstractModel3D}},
+    target::Problem;
+    accuracy = Accuracy(),
+    tci = TCIOptions(),
+    refinement = RefinementOptions(),
+    parallel_tasks = 1,
+)
+    compatible_problem(state.problem, target; refinement = true) ||
+        throw(ArgumentError("Refinement changes the physical problem"))
+    validate(accuracy)
+    validate(refinement)
+    coarse = state.problem.grid
+    g = target.grid
+    0 < g.R - coarse.R <= refinement.max_added_bits ||
+        throw(ArgumentError("Invalid 3D refinement increment"))
+    rec = recorder(nothing, tci; parallel_tasks)
+    cfg = solver_config(target, accuracy, SCFOptions(; parallel_tasks))
+    ratio = 1 << (g.R - coarse.R)
+    n = 1 << coarse.R
+    nodes = collect((-(refinement.degree ÷ 2)):(refinement.degree ÷ 2 + 1))
+    orbitals = Q.recorded_map(Q.QTT, length(state.orbitals), cfg, rec) do i, localrec
+        ev = Q.evaluate(state.orbitals[i], localrec)
+        fn =
+            j -> begin
+                q = grid_indices(g, j)
+                u = ntuple(a -> (q[a] + 0.5) / ratio - 0.5, 3)
+                base = floor.(Int, u)
+                weights = ntuple(
+                    a -> [
+                        prod((u[a] - base[a] - b) / (v - b) for b in nodes if b != v) for v in nodes
+                    ],
+                    3,
+                )
+                value = 0.0im
+                for ks in Iterators.product(eachindex(nodes), eachindex(nodes), eachindex(nodes))
+                    index = ntuple(a -> base[a] + nodes[ks[a]], 3)
+                    all(t -> 0 <= t < n, index) || continue
+                    value += prod(weights[a][ks[a]] for a = 1:3) * ev(grid_index(coarse, index))
+                end
+                value / sqrt(ratio^3)
+            end
+        Q.cross(
+            localrec,
+            nsites(g),
+            fn;
+            tol = refinement.tolerance,
+            cap = accuracy.orbital_cap,
+            label = "refine_$i",
+        )
+    end
+    orbitals = first(Q.orthogonalize(orbitals, cfg, rec))
+    orbitals = first(Q.pack_orbitals(orbitals, cfg; tol = accuracy.storage_tolerance))
+    OrbitalState(target, orbitals; time = state.time)
+end
+
 "Rows are orbitals; columns are internal bonds ordered from MSB to LSB."
 bond_profiles(s::OrbitalState) = reduce(
     vcat,
@@ -189,6 +288,24 @@ function restore_problem(d; model = nothing)
     end
     Problem(PeriodicGrid1D(d["R"], d["cell"]), m, d["occupations"]; mass = d["mass"])
 end
+function restore_problem3d(d; model = nothing)
+    d["boundary"] == "isolated_zero_exterior" &&
+        d["units"] == "atomic" &&
+        d["ordering"] == "interleaved_lsb" &&
+        d["nodes"] == "cell_centers" ||
+        throw(ArgumentError("Unsupported 3D checkpoint conventions"))
+    md = d["model"]
+    m = if md["kind"] == "all_electron_lda_3d"
+        AllElectronLDA3D(md["positions"], md["charges"]; xc = Symbol(md["xc"]))
+    elseif md["kind"] == "local_potential_3d" && model isa LocalPotential3D
+        model
+    else
+        throw(ArgumentError("Supply the original LocalPotential3D for custom-potential checkpoints"))
+    end
+    model !== nothing && model_descriptor(model) != md && throw(ArgumentError("Model mismatch"))
+    Problem(BoxGrid3D(d["R"], d["cell"]), m, d["occupations"]; mass = d["mass"])
+end
+
 function load_checkpoint(path; model = nothing, problem = nothing)
     d = deserialize(path)
     d isa AbstractDict && get(d, "schema_version", 0) == CHECKPOINT_SCHEMA ||
@@ -221,6 +338,8 @@ function lowpass_mpo(grid::PeriodicGrid1D; cutoff::Real, mass::Real = 1)
     cores = Q.lowpass_mpo(grid.R, spacing(grid) * sqrt(m), Float64(cutoff))
     LowPassMPO(grid, m, cores)
 end
+lowpass_mpo(::BoxGrid3D; kwargs...) =
+    throw(ArgumentError("The low-pass interface is currently 1D only"))
 lowpass_mpo(problem::Problem; cutoff) = lowpass_mpo(problem.grid; cutoff, mass = problem.mass)
 
 """

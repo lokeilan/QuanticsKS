@@ -6,6 +6,24 @@
 /vendor/
 /.chart-data-*/
 /.tooling/
+/numerics-failures/
+
+# Local development and validation files.
+/AGENTS.md
+/.JuliaFormatter.toml
+/test/
+/tests/
+/scripts/
+
+# Publish only the user guides and basic runnable examples.
+/docs/*
+!/docs/algorithm.md
+!/docs/configuration.md
+!/docs/structure.md
+/inputs/*
+!/inputs/h4.toml
+!/inputs/helium.toml
+!/inputs/propagation.toml
 
 # Caches, process receipts, and generated binary states.
 __pycache__/
