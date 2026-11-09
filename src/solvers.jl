@@ -762,3 +762,199 @@ function pack_orbitals(orbitals, cfg; tol = cfg.tci_tol, input_gram_defect = not
     end
     error("Orbital compression failed the Gram check at requested tolerances")
 end
+
+# Restarted QTT subspaces share the same projection and reconstruction operations.
+
+"Discard dependent coefficient directions and form W such that W' * S * W = I."
+function metric_whitener(overlap, relative_cutoff, absolute_cutoff)
+    metric = eigen(Hermitian((overlap + overlap') / 2))
+    cutoff = max(absolute_cutoff, relative_cutoff * last(metric.values))
+    independent = findall(>(cutoff), metric.values)
+    metric.vectors[:, independent] * Diagonal(inv.(sqrt.(metric.values[independent])))
+end
+
+"Fit each final orbital from one shared basis cache."
+function combine_orbitals(basis, coefficients, cfg, rec; tol, cap, label)
+    oracle = synchronized(block_oracle(basis, rec))
+    recorded_map(QTT, size(coefficients, 2), cfg, rec) do i, localrec
+        linear_combination(
+            localrec,
+            basis,
+            view(coefficients, :, i);
+            oracle,
+            tol,
+            cap,
+            label = "$(label)_$i",
+        )
+    end
+end
+
+function subspace_ritz(basis, keep, project_matrices, cfg, rec; tol)
+    hamiltonian, overlap = timed(() -> project_matrices(basis), rec, "subspace_projection")
+    whitener = metric_whitener(overlap, cfg.metric_relative_cutoff, cfg.metric_absolute_cutoff)
+    size(whitener, 2) >= keep || error("The trial subspace lost occupied rank")
+    projected = whitener' * hamiltonian * whitener
+    spectrum = eigen(Hermitian((projected + projected') / 2))
+    coefficients = whitener * spectrum.vectors[:, 1:keep]
+    orbitals = combine_orbitals(
+        basis,
+        coefficients,
+        cfg,
+        rec;
+        tol,
+        cap = cfg.rankcap,
+        label = "subspace_ritz",
+    )
+    # Fitting can change the Gram matrix; repair only if the stored orbitals need it.
+    orbitals, defect = orthogonalize(orbitals, cfg, rec)
+    orbitals, spectrum.values[1:keep], defect
+end
+
+function extend_subspace(basis, directions, room, cfg, rec; tol)
+    isempty(directions) && return QTT[]
+    # Scale raw Hamiltonian images and preconditioned residuals in one place.
+    norms = ttnorm.(directions)
+    directions = [scale(x, inv(n)) for (x, n) in zip(directions, norms) if n > 100eps(Float64)]
+    isempty(directions) && return directions
+    whitener =
+        metric_whitener(gram(basis; cfg), cfg.metric_relative_cutoff, cfg.metric_absolute_cutoff)
+    overlap = gram(basis, directions; cfg)
+    projection = whitener * (whitener' * overlap)
+    # Measure explicit remainders; a difference of Gram matrices loses small directions.
+    remainders = combine_orbitals(
+        vcat(basis, directions),
+        vcat(-projection, Matrix{ComplexF64}(I, length(directions), length(directions))),
+        cfg,
+        rec;
+        tol,
+        cap = cfg.workcap,
+        label = "subspace_direction",
+    )
+    norms = ttnorm.(remainders)
+    norm_floor = max(tol, 100eps(Float64))
+    candidates = [scale(x, inv(n)) for (x, n) in zip(remainders, norms) if n > norm_floor]
+    isempty(candidates) && return candidates
+    # Pivoted Cholesky selects independent vectors without fitting another rotated block.
+    independent = cholesky(
+        Hermitian(gram(candidates; cfg)),
+        RowMaximum();
+        check = false,
+        tol = cfg.metric_relative_cutoff,
+    )
+    candidates[independent.p[1:min(independent.rank, room)]]
+end
+
+function davidson_directions(solver, orbitals, energies, H, green, cfg, rec, potential; tol)
+    residuals = recorded_map(QTT, length(orbitals), cfg, rec) do i, localrec
+        h_residual(
+            H,
+            orbitals[i],
+            energies[i],
+            cfg,
+            localrec;
+            tol,
+            cap = cfg.workcap,
+            label = "davidson_residual_$i",
+            potential,
+        )
+    end
+    norms = ttnorm.(residuals)
+    selected = solver == :davidson ? [argmax(norms)] : eachindex(orbitals)
+    candidates = recorded_map(Union{Nothing,QTT}, length(selected), cfg, rec) do j, _
+        i = selected[j]
+        norms[i] > max(tol, 100eps(Float64)) || return nothing
+        # Normalize the inverse's input so its work budget is independent of residual size.
+        apply_mpo(green, scale(residuals[i], inv(norms[i])); tol, cap = cfg.workcap)
+    end
+    QTT[x for x in candidates if x !== nothing], maximum(norms), norm(norms) / sqrt(length(norms))
+end
+
+"Expand a fixed-H trial space, retain the lowest Ritz orbitals, and restart at its size limit."
+function subspace_step(
+    solver,
+    orbitals,
+    subspace,
+    H,
+    green,
+    cfg,
+    rec;
+    work_tol,
+    ritz_tol,
+    potential,
+    project_matrices = basis -> (h_gram(basis, H; cfg), gram(basis; cfg)),
+)
+    norbitals = length(orbitals)
+    if subspace === nothing
+        if solver == :lanczos
+            # Expand the supplied Lanczos block before solving its first Ritz problem.
+            energies = nothing
+            gram_defect = norm(gram(orbitals; cfg) - I)
+        else
+            orbitals, energies, gram_defect =
+                subspace_ritz(orbitals, norbitals, project_matrices, cfg, rec; tol = ritz_tol)
+        end
+        subspace = (; basis = orbitals, frontier = 1:norbitals, energies, gram_defect)
+    end
+    limit = min(2^cfg.R, max(16, 4norbitals))
+    width = solver == :lanczos ? length(subspace.frontier) : solver == :davidson ? 1 : norbitals
+    restarted = length(subspace.basis) + width > limit && length(subspace.basis) > norbitals
+    basis = restarted ? orbitals : subspace.basis
+    frontier = restarted ? (1:norbitals) : subspace.frontier
+    room = limit - length(basis)
+    directions, residual_max, residual_rms = timed(rec, "subspace_expansion") do
+        if room == 0
+            QTT[], nothing, nothing
+        elseif solver == :lanczos
+            # Full reorthogonalization is handled by extend_subspace for both methods.
+            images = recorded_map(QTT, length(frontier), cfg, rec) do i, localrec
+                h_action(
+                    H,
+                    basis[frontier[i]],
+                    cfg,
+                    localrec;
+                    label = "lanczos_$i",
+                    work_tol,
+                    potential,
+                )
+            end
+            images, nothing, nothing
+        else
+            davidson_directions(
+                solver,
+                orbitals,
+                subspace.energies,
+                H,
+                green,
+                cfg,
+                rec,
+                potential;
+                tol = work_tol,
+            )
+        end
+    end
+    appended = timed(rec, "subspace_orthogonalization") do
+        extend_subspace(basis, directions, room, cfg, rec; tol = min(work_tol, cfg.ortho_tol))
+    end
+    if !isempty(appended) || subspace.energies === nothing
+        frontier =
+            isempty(appended) ? (1:norbitals) :
+            ((length(basis) + 1):(length(basis) + length(appended)))
+        basis = vcat(basis, appended)
+        orbitals, energies, gram_defect =
+            subspace_ritz(basis, norbitals, project_matrices, cfg, rec; tol = ritz_tol)
+        subspace = (; basis, frontier, energies, gram_defect)
+    end
+    metrics = (;
+        solver,
+        trial_dimension = length(subspace.basis),
+        appended_directions = length(appended),
+        restarted = restarted && !isempty(appended),
+        residual_max,
+        residual_rms,
+        gram_defect = subspace.gram_defect,
+        work_tolerance = work_tol,
+        work_rank_cap = cfg.workcap,
+        max_trial_bond = maximum(rank, subspace.basis),
+    )
+    orbitals, subspace, metrics
+end

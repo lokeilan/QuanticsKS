@@ -153,7 +153,8 @@ function problem_descriptor(p)
     )
 end
 function compatible_problem(a, b; refinement = false)
-    typeof(a.grid) == typeof(b.grid) && a.grid.L == b.grid.L &&
+    typeof(a.grid) == typeof(b.grid) &&
+        a.grid.L == b.grid.L &&
         a.mass == b.mass &&
         (refinement || a.grid.R == b.grid.R) &&
         a.occupations == b.occupations &&
@@ -369,6 +370,8 @@ Base.@kwdef struct PhysicsNumerics
     green_relative_tolerance::Float64 = 1e-8
     green_max_iterations::Int = 300
 end
+const SUBSPACE_SOLVERS = (:lanczos, :davidson, :block_davidson)
+
 Base.@kwdef struct SCFOptions
     # 0 uses the default Julia thread pool; 1 keeps core contractions serial.
     parallel_tasks::Int = 1
@@ -397,6 +400,7 @@ Base.@kwdef struct SCFOptions
     orthogonalize_threshold::Float64 = 1e-8
     independence_threshold::Float64 = 1e-8
     gram_tolerance::Float64 = 1e-6
+    solver::Symbol = :lrrap
 end
 function validate(a::Accuracy)
     all(

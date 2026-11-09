@@ -89,6 +89,26 @@ for cancellation. Fine 3D grids can require many CG iterations and large ranks.
 The Green action and its residual share one FD2 expression. Its exact shift
 terms are combined before the working result is compressed.
 
+## Restarted orbital subspace solvers
+
+`lanczos` applies the forward Hamiltonian to the latest basis block and
+orthogonalizes the result against the retained space. `davidson` adds the
+Green-preconditioned residual of the Ritz orbital with the largest residual.
+`block_davidson` expands with a block of preconditioned residuals.
+The two Davidson variants use the shifted kinetic inverse as their
+preconditioner.
+
+The solvers use QTT search vectors and solve a small projected Ritz problem.
+The trial dimension is capped at the smaller of the grid size and
+`max(16, 4b)` for `b` requested orbitals. A restart retains the current Ritz
+orbitals. SCF starts a new search space for each new Hamiltonian.
+
+Hamiltonian images and preconditioned residuals enter the same direction
+selection step. It normalizes each input, removes its component in the retained
+space, and uses pivoted Cholesky to select independent remainders. Ritz
+reconstruction shares the basis cache across orbitals. A Gram check after
+fitting determines whether orthogonality needs repair.
+
 ## Tensor construction and rank control
 
 TCI constructs tensors with adaptive prrLU sampling. By default, its result is
@@ -125,8 +145,12 @@ stopping and physical acceptance independently.
 
 ## Fixed-potential spectra and propagation
 
-The 1D `fixed_spectrum` interface supports Block Green, residual-subspace, and
-LRRAP updates. It records eigen-residuals separately from band-energy stopping.
+The 1D `fixed_spectrum` interface defaults to Block Green. Block Green,
+residual-subspace, and LRRAP updates retain band-energy stopping. The three
+restarted subspace solvers check the maximum residual of all requested states
+and the Gram defect against `scf.eigen_tolerance` and `scf.gram_tolerance`,
+respectively. Use `solver=:block_davidson` to select a method and
+`scf=SCFOptions(...)` to supply numerical controls.
 
 The 1D `propagate` interface applies a potential half step, an FD2 Cayley kinetic
 step, and a second potential half step. Each potential step uses the density of

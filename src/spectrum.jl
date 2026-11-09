@@ -53,7 +53,7 @@ function validate(o::FixedSpectrumOptions)
         (o.ritz_tolerance, o.matrix_tolerance, o.diagnostic_tolerance, o.virtual_envelope_period),
     ) || throw(ArgumentError("Invalid fixed spectrum controls"))
     isfinite(o.virtual_envelope_amplitude) || throw(ArgumentError("Invalid virtual envelope"))
-    o.method in (:lrrap, :block_residual, :block_green) ||
+    o.method in (:lrrap, :block_residual, :block_green, SUBSPACE_SOLVERS...) ||
         throw(ArgumentError("Unknown fixed spectrum method"))
     o.min_iterations >= 1 && isfinite(o.energy_tolerance) && o.energy_tolerance > 0 ||
         throw(ArgumentError("Invalid fixed-H stopping criterion"))
@@ -209,19 +209,12 @@ function spectrum_ritz(
         else
             S[(keep + 1):end, (keep + 1):end] - XZ' * projection
         end
-        metric = eigen(Hermitian((schur + schur') / 2))
-        good = findall(
-            >(
-                max(
-                    o.direction_norm_floor^2,
-                    o.metric_absolute_cutoff,
-                    o.metric_relative_cutoff * maximum(metric.values),
-                ),
-            ),
-            metric.values,
+        W = Q.metric_whitener(
+            schur,
+            o.metric_relative_cutoff,
+            max(o.direction_norm_floor^2, o.metric_absolute_cutoff),
         )
-        W = metric.vectors[:, good] * Diagonal(1 ./ sqrt.(metric.values[good]))
-        C = zeros(ComplexF64, length(orbitals), keep + length(good))
+        C = zeros(ComplexF64, length(orbitals), keep + size(W, 2))
         C[1:keep, 1:keep] = I(keep)
         C[1:keep, (keep + 1):end] = -projection * W
         C[(keep + 1):end, (keep + 1):end] = W
@@ -244,18 +237,15 @@ function spectrum_ritz(
         coefficients = fac.vectors
     end
     updated_orbitals = Q.timed(rec, "ritz_reconstruction") do
-        oracle = Q.synchronized(Q.block_oracle(orbitals, rec))
-        Q.recorded_map(Q.QTT, keep, cfg, rec) do i, localrec
-            Q.linear_combination(
-                localrec,
-                orbitals,
-                view(coefficients, :, i);
-                oracle,
-                tol,
-                cap = cfg.rankcap,
-                label = "fixed_ritz_$i",
-            )
-        end
+        Q.combine_orbitals(
+            orbitals,
+            view(coefficients, :, 1:keep),
+            cfg,
+            rec;
+            tol,
+            cap = cfg.rankcap,
+            label = "fixed_ritz",
+        )
     end
     updated_orbitals, fac.values[1:keep]
 end
@@ -500,15 +490,26 @@ function fixed_spectrum(
     potential::AbstractVector{<:Real};
     spectrum = FixedSpectrumOptions(),
     accuracy = Accuracy(),
-    solver = SCFOptions(green_polish_every = 1),
+    solver = nothing,
+    scf = SCFOptions(green_polish_every = 1),
     tci = TCIOptions(),
     output = nothing,
     resume_from = nothing,
 )
+    if solver isa SCFOptions
+        # Preserve the original keyword for callers supplying numerical controls.
+        scf = solver
+    elseif solver isa Symbol
+        spectrum = FixedSpectrumOptions(; merge(option_tuple(spectrum), (; method = solver))...)
+    elseif solver !== nothing
+        throw(ArgumentError("solver must be a method Symbol or SCFOptions"))
+    end
     o = validate(spectrum)
     validate(accuracy)
-    validate(solver)
+    validate(scf)
     validate(tci)
+    use_subspace = o.method in SUBSPACE_SOLVERS
+    criterion = use_subspace ? "residual_and_gram" : "energy"
     problem = initial.problem
     grid = problem.grid
     ngrid = length(grid)
@@ -546,19 +547,20 @@ function fixed_spectrum(
         problem;
         spectrum = o,
         accuracy = accuracy,
-        solver,
+        solver = scf,
         tci,
     )
-    rec = recorder(dir, tci; parallel_tasks = solver.parallel_tasks)
+    rec = recorder(dir, tci; parallel_tasks = scf.parallel_tasks)
     io = run_io(dir, "iterations.jsonl")
     try
-        cfg = solver_config(problem, accuracy, solver)
+        cfg = solver_config(problem, accuracy, scf)
+        fitted_projection = use_subspace && o.projection == :qtt_gradient
         v = Q.timed(rec, "potential_tci") do
             Q.cross(
                 rec,
                 grid.R,
                 j -> potential[j + 1];
-                tol = accuracy.external_tolerance,
+                tol = fitted_projection ? o.matrix_tolerance : accuracy.external_tolerance,
                 cap = field_caps(accuracy).effective_potential_cap,
                 label = "fixed_potential",
             )
@@ -575,7 +577,7 @@ function fixed_spectrum(
             (
                 max_absolute_error = maxerr,
                 rms_absolute_error = sqrt(err2 / ngrid),
-                relative_l2 = sqrt(err2 / sum(abs2, potential)),
+                relative_l2 = iszero(err2) ? 0.0 : sqrt(err2 / sum(abs2, potential)),
                 max_bond = Q.rank(v),
                 bytes = Q.storage(v),
             )
@@ -594,7 +596,20 @@ function fixed_spectrum(
                 Q.shift_mpo(grid.R, -1),
                 dx * sqrt(problem.mass),
             )
-            H, Q.green_mpo(grid.R, H.h, solver.green_shift)
+            H, o.method == :lanczos ? nothing : Q.green_mpo(grid.R, H.h, scf.green_shift)
+        end
+        project_matrices = if o.projection == :streaming_grid
+            basis -> spectrum_grid_matrices(basis, H, potential, cfg, rec, o)
+        else
+            basis -> (Q.h_gram(basis, H; cfg), Q.gram(basis; cfg))
+        end
+        search_field = if use_subspace
+            Q.synchronized(
+                o.projection == :streaming_grid ? Q.sampled(j -> potential[j + 1], cfg.R) :
+                Q.sampled(H.potential, rec),
+            )
+        else
+            nothing
         end
         orbitals = if resumed === nothing
             Q.timed(rec, "initial_orbitals") do
@@ -620,7 +635,18 @@ function fixed_spectrum(
         initial_tol =
             o.adaptive_ritz ? max(o.ritz_tolerance, o.max_ritz_tolerance) : o.ritz_tolerance
         initial_cfg = merge(cfg, (ortho_tol = initial_tol,))
-        if resumed === nothing
+        subspace = nothing
+        if use_subspace
+            orbitals, eps, gram_defect = Q.subspace_ritz(
+                orbitals,
+                o.states,
+                project_matrices,
+                cfg,
+                rec;
+                tol = o.ritz_tolerance,
+            )
+            subspace = (; basis = orbitals, frontier = 1:(o.states), energies = eps, gram_defect)
+        elseif resumed === nothing
             orbitals = Q.timed(rec, "initial_orthogonalization") do
                 first(Q.orthogonalize(orbitals, initial_cfg, rec; force = true))
             end
@@ -662,6 +688,24 @@ function fixed_spectrum(
                     # Rotation changes state identities; reset rather than mismatch columns.
                     orbitals, eps = spectrum_ritz(orbitals, H, cfg, rec, o, potential)
                     previous = nothing
+                elseif use_subspace
+                    orbitals, subspace, metrics = Q.subspace_step(
+                        o.method,
+                        orbitals,
+                        subspace,
+                        H,
+                        green,
+                        cfg,
+                        rec;
+                        work_tol = min(
+                            accuracy.work_tolerance,
+                            o.ritz_tolerance,
+                            scf.eigen_tolerance / 10,
+                        ),
+                        ritz_tol = o.ritz_tolerance,
+                        potential = search_field,
+                        project_matrices,
+                    )
                 else
                     old_xs = orbitals
                     work =
@@ -753,13 +797,21 @@ function fixed_spectrum(
             flush(stdout)
             energy_change === nothing || (
                 @printf(
-                    "    occupied fixed-H band energy=%.12f Ha delta=%.3e Ha criterion=energy\n",
+                    "    occupied fixed-H band energy=%.12f Ha delta=%.3e Ha criterion=%s\n",
                     occupied_band_energy,
-                    energy_change
+                    energy_change,
+                    criterion,
                 );
                 flush(stdout)
             )
-            if spectrum_accepted(o, iteration, energy_change)
+            accepted = if use_subspace
+                iteration >= o.min_iterations &&
+                    row.max_residual < scf.eigen_tolerance &&
+                    row.gram_defect < scf.gram_tolerance
+            else
+                spectrum_accepted(o, iteration, energy_change)
+            end
+            if accepted
                 converged = true
                 break
             end
@@ -771,7 +823,7 @@ function fixed_spectrum(
             (
                 status = "finished",
                 converged,
-                criterion = "energy",
+                criterion,
                 iterations = last(history).iteration,
                 elapsed_seconds = elapsed,
                 potential_compression = compression,
@@ -780,7 +832,9 @@ function fixed_spectrum(
                 solved_states = o.states,
                 occupied_states = o.occupied_states,
                 electrons = sum(problem.occupations),
-                canonical_potential = o.method == :lrrap ?
+                canonical_potential = use_subspace && o.projection == :qtt_gradient ?
+                                      "fitted potential in subspace updates and Ritz; original input in diagnostics" :
+                                      o.method == :lrrap ?
                                       "compressed potential in LRRAP update; original input in Ritz and diagnostics" :
                                       "original input samples in updates, Rayleigh-Ritz and residual diagnostics",
                 method = string(o.method),

@@ -44,6 +44,11 @@ postprocess("results/h4-library")
 directory. `fixed_spectrum`, `propagate`, and `refine_state` use the same problem
 and orbital-state types.
 
+Select an orbital solver with `ground_state(problem; solver=:block_davidson)`.
+The choices are `:lrrap` (default), `:lanczos`, `:davidson`, and
+`:block_davidson`. The three subspace methods are also available as
+`fixed_spectrum(state, potential; solver=:lanczos, spectrum=options)`.
+
 ## Documentation
 
 - [Algorithm](docs/algorithm.md): discretization, SCF, tensor operations, and propagation.

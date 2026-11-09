@@ -69,6 +69,11 @@ function validate(a::AuditOptions)
     a
 end
 function validate(s::SCFOptions)
+    s.solver in (:lrrap, SUBSPACE_SOLVERS...) || throw(
+        ArgumentError(
+            "Unknown SCF solver $(s.solver); choose :lrrap, :lanczos, :davidson or :block_davidson",
+        ),
+    )
     s.parallel_tasks >= 0 || throw(ArgumentError("parallel_tasks must be nonnegative"))
     s.criterion in (:energy, :strict) ||
         throw(ArgumentError("SCF criterion must be :energy or :strict"))
@@ -130,8 +135,7 @@ function prepare_run(output, kind, p; options...)
         "parallel_timing_policy" => "stage seconds are wall time; summed fit/substage seconds may overlap across workers and must not be added to parent wall time",
         "timing_scope" => "in-process end-to-end wall time; includes initialization, diagnostics and checkpoint I/O; excludes Julia process startup and later postprocessing",
     )
-    haskey(options, :accuracy) &&
-        (config["resolved_field_caps"] = field_caps(options[:accuracy]))
+    haskey(options, :accuracy) && (config["resolved_field_caps"] = field_caps(options[:accuracy]))
     write_json(joinpath(dir, "config.json"), config)
     dir
 end
@@ -287,7 +291,8 @@ function configured_options(d::AbstractDict)
     threads = get(run, "blas_threads", 1)
     threads isa Integer && threads >= 1 || throw(ArgumentError("Invalid BLAS thread count"))
     p = problem_from_config(d)
-    p.grid isa BoxGrid3D && kind != "scf" &&
+    p.grid isa BoxGrid3D &&
+        kind != "scf" &&
         throw(ArgumentError("3D configuration currently supports ground-state SCF"))
     a = options_from_dict(Accuracy, get(d, "accuracy", Dict()))
     tci = options_from_dict(TCIOptions, get(d, "tci", Dict()))
@@ -330,7 +335,7 @@ function configuration_plan(path)
     c = configured_options(d)
     p = c.problem
     tasks = c.kind == "scf" ? c.scf.parallel_tasks : c.time.parallel_tasks
-    Dict(
+    plan = Dict(
         "kind" => c.kind,
         "system" => get(get(d, "system", Dict()), "kind", "hydrogen_chain"),
         "grid_points" => length(p.grid),
@@ -346,9 +351,12 @@ function configuration_plan(path)
         "blas_threads" => c.blas_threads,
         "calculation_started" => false,
         "resolved_field_caps" => option_dict(field_caps(c.accuracy)),
-        "dense_orbital_bytes" => big(sizeof(ComplexF64)) * length(p.grid) * length(p.occupations),
+        "dense_orbital_bytes" =>
+            big(sizeof(ComplexF64)) * length(p.grid) * length(p.occupations),
         "note" => "Dense storage comparison only; not an estimate of peak memory.",
     )
+    c.kind == "scf" && (plan["solver"] = string(c.scf.solver))
+    plan
 end
 
 "Run a TOML experiment. Output directories are fresh; checkpoint states are warm starts."

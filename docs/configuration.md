@@ -75,6 +75,7 @@ budget raises an error.
 | `scf.energy_tolerance` | Total-energy change threshold; default `1e-6 Ha` |
 | `scf.max_iterations` | SCF iteration limit |
 | `scf.inner_steps` | Orbital updates at a fixed input density |
+| `scf.solver` | `"lrrap"` (default), `"lanczos"`, `"davidson"`, or `"block_davidson"` |
 | `scf.mixing` | Density mixing weight |
 | `scf.anderson` | Enable Anderson mixing |
 | `scf.eigen_tolerance` | Final orbital residual threshold |
@@ -111,7 +112,7 @@ overrides `[run].output`, and existing output directories are rejected.
 | `status.json` | Completion state, SCF stopping, and physical audit |
 | `checkpoint.jls`, `snapshots/` | Stored orbitals and problem metadata |
 | `cross-state.jls` | Reusable TCI pivot geometry |
-| `scf.jsonl`, `lrrap.jsonl` | Iteration energies, residuals, ranks, and timings |
+| `scf.jsonl`, `lrrap.jsonl` or `eigensolver.jsonl` | Outer iterations and the selected orbital solver's inner updates |
 | `workflow.json` | Configured-run elapsed time and restart information |
 | `source/` | Runnable source and dependency snapshot |
 

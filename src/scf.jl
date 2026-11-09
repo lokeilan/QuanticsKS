@@ -16,19 +16,21 @@ function ground_state(
     pivot_state = nothing,
     accuracy = Accuracy(),
     scf = SCFOptions(),
+    solver::Symbol = scf.solver,
     tci = TCIOptions(),
     guess = InitialGuess(),
     physics = PhysicsNumerics(),
     audit = AuditOptions(),
     output = nothing,
 )
+    scf = solver == scf.solver ? scf : SCFOptions(; merge(option_tuple(scf), (; solver))...)
     validate(accuracy)
     validate(scf)
     validate(tci)
     validate(physics)
     validate(guess)
     all(==(first(problem.occupations)), problem.occupations) ||
-        throw(ArgumentError("The current LRRAP solver requires equal occupations"))
+        throw(ArgumentError("Ground-state SCF requires equal occupations"))
     initial !== nothing &&
         !compatible_problem(initial.problem, problem) &&
         throw(
@@ -39,12 +41,12 @@ function ground_state(
     dir = prepare_run(output, "scf", problem; accuracy = accuracy, scf, tci, guess, physics, audit)
     rec = recorder(dir, tci; parallel_tasks = scf.parallel_tasks)
     sio = run_io(dir, "scf.jsonl")
-    lio = run_io(dir, "lrrap.jsonl")
+    solver_io = run_io(dir, solver == :lrrap ? "lrrap.jsonl" : "eigensolver.jsonl")
     try
         pivot_state === nothing || Q.load_cross_state!(rec, pivot_state)
         cfg = solver_config(problem, accuracy, scf)
         ops = build_operators(problem, accuracy, rec, physics)
-        green = green_operator(problem, accuracy, scf, physics, ops)
+        green = solver == :lanczos ? nothing : green_operator(problem, accuracy, scf, physics, ops)
         state =
             initial === nothing ? initial_state(problem, accuracy, rec, guess) :
             OrbitalState(problem, initial.orbitals)
@@ -83,22 +85,40 @@ function ground_state(
             # Only the fixed potential survives all inner stages. Orbitals get
             # new evaluators after every update; a new SCF H gets a new cache.
             potential = Q.timed(rec, "fixed_potential_setup") do
-                Q.potential_samples(H, rec)
+                solver == :lrrap ? Q.potential_samples(H, rec) : Q.memoized_sample(H.potential, rec)
             end
+            # The subspace methods use the same fitted field in actions and projection.
+            subspace_field = solver == :lrrap ? nothing : Q.synchronized(potential)
+            subspace = nothing
             metrics = nothing
             for j = 1:(scf.inner_steps)
                 rec.inner = j
-                orbitals, search_directions, metrics = Q.lrrap_step(
-                    orbitals,
-                    search_directions,
-                    H,
-                    green,
-                    cfg,
-                    rec;
-                    work_tol = accuracy.work_tolerance,
-                    potential,
-                )
-                Q.event!(lio, merge((scf = k, inner = j), metrics))
+                if solver == :lrrap
+                    orbitals, search_directions, metrics = Q.lrrap_step(
+                        orbitals,
+                        search_directions,
+                        H,
+                        green,
+                        cfg,
+                        rec;
+                        work_tol = accuracy.work_tolerance,
+                        potential,
+                    )
+                else
+                    orbitals, subspace, metrics = Q.subspace_step(
+                        solver,
+                        orbitals,
+                        subspace,
+                        H,
+                        green,
+                        cfg,
+                        rec;
+                        work_tol = min(accuracy.work_tolerance, cfg.eigen_tol / 10),
+                        ritz_tol = cfg.ortho_tol,
+                        potential = subspace_field,
+                    )
+                end
+                Q.event!(solver_io, merge((scf = k, inner = j), metrics))
             end
             Q.event!(
                 rec.stage_io,
@@ -258,6 +278,7 @@ function ground_state(
                 status = "finished",
                 converged,
                 criterion = string(scf.criterion),
+                solver = string(solver),
                 stop_reason = string(reason),
                 iterations = length(history),
                 elapsed_seconds = elapsed,
@@ -271,7 +292,7 @@ function ground_state(
         rethrow()
     finally
         close_run_io(sio)
-        close_run_io(lio)
+        close_run_io(solver_io)
         close(rec)
     end
 end

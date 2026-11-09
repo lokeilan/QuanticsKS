@@ -12,7 +12,7 @@ import ITensors, ITensorMPS
 include("tensor.jl")
 include("tci.jl")
 include("physics.jl")
-include("lrrap.jl")
+include("solvers.jl")
 end
 const Q = Numerics
 

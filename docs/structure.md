@@ -32,7 +32,7 @@ src/
     tensor.jl
     tci.jl
     physics.jl
-    lrrap.jl
+    solvers.jl
 ```
 
 ## Calculation flow
@@ -63,7 +63,7 @@ operations used by every model. Its files are loaded by `QuanticsKS.jl`.
 | [tensor.jl](../src/tensor.jl) | QTT algebra, MPO operations, linear expressions, and compression recovery |
 | [tci.jl](../src/tci.jl) | Sample caches, TCI fitting, pivot reuse, fit records, and task scheduling |
 | [physics.jl](../src/physics.jl) | Periodic soft-Coulomb kernel and scalar 1D XC formulas |
-| [lrrap.jl](../src/lrrap.jl) | Tangent projection, orbital updates, orthogonalization, mixing, and storage |
+| [solvers.jl](../src/solvers.jl) | LRRAP, restarted Lanczos and Davidson updates, shared orbital algebra, mixing, and storage |
 
 TensorCrossInterpolation supplies fitting, tensor addition, compression, and
 contraction environments, including the signed 3D kernel suffix. ITensorMPS
@@ -77,5 +77,5 @@ caches, and cancellation-sensitive expressions. Dependent SCF, Green, and
 tangent-coordinate updates remain explicit in the solver.
 
 Read `scf.jl` for the ground-state workflow, `hamiltonian.jl` for its physical
-operators, and `lrrap.jl` for the inner orbital update. Dimension-specific methods
-sit with the operation they implement.
+operators, and `solvers.jl` for orbital updates and their shared numerical
+functions. Dimension-specific methods sit with the operation they implement.
