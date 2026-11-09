@@ -636,7 +636,7 @@ function fixed_spectrum(
             o.adaptive_ritz ? max(o.ritz_tolerance, o.max_ritz_tolerance) : o.ritz_tolerance
         initial_cfg = merge(cfg, (orthogonalization_tolerance = initial_tol,))
         subspace = nothing
-        if use_subspace
+        if use_subspace && o.method != :lanczos
             orbitals, eps, gram_defect = Q.subspace_ritz(
                 orbitals,
                 o.states,
@@ -645,8 +645,10 @@ function fixed_spectrum(
                 rec;
                 tol = o.ritz_tolerance,
             )
-            subspace =
-                (; basis = orbitals, expansion_indices = 1:(o.states), energies = eps, gram_defect)
+            subspace = (; basis = orbitals, energies = eps, gram_defect)
+        elseif o.method == :lanczos
+            orbitals, gram_defect = Q.orthogonalize(orbitals, cfg, rec)
+            eps = zeros(o.states)
         elseif resumed === nothing
             orbitals = Q.timed(rec, "initial_orthogonalization") do
                 first(Q.orthogonalize(orbitals, initial_cfg, rec; force = true))

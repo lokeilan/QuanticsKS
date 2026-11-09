@@ -2,7 +2,7 @@
 
 julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "c837c48b600ae85f4f1e6f3f175d7b7934f1953a"
+project_hash = "e3b50668f30c54dfca7b318d7dd5fe2e178d9d80"
 
 [[deps.Accessors]]
 deps = ["CompositionsBase", "ConstructionBase", "Dates", "InverseFunctions", "MacroTools"]
@@ -624,7 +624,7 @@ version = "2.11.3"
     Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 
 [[deps.QuanticsKS]]
-deps = ["Dates", "JSON3", "LinearAlgebra", "Printf", "QuadGK", "Random", "SHA", "Serialization", "SpecialFunctions", "TOML", "TensorCrossInterpolation", "TensorOperations"]
+deps = ["Dates", "ITensorMPS", "ITensors", "JSON3", "KrylovKit", "LinearAlgebra", "Printf", "QuadGK", "Random", "SHA", "Serialization", "SpecialFunctions", "TOML", "TensorCrossInterpolation", "TensorOperations", "VectorInterface"]
 path = "."
 uuid = "dfe65309-75e7-4472-9af8-9c8258f64e76"
 version = "0.1.0"

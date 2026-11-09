@@ -8,6 +8,8 @@ module Numerics
 using LinearAlgebra, Random, Serialization, TensorOperations
 import TensorCrossInterpolation as TCI
 import ITensors, ITensorMPS
+import KrylovKit
+import VectorInterface as VI
 
 include("tensor.jl")
 include("tci.jl")

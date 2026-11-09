@@ -48,6 +48,8 @@ Select an orbital solver with `ground_state(problem; solver=:block_davidson)`.
 The choices are `:lrrap` (default), `:lanczos`, `:davidson`, and
 `:block_davidson`. The three subspace methods are also available as
 `fixed_spectrum(state, potential; solver=:lanczos, spectrum=options)`.
+Lanczos uses KrylovKit's scalar or block three-term recurrence, with
+reorthogonalization and explicit restart from the retained Ritz orbitals.
 
 ## Documentation
 

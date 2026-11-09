@@ -91,27 +91,49 @@ for cancellation. Fine 3D grids can require many CG iterations and large ranks.
 The Green action and its residual share one FD2 expression. Its exact shift
 terms are combined before the working result is compressed.
 
-## Restarted orbital subspace solvers
+## Lanczos and Davidson solvers
 
-`lanczos` selects restarted block Krylov expansion: apply the Hamiltonian
-to the latest basis block and project out the retained space. The implementation
-uses a full generalized Ritz problem; it does not form a three-term Lanczos
-recurrence or assume a tridiagonal projected matrix. `davidson` adds the
-Green-preconditioned residual of the Ritz orbital with the largest residual.
-`block_davidson` expands with a block of preconditioned residuals.
-The two Davidson variants use the shifted kinetic inverse as their
-preconditioner.
+`lanczos` uses KrylovKit's [Lanczos factorization iterators][lanczos]. For
+one orbital, the normalized basis vectors obey the three-term recurrence
 
-The solvers use QTT search vectors and solve a small projected Ritz problem.
+$$
+Hq_j=\beta_{j-1}q_{j-1}+\alpha_jq_j+\beta_jq_{j+1}.
+$$
+
+The Ritz problem uses the real symmetric tridiagonal matrix with diagonal
+`alpha` and off-diagonal `beta`. For several orbitals, `BlockLanczosIterator`
+uses the block recurrence
+
+$$
+HQ_j=Q_{j-1}B_{j-1}^{\dagger}+Q_jA_j+Q_{j+1}B_j,
+$$
+
+and a Hermitian block tridiagonal Ritz matrix. The starting block retains
+independent components in degenerate eigenspaces. KrylovKit performs modified
+Gram-Schmidt reorthogonalization and deflates dependent residual directions.
+An invariant subspace ends expansion before a zero residual is normalized.
+
+The `LanczosVector` adapter supplies exact QTT inner products and TT addition
+with the effective working tolerance and `work_cap`. Hamiltonian actions use the same sampled
+FD2 expression as the physical residual. QTT fitting and truncation make these
+actions inexact, so the recurrence residual is a diagnostic, not an acceptance
+criterion. The solver checks the residuals of the reconstructed orbitals
+separately.
+
+`davidson` adds the Green-preconditioned residual of the Ritz orbital with the
+largest residual. `block_davidson` adds a block of preconditioned residuals.
+Both use the shifted kinetic inverse. They project the new directions out of
+the retained space, select independent remainders with pivoted Cholesky, and
+solve a generalized Ritz problem using the overlap matrix.
+
 The trial dimension is capped at the smaller of the grid size and
-`max(16, 4b)` for `b` requested orbitals. A restart retains the current Ritz
+`max(16, 4b)` for `b` requested orbitals. Lanczos explicitly restarts its
+factorization from the current Ritz orbital or block; each inner update
+advances one recurrence step. Davidson also restarts from the current Ritz
 orbitals. SCF starts a new search space for each new Hamiltonian.
-
-Hamiltonian images and preconditioned residuals enter the same direction
-selection step. It normalizes each input, removes its component in the retained
-space, and uses pivoted Cholesky to select independent remainders. Ritz
-reconstruction shares the basis cache across orbitals. A Gram check after
-fitting determines whether orthogonality needs repair.
+Ritz reconstruction shares a basis cache across orbitals. A Gram check after
+fitting determines whether the returned orbitals need orthogonality repair;
+this repair does not alter the retained Lanczos basis.
 
 ## Tensor construction and rank control
 
@@ -181,6 +203,7 @@ the implementation to its sources.
 | LRRAP | Low-rank Riemannian alternating projection. The implementation adapts the paper's common tangent-space and constrained coefficient update to Kohn-Sham SCF. | [LRRAP, Eqs. (23)-(29)][lrrap-paper] |
 | Gram/overlap matrix, canonical orthogonalization | `S = X'X`; `canonical_orthogonalizer` returns retained overlap eigenvectors scaled by inverse square roots. Its columns satisfy `W'SW = I`. Orbital symmetric orthogonalization instead uses the full `S^(-1/2)`. | [PySCF orthogonalization][orthogonalization] |
 | Rayleigh quotient, Ritz values/vectors, Krylov subspace, Davidson correction | Projected eigenproblems and trial-space expansion. Davidson directions use preconditioned residuals. | [SLEPc eigensolver guide][eigensolvers] |
+| Lanczos recurrence, block Lanczos, reorthogonalization | Three-term scalar or block recurrence; the projected Ritz matrix is tridiagonal or block tridiagonal. Explicit restart uses the retained Ritz orbitals. | [KrylovKit factorizations][lanczos] |
 | Rounding, compression, truncation | Approximation at a specified TT rank/tolerance. `compress_orbitals` also checks the Gram matrix after compression. | [TT arithmetic][tt-arithmetic] |
 
 `psi` denotes an orbital, `rho` a density, `H` the Hamiltonian, and `V` a
@@ -201,6 +224,7 @@ Propagation uses [Strang splitting][strang] with a Cayley approximation to the k
 exponential; the [reference GPE paper][gp-paper] motivates the QTT split-step
 organization, while this project's kinetic discretization is stated above.
 
+[lanczos]: https://jutho.github.io/KrylovKit.jl/latest/man/implementation/
 [gp-code]: https://github.com/MarcelNiedermeier/Gross-Pitaevskii-TCI/blob/main/working_example/utilities.jl
 [gp-paper]: https://arxiv.org/abs/2507.04262
 [itensor]: https://docs.itensor.org/ITensorMPS/stable/examples/MPSandMPO.html

@@ -791,7 +791,107 @@ function compress_orbitals(orbitals, cfg; tol = cfg.orbital_tolerance, input_gra
     error("Orbital compression failed the Gram check at requested tolerances")
 end
 
-# Restarted QTT subspaces share the same projection and reconstruction operations.
+# KrylovKit owns the Lanczos recurrence; this adapter supplies QTT rank controls.
+struct LanczosVector
+    psi::QTT
+    tol::Float64
+    cap::Int
+end
+VI.scalartype(::Type{LanczosVector}) = ComplexF64
+VI.inner(x::LanczosVector, y::LanczosVector) = inner(x.psi, y.psi)
+LinearAlgebra.norm(x::LanczosVector) = ttnorm(x.psi)
+VI.zerovector(x::LanczosVector, ::Type{<:Number}) =
+    LanczosVector(constant_tt(length(x.psi), 0), x.tol, x.cap)
+VI.zerovector!!(x::LanczosVector) = VI.zerovector(x)
+VI.scale(x::LanczosVector, a::Number) = LanczosVector(scale(x.psi, a), x.tol, x.cap)
+VI.scale!!(x::LanczosVector, a::Number) = VI.scale(x, a)
+VI.scale!!(::LanczosVector, x::LanczosVector, a::Number) = VI.scale(x, a)
+function VI.add(y::LanczosVector, x::LanczosVector, a::Number, b::Number)
+    iszero(a) && return VI.scale(y, b)
+    iszero(b) && return VI.scale(x, a)
+    # Use TT addition for recurrence algebra, with exact contractions for overlaps.
+    psi = add(y.psi, x.psi; a = b, b = a, tol = y.tol, cap = y.cap)
+    LanczosVector(psi, y.tol, y.cap)
+end
+VI.add!!(y::LanczosVector, x::LanczosVector, a::Number, b::Number) = VI.add(y, x, a, b)
+
+"Advance a scalar or block Lanczos factorization and extract its lowest Ritz orbitals."
+function lanczos_step(orbitals, subspace, H, cfg, rec; work_tol, ritz_tol, potential)
+    norbitals = length(orbitals)
+    limit = min(2^cfg.R, max(16, 4norbitals))
+    width =
+        subspace === nothing ? norbitals :
+        norbitals == 1 ? 1 : length(KrylovKit.residual(subspace.factorization))
+    restarted = subspace !== nothing && length(subspace.factorization) + width > limit
+    if subspace === nothing || restarted
+        action =
+            x -> LanczosVector(
+                h_action(H, x.psi, cfg, rec; label = "lanczos_action", work_tol, potential),
+                work_tol,
+                cfg.work_cap,
+            )
+        initial = [LanczosVector(psi, work_tol, cfg.work_cap) for psi in orbitals]
+        # A block preserves independent directions within degenerate eigenspaces.
+        iterator = if norbitals == 1
+            KrylovKit.LanczosIterator(action, only(initial), KrylovKit.ModifiedGramSchmidt2())
+        else
+            KrylovKit.BlockLanczosIterator(
+                action,
+                KrylovKit.Block(initial),
+                limit,
+                KrylovKit.ModifiedGramSchmidt2(),
+                max(work_tol, 100eps(Float64)),
+            )
+        end
+        factorization = KrylovKit.initialize(iterator)
+        length(factorization) >= norbitals || error("The initial Lanczos block lost occupied rank")
+        subspace = (; iterator, factorization)
+    end
+    factorization = subspace.factorization
+    previous_dimension = length(factorization)
+    width = norbitals == 1 ? 1 : length(KrylovKit.residual(factorization))
+    # Do not normalize a numerically zero residual at an invariant subspace.
+    breakdown_tolerance = sqrt(width) * max(work_tol, 100eps(Float64))
+    breakdown = KrylovKit.normres(factorization) <= breakdown_tolerance
+    if !breakdown && previous_dimension + width <= limit
+        KrylovKit.expand!(subspace.iterator, factorization)
+    end
+    dimension = length(factorization)
+    projected = if norbitals == 1
+        KrylovKit.rayleighquotient(factorization) # Real symmetric tridiagonal matrix.
+    else
+        Hermitian(view(factorization.H, 1:dimension, 1:dimension)) # Block tridiagonal.
+    end
+    spectrum = eigen(projected)
+    basis = [x.psi for x in KrylovKit.basis(factorization)]
+    orbitals = combine_orbitals(
+        basis,
+        spectrum.vectors[:, 1:norbitals],
+        cfg,
+        rec;
+        tol = ritz_tol,
+        cap = cfg.orbital_cap,
+        label = "lanczos_ritz",
+    )
+    # Compression can disturb the returned orbitals; it must not rotate the recurrence basis.
+    orbitals, gram_defect = orthogonalize(orbitals, cfg, rec)
+    metrics = (;
+        solver = :lanczos,
+        recurrence = norbitals == 1 ? :scalar : :block,
+        trial_dimension = dimension,
+        appended_directions = dimension - previous_dimension,
+        restarted,
+        breakdown,
+        recurrence_residual = KrylovKit.normres(factorization),
+        gram_defect,
+        work_tolerance = work_tol,
+        work_rank_cap = cfg.work_cap,
+        max_trial_bond = maximum(rank, basis),
+    )
+    orbitals, subspace, metrics
+end
+
+# Davidson subspaces share the same projection and reconstruction operations.
 
 "Canonical orthogonalization: discard small overlap eigenvalues and form W with W' * S * W = I."
 function canonical_orthogonalizer(overlap, relative_cutoff, absolute_cutoff)
@@ -915,43 +1015,22 @@ function subspace_step(
     potential,
     project_matrices = basis -> (h_gram(basis, H; cfg), gram(basis; cfg)),
 )
+    solver == :lanczos &&
+        return lanczos_step(orbitals, subspace, H, cfg, rec; work_tol, ritz_tol, potential)
     norbitals = length(orbitals)
     if subspace === nothing
-        if solver == :lanczos
-            # Expand the supplied Lanczos block before solving its first Ritz problem.
-            energies = nothing
-            gram_defect = norm(gram(orbitals; cfg) - I)
-        else
-            orbitals, energies, gram_defect =
-                subspace_ritz(orbitals, norbitals, project_matrices, cfg, rec; tol = ritz_tol)
-        end
-        subspace = (; basis = orbitals, expansion_indices = 1:norbitals, energies, gram_defect)
+        orbitals, energies, gram_defect =
+            subspace_ritz(orbitals, norbitals, project_matrices, cfg, rec; tol = ritz_tol)
+        subspace = (; basis = orbitals, energies, gram_defect)
     end
     limit = min(2^cfg.R, max(16, 4norbitals))
-    width =
-        solver == :lanczos ? length(subspace.expansion_indices) :
-        solver == :davidson ? 1 : norbitals
+    width = solver == :davidson ? 1 : norbitals
     restarted = length(subspace.basis) + width > limit && length(subspace.basis) > norbitals
     basis = restarted ? orbitals : subspace.basis
-    expansion_indices = restarted ? (1:norbitals) : subspace.expansion_indices
     room = limit - length(basis)
     directions, residual_max, residual_rms = timed(rec, "subspace_expansion") do
         if room == 0
             QTT[], nothing, nothing
-        elseif solver == :lanczos
-            # Full reorthogonalization is handled by extend_subspace for both methods.
-            images = recorded_map(QTT, length(expansion_indices), cfg, rec) do i, localrec
-                h_action(
-                    H,
-                    basis[expansion_indices[i]],
-                    cfg,
-                    localrec;
-                    label = "lanczos_$i",
-                    work_tol,
-                    potential,
-                )
-            end
-            images, nothing, nothing
         else
             davidson_directions(
                 solver,
@@ -976,14 +1055,11 @@ function subspace_step(
             tol = min(work_tol, cfg.orthogonalization_tolerance),
         )
     end
-    if !isempty(appended) || subspace.energies === nothing
-        expansion_indices =
-            isempty(appended) ? (1:norbitals) :
-            ((length(basis) + 1):(length(basis) + length(appended)))
+    if !isempty(appended)
         basis = vcat(basis, appended)
         orbitals, energies, gram_defect =
             subspace_ritz(basis, norbitals, project_matrices, cfg, rec; tol = ritz_tol)
-        subspace = (; basis, expansion_indices, energies, gram_defect)
+        subspace = (; basis, energies, gram_defect)
     end
     metrics = (;
         solver,

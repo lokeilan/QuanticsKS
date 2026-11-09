@@ -111,6 +111,11 @@ budget raises an error.
 | `time.dt`, `time.steps` | Time step and number of propagation steps |
 | `time.observe_every`, `time.snapshot_every` | Observation and saved-state intervals |
 
+`"lanczos"` uses a scalar three-term recurrence for one orbital and block
+Lanczos for several orbitals. Each `inner_steps` update advances one recurrence
+step, with an explicit restart when the trial space reaches its size limit.
+The shared working tolerance and rank cap also control its QTT vector algebra.
+
 `[audit]` sets independent final-state numerical budgets. `rank_multiplier`
 scales both inherited and explicitly overridden field caps. `[guess]` controls
 the 1D initial guess; 3D uses nuclear-envelope orbitals unless an initial state

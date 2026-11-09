@@ -63,12 +63,14 @@ operations used by every model. Its files are loaded by `QuanticsKS.jl`.
 | [tensor.jl](../src/tensor.jl) | QTT algebra, MPO operations, linear expressions, and compression recovery |
 | [tci.jl](../src/tci.jl) | Sample caches, TCI fitting, pivot reuse, fit records, and task scheduling |
 | [physics.jl](../src/physics.jl) | Periodic soft-Coulomb kernel and scalar 1D XC formulas |
-| [solvers.jl](../src/solvers.jl) | LRRAP, restarted Krylov and Davidson updates, shared orbital algebra, mixing, and storage |
+| [solvers.jl](../src/solvers.jl) | LRRAP, Lanczos and Davidson updates, shared orbital algebra, mixing, and storage |
 
 TensorCrossInterpolation supplies fitting, tensor addition, compression, and
 contraction environments, including the signed 3D kernel suffix. ITensorMPS
 supplies MPO matrix elements, canonical forms, compression recovery, and ordinary
-MPO application through TCI's conversion extension.
+MPO application through TCI's conversion extension. KrylovKit supplies scalar
+and block Lanczos recurrences and reorthogonalization. Its VectorInterface
+adapter in `solvers.jl` carries QTT working tolerances and rank caps.
 Hamiltonian projection reuses converted orbitals and operators within a call.
 Checkpoints store QTT cores and retain their package type identities.
 
