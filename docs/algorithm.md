@@ -73,6 +73,11 @@ The total energy includes occupied kinetic energy, external energy, half the
 Hartree integral, XC energy, and nuclear repulsion. The XC potential itself is
 not added as an XC energy term.
 
+In 1D, kinetic energy contracts the FD2 shift MPOs directly with each orbital.
+If cancellation obscures the kinetic numerator, an exact low-rank gradient
+contraction supplies it. Hartree energy contracts `rho' * K * rho` directly,
+with prefactor `dV^2/2`; it does not construct a second Hartree field for energy.
+
 ## LRRAP orbital update
 
 | Stage | Operation |
@@ -100,8 +105,11 @@ the untruncated discrete residual independently of these sampled updates.
 
 ## Lanczos and Davidson solvers
 
-`lanczos` uses KrylovKit's [Lanczos factorization iterators][lanczos]. For
-one orbital, the normalized basis vectors obey the three-term recurrence
+`lanczos` and `block_lanczos` share KrylovKit's
+[Lanczos factorization iterators][lanczos]. `lanczos` selects the scalar
+recurrence for one orbital and the block recurrence for several orbitals.
+`block_lanczos` selects the block recurrence even for a one-orbital block.
+In the scalar case, the normalized basis vectors obey the three-term recurrence
 
 $$
 Hq_j=\beta_{j-1}q_{j-1}+\alpha_jq_j+\beta_jq_{j+1}.
@@ -115,7 +123,8 @@ $$
 HQ_j=Q_{j-1}B_{j-1}^{\dagger}+Q_jA_j+Q_{j+1}B_j,
 $$
 
-and a Hermitian block tridiagonal Ritz matrix. The starting block retains
+and a Hermitian block tridiagonal Ritz matrix. Both methods share
+`lanczos_step`, Ritz reconstruction, and explicit restart. The starting block retains
 independent components in degenerate eigenspaces. KrylovKit performs modified
 Gram-Schmidt reorthogonalization and deflates dependent residual directions.
 An invariant subspace ends expansion before a zero residual is normalized;
@@ -123,10 +132,15 @@ subsequent calls reuse the existing orbitals without refitting or restarting.
 
 Lanczos and Davidson share a `QTTVector` adapter. Consecutive projection
 updates retain a linear expression over existing QTT states. Inner products
-contract its terms directly; a norm or operator action constructs the combined
-state with TCI at the effective working tolerance and `work_cap`. This avoids
+contract its terms directly; a norm or operator action reconstructs the combined
+state at the effective working tolerance and `work_cap`. A single active term
+uses direct scaling; multiple terms use TCI. This avoids
 constructing and compressing a separate QTT for every Gram-Schmidt subtraction.
 Hamiltonian actions use the same sampled FD2 expression as the physical residual.
+Within SCF, both Lanczos choices sample the frozen local potential without
+fitting its combined cores first. If every initial action sample is zero,
+the core-algebra fallback constructs and caches the diagonal potential MPO on
+demand. Zero samples alone never establish a globally zero action.
 QTT fitting and truncation make these actions inexact, so the recurrence residual is a diagnostic, not an acceptance
 criterion. The solver checks the residuals of the reconstructed orbitals
 separately.
@@ -211,7 +225,7 @@ stopping and physical acceptance independently.
 ## Fixed-potential spectra and propagation
 
 The 1D `fixed_spectrum` interface defaults to Block Green. Block Green,
-residual-subspace, and LRRAP updates retain band-energy stopping. The three
+residual-subspace, and LRRAP updates retain band-energy stopping. The
 restarted subspace solvers check the maximum residual of all requested states
 and the Gram defect against `scf.eigen_tolerance` and `scf.gram_tolerance`,
 respectively. Use `solver=:block_davidson` to select a method and

@@ -50,10 +50,12 @@ directory. `fixed_spectrum`, `propagate`, and `refine_state` use the same proble
 and orbital-state types.
 
 Select an orbital solver with `ground_state(problem; solver=:block_davidson)`.
-The choices are `:lrrap` (default), `:lanczos`, `:davidson`, and
-`:block_davidson`. The three subspace methods are also available as
+The choices are `:lrrap` (default), `:lanczos`, `:block_lanczos`, `:davidson`, and
+`:block_davidson`. The subspace methods are also available as
 `fixed_spectrum(state, potential; solver=:lanczos, spectrum=options)`.
-Lanczos uses KrylovKit's scalar or block three-term recurrence, with
+`block_lanczos` explicitly selects KrylovKit's block three-term recurrence,
+including for a single orbital. `lanczos` selects the scalar recurrence for one
+orbital and the block recurrence for several orbitals. Both use
 reorthogonalization and explicit restart from the retained Ritz orbitals.
 The Davidson choices use generalized Davidson with a shifted kinetic-inverse
 preconditioner and share KrylovKit's direction orthogonalization.

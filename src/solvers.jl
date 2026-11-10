@@ -100,9 +100,31 @@ end
 
 # 1D FD2 Hamiltonian sampling, tangent projection, and exact MPO expectation values.
 
-struct Hamiltonian{S}
-    potential::QTT
-    diagonal::Vector{Array{ComplexF64,4}}
+"Construct and cache a diagonal potential MPO only when a core contraction needs it."
+struct DeferredPotentialMPO{F}
+    build::F
+    cores::Base.RefValue{Union{Nothing,Vector{Array{ComplexF64,4}}}}
+    lock::ReentrantLock
+end
+DeferredPotentialMPO(build) = DeferredPotentialMPO(
+    build, Ref{Union{Nothing,Vector{Array{ComplexF64,4}}}}(nothing), ReentrantLock(),
+)
+potential_mpo(H, rec = nothing) = potential_mpo(H.diagonal, rec)
+potential_mpo(cores::Vector{Array{ComplexF64,4}}, rec = nothing) = cores
+function potential_mpo(potential::DeferredPotentialMPO, rec = nothing)
+    lock(potential.lock) do
+        if potential.cores[] === nothing
+            potential.cores[] = with_sampling_seed(0) do
+                potential.build(rec)
+            end
+        end
+        potential.cores[]::Vector{Array{ComplexF64,4}}
+    end
+end
+
+struct Hamiltonian{S,D}
+    potential::Union{Nothing,QTT}
+    diagonal::D
     plus::Vector{Array{ComplexF64,4}}
     minus::Vector{Array{ComplexF64,4}}
     h::Float64
@@ -115,11 +137,11 @@ potential_samples(H::Hamiltonian, rec) =
     H.samples === nothing ? memoized_sample(H.potential, rec) : H.samples
 # Used only when every initial pivot cancels. Preserve a core-algebra fallback
 # instead of declaring an unsampled large-grid function globally zero.
-function h_core_fallback(H, psi, energy; tol, cap)
+function h_core_fallback(H, psi, energy; tol, cap, rec = nothing)
     shift_tol = min(tol, tol * H.h^2)
     terms = (
         psi,
-        apply_mpo(H.diagonal, psi; tol, cap),
+        apply_mpo(potential_mpo(H, rec), psi; tol, cap),
         apply_mpo(H.plus, psi; tol = shift_tol, cap),
         apply_mpo(H.minus, psi; tol = shift_tol, cap),
     )
@@ -166,7 +188,7 @@ function h_residual(
         tol,
         cap,
         label,
-        initial_zero_fallback = () -> h_core_fallback(H, psi, energy; tol, cap),
+        initial_zero_fallback = () -> h_core_fallback(H, psi, energy; tol, cap, rec),
     )
 end
 
@@ -186,20 +208,48 @@ function h_action(H, psi, cfg, rec; label = "", work_tol = 0.0, potential = noth
 end
 function h_project(tangent_basis, psi, H; projected_psi = nothing)
     center = projected_psi === nothing ? project(tangent_basis, psi) : projected_psi
-    project(tangent_basis, psi, H.diagonal) +
+    project(tangent_basis, psi, potential_mpo(H)) +
     (center - (project(tangent_basis, psi, H.plus) + project(tangent_basis, psi, H.minus)) / 2) / H.h^2
 end
 
 "Project H on gauge-constrained tangent coordinates, such as L4's projected/SVD columns."
-function h_project_tangent(f, z, H)
-    t = tangent_vector(f, z)
-    project(f, t, H.diagonal) + (z - (project(f, t, H.plus) + project(f, t, H.minus)) / 2) / H.h^2
+function h_project_tangent(tangent_basis, z, H)
+    tangent = tangent_vector(tangent_basis, z)
+    project(tangent_basis, tangent, potential_mpo(H)) +
+    (z - (project(tangent_basis, tangent, H.plus) + project(tangent_basis, tangent, H.minus)) / 2) / H.h^2
 end
 function h_expectation(H, psi)
     # All coefficient-Hamiltonian blocks must use the same MPO contraction.
     # A loose TCI Rayleigh diagonal becomes an artificial negative direction
     # when the joint old-orbital / tangent Gram matrix is nearly singular.
     real(only(h_gram([psi], H)))
+end
+
+"Kinetic expectations from shared MPO contractions, with a stable gradient fallback."
+function kinetic_expectations(orbitals, plus, minus, h; cfg = (;))
+    b = length(orbitals)
+    out = zeros(Float64, b)
+    with_sampling_seed(0) do
+        bras, kets, (shift_plus, shift_minus) = mpo_basis(orbitals, (plus, minus))
+        foreach_independent(b, cfg) do i
+            overlap = inner(orbitals[i], orbitals[i]; cfg)
+            terms = (
+                overlap,
+                -ITensorMPS.inner(bras[i], shift_plus, kets[i]; make_inds_match = false) / 2,
+                -ITensorMPS.inner(bras[i], shift_minus, kets[i]; make_inds_match = false) / 2,
+            )
+            numerator = compensated_sum(terms)
+            # Nearly equal FD2 terms lose digits; use the exact low-rank gradient.
+            if abs(numerator) <= sqrt(eps(Float64)) * sum(abs, terms) ||
+               real(numerator) < 0
+                gradient = shift_difference(plus, orbitals[i])
+                numerator = inner(gradient, gradient; cfg) / 2
+            end
+            # numerator already contains the 1/2 from (plus+minus)/2.
+            out[i] = real(numerator) / h^2
+        end
+    end
+    out
 end
 
 function shift_difference(shift, psi)
@@ -218,7 +268,7 @@ end
 function h_gram(orbitals, H; cfg = (;))
     with_sampling_seed(0) do
         b = length(orbitals)
-        bras, kets, (potential, plus, minus) = mpo_basis(orbitals, (H.diagonal, H.plus, H.minus))
+        bras, kets, (potential, plus, minus) = mpo_basis(orbitals, (potential_mpo(H), H.plus, H.minus))
         overlaps = gram(orbitals; cfg)
         A = zeros(ComplexF64, b, b)
         fallback = fill(false, b, b)
@@ -847,7 +897,7 @@ VI.add!!(y::QTTVector, x::QTTVector, a::Number, b::Number) = VI.add(y, x, a, b)
 function lanczos_orbitals(factorization, norbitals, cfg, rec; tol)
     dimension = length(factorization)
     projected =
-        norbitals == 1 ? KrylovKit.rayleighquotient(factorization) :
+        factorization isa KrylovKit.LanczosFactorization ? KrylovKit.rayleighquotient(factorization) :
         Hermitian(view(factorization.H, 1:dimension, 1:dimension))
     spectrum = eigen(projected)
     basis = reconstruct_orbital!.(KrylovKit.basis(factorization))
@@ -871,16 +921,19 @@ function lanczos_step(
     H,
     cfg,
     rec;
+    solver = :lanczos,
     work_tol,
     ritz_tol,
     potential,
     extract_ritz = true,
 )
+    solver in (:lanczos, :block_lanczos) || throw(ArgumentError("Unknown Lanczos method"))
     norbitals = length(orbitals)
+    block_recurrence = solver == :block_lanczos || norbitals > 1
     limit = min(2^cfg.R, max(16, 4norbitals))
     width =
         subspace === nothing ? norbitals :
-        norbitals == 1 ? 1 : length(KrylovKit.residual(subspace.factorization))
+        block_recurrence ? length(KrylovKit.residual(subspace.factorization)) : 1
     residual_floor = max(work_tol, 100eps(Float64))
     breakdown =
         subspace !== nothing &&
@@ -908,7 +961,7 @@ function lanczos_step(
             )
         initial = [QTTVector(psi, work_tol, cfg.work_cap, rec) for psi in orbitals]
         # A block preserves independent directions within degenerate eigenspaces.
-        iterator = if norbitals == 1
+        iterator = if !block_recurrence
             KrylovKit.LanczosIterator(action, only(initial), KrylovKit.ModifiedGramSchmidt2())
         else
             KrylovKit.BlockLanczosIterator(
@@ -925,7 +978,7 @@ function lanczos_step(
     end
     factorization = subspace.factorization
     previous_dimension = length(factorization)
-    width = norbitals == 1 ? 1 : length(KrylovKit.residual(factorization))
+    width = block_recurrence ? length(KrylovKit.residual(factorization)) : 1
     # Do not normalize a numerically zero residual at an invariant subspace.
     breakdown_tolerance = sqrt(width) * residual_floor
     breakdown = KrylovKit.normres(factorization) <= breakdown_tolerance
@@ -938,11 +991,11 @@ function lanczos_step(
         orbitals, gram_defect = lanczos_orbitals(factorization, norbitals, cfg, rec; tol = ritz_tol)
         subspace = (; subspace.iterator, factorization, gram_defect, ritz_dimension = dimension)
     end
-    width = norbitals == 1 ? 1 : length(KrylovKit.residual(factorization))
+    width = block_recurrence ? length(KrylovKit.residual(factorization)) : 1
     breakdown = KrylovKit.normres(factorization) <= sqrt(width) * residual_floor
     metrics = (;
-        solver = :lanczos,
-        recurrence = norbitals == 1 ? :scalar : :block,
+        solver,
+        recurrence = block_recurrence ? :block : :scalar,
         trial_dimension = dimension,
         appended_directions = dimension - previous_dimension,
         restarted,

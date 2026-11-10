@@ -130,7 +130,7 @@ and calibration reports remain local calculation outputs.
 | `scf.energy_tolerance` | Total-energy change threshold; default `1e-6 Ha` |
 | `scf.max_iterations` | SCF iteration limit |
 | `scf.inner_steps` | Orbital updates at a fixed input density |
-| `scf.solver` | `"lrrap"` (default), `"lanczos"`, `"davidson"`, or `"block_davidson"` |
+| `scf.solver` | `"lrrap"` (default), `"lanczos"`, `"block_lanczos"`, `"davidson"`, or `"block_davidson"` |
 | `scf.mixing` | Density mixing weight |
 | `scf.anderson` | Enable Anderson mixing |
 | `scf.eigen_tolerance` | Inner eigensolver residual target and Ritz rotation threshold |
@@ -149,7 +149,8 @@ iteration limit checks the actual returned state. Set
 `orbital_residual_tolerance` explicitly to change physical acceptance without
 changing the inner eigensolver decisions.
 
-`"lanczos"` uses a scalar three-term recurrence for one orbital and block
+`"block_lanczos"` explicitly selects the block three-term recurrence, including
+for one orbital. `"lanczos"` uses a scalar three-term recurrence for one orbital and block
 Lanczos for several orbitals. Each `inner_steps` update advances one recurrence
 step, with an explicit restart when the trial space reaches its size limit.
 SCF reconstructs Ritz orbitals at a restart and at the final inner step;
@@ -203,6 +204,10 @@ configured steps.
 Logged ranks distinguish inner-update output from stored orbitals. Parallel
 subtask times may overlap; their sum is not wall time. Tensor storage, cumulative
 allocation, and peak process memory are separate quantities.
+
+For a zero-sample fallback, `tci_calls.jsonl` records inclusive `seconds` and
+separates any potential-construction time in `nested_tci_seconds`. Aggregate
+TCI time counts that nested construction once, and each call retains its own ID.
 
 `postprocess("results/helium")` writes `observables/trajectory.json`,
 `density.csv`, and `bond_profiles.csv`. The 3D density output samples the Morton

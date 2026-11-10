@@ -371,7 +371,8 @@ Base.@kwdef struct PhysicsNumerics
     green_relative_tolerance::Float64 = 1e-8
     green_max_iterations::Int = 300
 end
-const SUBSPACE_SOLVERS = (:lanczos, :davidson, :block_davidson)
+const LANCZOS_SOLVERS = (:lanczos, :block_lanczos)
+const SUBSPACE_SOLVERS = (LANCZOS_SOLVERS..., :davidson, :block_davidson)
 
 Base.@kwdef struct SCFOptions
     # 0 uses the default Julia thread pool; 1 keeps core contractions serial.

@@ -136,9 +136,9 @@ function local_potential_samples(problem, rho, ops, accuracy, rec; time = 0.0, d
     end
     # Hartree and XC read the same immutable SCF input, never updated orbitals.
     frozen_density = Q.QTT([copy(core) for core in rho.c])
-    Vhartree = hartree(frozen_density, problem, ops, accuracy)
+    hartree_potential = hartree(frozen_density, problem, ops, accuracy)
     rho_samples = Q.memoized_sample(frozen_density, rec)
-    hartree_samples = Q.memoized_sample(Vhartree, rec)
+    hartree_samples = Q.memoized_sample(hartree_potential, rec)
     dx = spacing(problem.grid)
     Q.memoized_sample(
         Q.pointwise(
@@ -155,25 +155,31 @@ function local_potential_samples(problem, rho, ops, accuracy, rec; time = 0.0, d
     )
 end
 
-function effective_hamiltonian(problem, rho, ops, accuracy, rec; time = 0.0, drive = NoDrive())
+function effective_hamiltonian(
+    problem, rho, ops, accuracy, rec;
+    time = 0.0, drive = NoDrive(), fit_potential = true,
+)
     field = local_potential_samples(problem, rho, ops, accuracy, rec; time, drive)
     # Core projections need one shared field representation; sampled residuals
     # and Green sources consume the original local expression directly.
-    Veff =
+    build_potential(fit_rec = rec) =
         problem.model isa LocalPotential1D &&
         drive isa NoDrive &&
         Q.rank(ops.external) <= field_caps(accuracy).effective_potential_cap ? ops.external :
         Q.cross(
-            rec,
+            fit_rec,
             problem.grid.R,
             field;
             tol = accuracy.field_tolerance,
             cap = field_caps(accuracy).effective_potential_cap,
             label = "effective_potential",
         )
+    potential = fit_potential ? build_potential() : nothing
+    diagonal = fit_potential ? Q.diagonal(potential) :
+               Q.DeferredPotentialMPO(localrec -> Q.diagonal(build_potential(something(localrec, rec))))
     Q.Hamiltonian(
-        Veff,
-        Q.diagonal(Veff),
+        potential,
+        diagonal,
         ops.plus,
         ops.minus,
         spacing(problem.grid) * sqrt(problem.mass),
@@ -182,23 +188,21 @@ function effective_hamiltonian(problem, rho, ops, accuracy, rec; time = 0.0, dri
 end
 function total_energy(problem, orbitals, rho, ops, accuracy, rec; time = 0.0, drive = NoDrive())
     dx = spacing(problem.grid)
-    kinetic_terms =
-        Q.recorded_map(Float64, length(orbitals), rec.options, rec; random = false) do i, localrec
-            occupation, psi = problem.occupations[i], orbitals[i]
-            shifted = Q.apply_mpo(
-                ops.plus,
-                psi;
-                tol = accuracy.algebra_tolerance,
-                cap = accuracy.orbital_cap,
-            )
-            gradient_norm =
-                Q.difference_norm(shifted, psi; rec = localrec, label = "kinetic_difference_norm")
-            occupation * gradient_norm^2 / (2problem.mass * dx^2)
-        end
-    kinetic_energy = sum(kinetic_terms)
-    Vhartree = hartree(rho, problem, ops, accuracy)
+    # Contract FD2 energy directly, using exact gradients only for cancellation.
+    kinetic = Q.kinetic_expectations(
+        orbitals,
+        ops.plus,
+        ops.minus,
+        dx * sqrt(problem.mass);
+        cfg = rec.options,
+    )
+    kinetic_energy = sum(problem.occupations .* kinetic)
     external_energy = dx * real(Q.inner(rho, ops.external; cfg = rec.options))
-    hartree_energy = 0.5dx * real(Q.inner(rho, Vhartree; cfg = rec.options))
+    # Contract <rho|K|rho> directly instead of materializing the Hartree field.
+    # V_H = dx * K*rho, so the Hartree integral carries dx^2.
+    hartree_energy =
+        ops.interaction === nothing ? 0.0 :
+        0.5dx^2 * real(Q.inner_mpo(rho, ops.interaction, rho))
     xc_energy = 0.0
     if ops.xc_table !== nothing
         rho_samples = Q.sampled(rho, rec)
@@ -214,7 +218,7 @@ function total_energy(problem, orbitals, rho, ops, accuracy, rec; time = 0.0, dr
     end
     drive_energy = 0.0
     if !(drive isa NoDrive)
-        Veff = Q.cross(
+        drive_potential = Q.cross(
             rec,
             problem.grid.R,
             j -> drive_value(drive, j * dx, time, problem.grid.L);
@@ -222,7 +226,7 @@ function total_energy(problem, orbitals, rho, ops, accuracy, rec; time = 0.0, dr
             cap = field_caps(accuracy).drive_cap,
             label = "drive_energy",
         )
-        drive_energy = dx * real(Q.inner(rho, Veff; cfg = rec.options))
+        drive_energy = dx * real(Q.inner(rho, drive_potential; cfg = rec.options))
     end
     ion_energy = ops.nuclear
     (;
@@ -516,9 +520,9 @@ function local_potential_samples(
     )
 end
 
-struct CartesianHamiltonian{S}
-    potential::Q.QTT
-    diagonal::Vector{Array{ComplexF64,4}}
+struct CartesianHamiltonian{S,D}
+    potential::Union{Nothing,Q.QTT}
+    diagonal::D
     plus::NTuple{3,Vector{Array{ComplexF64,4}}}
     minus::NTuple{3,Vector{Array{ComplexF64,4}}}
     grid::BoxGrid3D
@@ -532,21 +536,25 @@ function effective_hamiltonian(
     ops,
     accuracy,
     rec;
+    fit_potential = true,
     kwargs...,
 )
     field = local_potential_samples(problem, rho, ops, accuracy, rec; kwargs...)
-    v =
+    build_potential(fit_rec = rec) =
         problem.model isa LocalPotential3D &&
         Q.rank(ops.external) <= field_caps(accuracy).effective_potential_cap ? ops.external :
         Q.cross(
-            rec,
+            fit_rec,
             nsites(problem.grid),
             field;
             tol = accuracy.field_tolerance,
             cap = field_caps(accuracy).effective_potential_cap,
             label = "effective_potential",
         )
-    CartesianHamiltonian(v, Q.diagonal(v), ops.plus, ops.minus, problem.grid, problem.mass, field)
+    potential = fit_potential ? build_potential() : nothing
+    diagonal = fit_potential ? Q.diagonal(potential) :
+               Q.DeferredPotentialMPO(localrec -> Q.diagonal(build_potential(something(localrec, rec))))
+    CartesianHamiltonian(potential, diagonal, ops.plus, ops.minus, problem.grid, problem.mass, field)
 end
 
 "Keep all FD2 terms until the caller combines and truncates its final expression."
@@ -559,9 +567,9 @@ function kinetic_expression(H::CartesianHamiltonian, psi)
     end
     Q.linear_expression(terms, weights)
 end
-function Q.h_core_fallback(H::CartesianHamiltonian, psi, energy; tol, cap)
+function Q.h_core_fallback(H::CartesianHamiltonian, psi, energy; tol, cap, rec = nothing)
     kinetic = kinetic_expression(H, psi)
-    potential = Q.apply_mpo(H.diagonal, psi; tol, cap)
+    potential = Q.apply_mpo(Q.potential_mpo(H, rec), psi; tol, cap)
     Q.reconstruct_expression(
         Q.linear_expression((kinetic, potential, psi), (1, 1, -energy));
         tol,
@@ -607,24 +615,25 @@ function Q.h_residual(
         tol,
         cap,
         label,
-        initial_zero_fallback = () -> Q.h_core_fallback(H, psi, energy; tol, cap),
+        initial_zero_fallback = () -> Q.h_core_fallback(H, psi, energy; tol, cap, rec),
     )
 end
-function Q.h_project(f, psi, H::CartesianHamiltonian; projected_psi = nothing)
-    result = Q.project(f, psi, H.diagonal)
-    center = projected_psi === nothing ? Q.project(f, psi) : projected_psi
+function Q.h_project(tangent_basis, psi, H::CartesianHamiltonian; projected_psi = nothing)
+    result = Q.project(tangent_basis, psi, Q.potential_mpo(H))
+    center = projected_psi === nothing ? Q.project(tangent_basis, psi) : projected_psi
     for a = 1:3
         result +=
-            (center - (Q.project(f, psi, H.plus[a]) + Q.project(f, psi, H.minus[a])) / 2) /
+            (center - (Q.project(tangent_basis, psi, H.plus[a]) + Q.project(tangent_basis, psi, H.minus[a])) / 2) /
             (H.mass * spacing(H.grid)[a]^2)
     end
     result
 end
-Q.h_project_tangent(f, z, H::CartesianHamiltonian) = Q.h_project(f, Q.tangent_vector(f, z), H)
+Q.h_project_tangent(tangent_basis, z, H::CartesianHamiltonian) =
+    Q.h_project(tangent_basis, Q.tangent_vector(tangent_basis, z), H)
 
 function Q.h_gram(orbitals, H::CartesianHamiltonian; cfg = (;))
     Q.with_sampling_seed(0) do
-        bras, kets, operators = Q.mpo_basis(orbitals, (H.diagonal, H.plus..., H.minus...))
+        bras, kets, operators = Q.mpo_basis(orbitals, (Q.potential_mpo(H), H.plus..., H.minus...))
         potential, plus, minus = operators[1], operators[2:4], operators[5:7]
         overlaps = Q.gram(orbitals; cfg)
         # Build gradients only when direct FD2 contractions lose significant digits.
@@ -788,10 +797,12 @@ function total_energy(
             problem.occupations[i] * Q.h_expectation(kinetic_operator, orbitals[i])
         end,
     )
-    dV = volume_element(problem.grid)
-    external = dV * real(Q.inner(rho, ops.external))
-    Vhartree = hartree(rho, problem, ops, accuracy, rec)
-    hartree_energy = dV / 2 * real(Q.inner(rho, Vhartree))
+    dv = volume_element(problem.grid)
+    external = dv * real(Q.inner(rho, ops.external))
+    # V_H = dV * K*rho, so the Hartree integral carries dV^2.
+    hartree_energy =
+        ops.interaction === nothing ? 0.0 :
+        dv^2 / 2 * real(Q.inner_mpo(rho, ops.interaction, rho))
     xc_energy = if ops.xc_table === nothing
         0.0
     else
@@ -803,7 +814,7 @@ function total_energy(
             cap = field_caps(accuracy).xc_energy_cap,
             label = "xc_energy_density",
         )
-        dV * real(sum(Q.tensortrain(xc_energy_density)))
+        dv * real(sum(Q.tensortrain(xc_energy_density)))
     end
     (;
         total = kinetic + external + hartree_energy + xc_energy + ops.nuclear,

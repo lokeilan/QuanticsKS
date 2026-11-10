@@ -775,6 +775,7 @@ function cross(
     )
     all(j -> 0 <= j < 2^R, pts) || throw(ArgumentError("Initial pivot outside the grid"))
     r.calls += 1
+    call = r.calls
     tic = time_ns()
     initial_max = maximum(j -> abs(evaluator(j)), pts; init = 0.0)
     old_max =
@@ -786,19 +787,22 @@ function cross(
         if initial_zero_fallback !== nothing
             # Zero initial samples do not establish global cancellation.
             # The caller supplies a reconstruction from the original cores.
+            previous_tci_time = r.tci_time
             x = initial_zero_fallback()
             dt = (time_ns() - tic) / 1e9
+            nested_tci_seconds = r.tci_time - previous_tci_time
             r.samples += evaluator.evaluations
-            r.tci_time += dt
+            r.tci_time += max(0.0, dt - nested_tci_seconds)
             event!(
                 r.tci_io,
                 (;
-                    call = r.calls,
+                    call,
                     scf = r.scf,
                     inner = r.inner,
                     stage = r.stage,
                     label,
                     seconds = dt,
+                    nested_tci_seconds,
                     function_evaluations = evaluator.evaluations,
                     rank = rank(x),
                     construction = "core_algebra_zero_initial_pivots",
@@ -819,7 +823,7 @@ function cross(
             event!(
                 r.tci_io,
                 (
-                    call = r.calls,
+                    call = call,
                     label = label,
                     seconds = dt,
                     function_evaluations = evaluator.evaluations,
@@ -879,7 +883,7 @@ function cross(
     event!(
         r.tci_io,
         (
-            call = r.calls,
+            call = call,
             scf = r.scf,
             inner = r.inner,
             stage = r.stage,

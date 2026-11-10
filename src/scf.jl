@@ -46,7 +46,7 @@ function ground_state(
         pivot_state === nothing || Q.load_cross_state!(rec, pivot_state)
         cfg = solver_config(problem, accuracy, scf)
         ops = build_operators(problem, accuracy, rec, physics)
-        green = solver == :lanczos ? nothing : green_operator(problem, accuracy, scf, physics, ops)
+        green = solver in LANCZOS_SOLVERS ? nothing : green_operator(problem, accuracy, scf, physics, ops)
         state =
             initial === nothing ? initial_state(problem, accuracy, rec, guess) :
             OrbitalState(problem, initial.orbitals)
@@ -85,13 +85,17 @@ function ground_state(
             )
             # Hartree is the first consumer requiring independent density cores.
             rho = Q.reconstruct_density(rho, cfg, rec)
-            H = effective_hamiltonian(problem, rho, ops, accuracy, rec)
+            H = effective_hamiltonian(
+                problem, rho, ops, accuracy, rec;
+                fit_potential = !(solver in LANCZOS_SOLVERS),
+            )
             # Only the fixed potential survives all inner stages. Orbitals get
             # new evaluators after every update; a new SCF H gets a new cache.
             potential = Q.timed(rec, "fixed_potential_setup") do
-                solver == :lrrap ? Q.potential_samples(H, rec) : Q.memoized_sample(H.potential, rec)
+                solver == :lrrap || solver in LANCZOS_SOLVERS ? Q.potential_samples(H, rec) :
+                Q.memoized_sample(H.potential, rec)
             end
-            # The subspace methods use the same fitted field in actions and projection.
+            # Share one synchronized field across the subspace's sampled actions.
             subspace_field = solver == :lrrap ? nothing : Q.synchronized(potential)
             subspace = nothing
             metrics = nothing
@@ -108,13 +112,14 @@ function ground_state(
                         work_tol = accuracy.work_tolerance,
                         potential,
                     )
-                elseif solver == :lanczos
+                elseif solver in LANCZOS_SOLVERS
                     orbitals, subspace, metrics = Q.lanczos_step(
                         orbitals,
                         subspace,
                         H,
                         cfg,
                         rec;
+                        solver,
                         work_tol = min(accuracy.work_tolerance, cfg.eigen_tolerance / 10),
                         ritz_tol = cfg.orthogonalization_tolerance,
                         potential = subspace_field,
@@ -344,10 +349,10 @@ end
 
 "Canonicalize occupied orbitals using their output-density Hamiltonian."
 function canonicalize_output_orbitals(problem, orbitals, output_density, ops, accuracy, cfg, rec)
-    Hout = effective_hamiltonian(problem, output_density, ops, accuracy, rec)
+    output_hamiltonian = effective_hamiltonian(problem, output_density, ops, accuracy, rec)
     # The complete operator path is used for this final projected matrix.
     # No spatial symmetry reduction or dense reference enters the solver.
-    ys, offdiag = Q.ritz_rotate(orbitals, Hout, cfg, rec; work_tol = 0.0, force = true)
+    ys, offdiag = Q.ritz_rotate(orbitals, output_hamiltonian, cfg, rec; work_tol = 0.0, force = true)
     ys, compression = Q.compress_orbitals(ys, cfg; tol = accuracy.storage_tolerance)
     after =
         density(problem, ys, accuracy, rec; renormalize = true, label = "canonical_output_density")

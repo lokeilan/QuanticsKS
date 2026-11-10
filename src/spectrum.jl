@@ -596,7 +596,7 @@ function fixed_spectrum(
                 Q.shift_mpo(grid.R, -1),
                 dx * sqrt(problem.mass),
             )
-            H, o.method == :lanczos ? nothing : Q.green_mpo(grid.R, H.h, scf.green_shift)
+            H, o.method in LANCZOS_SOLVERS ? nothing : Q.green_mpo(grid.R, H.h, scf.green_shift)
         end
         project_matrices = if o.projection == :streaming_grid
             basis -> spectrum_grid_matrices(basis, H, potential, cfg, rec, o)
@@ -680,13 +680,14 @@ function fixed_spectrum(
                     # Rotation changes state identities; reset rather than mismatch columns.
                     orbitals, eps = spectrum_ritz(orbitals, H, cfg, rec, o, potential)
                     previous = nothing
-                elseif o.method == :lanczos
+                elseif o.method in LANCZOS_SOLVERS
                     orbitals, subspace, metrics = Q.lanczos_step(
                         orbitals,
                         subspace,
                         H,
                         cfg,
                         rec;
+                        solver = o.method,
                         work_tol = min(
                             accuracy.work_tolerance,
                             o.ritz_tolerance,

@@ -71,7 +71,7 @@ end
 function validate(s::SCFOptions)
     s.solver in (:lrrap, SUBSPACE_SOLVERS...) || throw(
         ArgumentError(
-            "Unknown SCF solver $(s.solver); choose :lrrap, :lanczos, :davidson or :block_davidson",
+            "Unknown SCF solver $(s.solver); choose :lrrap, :lanczos, :block_lanczos, :davidson or :block_davidson",
         ),
     )
     s.parallel_tasks >= 0 || throw(ArgumentError("parallel_tasks must be nonnegative"))

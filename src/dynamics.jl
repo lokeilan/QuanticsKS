@@ -8,14 +8,14 @@ struct TimeResult
 end
 function potential_half_step(problem, orbitals, ops, accuracy, rec, t, drive, options)
     rho = density(problem, orbitals, accuracy, rec)
-    Veff = local_potential_samples(problem, rho, ops, accuracy, rec; time = t, drive)
-    Veff = Q.synchronized(Veff)
+    potential = local_potential_samples(problem, rho, ops, accuracy, rec; time = t, drive)
+    potential = Q.synchronized(potential)
     Q.recorded_map(Q.QTT, length(orbitals), options, rec) do i, localrec
         e = Q.evaluate(orbitals[i], localrec)
         Q.cross(
             localrec,
             problem.grid.R,
-            j -> cis(-options.dt * real(Veff(j)) / 2) * e(j);
+            j -> cis(-options.dt * real(potential(j)) / 2) * e(j);
             tol = options.phase_tolerance,
             cap = options.phase_cap,
             label = "potential_phase_$i",

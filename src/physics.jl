@@ -37,9 +37,9 @@ function xc_exact(rho; rtol = 2e-11)
         q < 0.1 ? q^2 * quadgk(t -> t * besselk(0, q * t), 0.0, 1.0; rtol)[1] :
         1 - q * besselk(1, q)
     exchange_energy = -(q * i0 - i1) / pi^2
-    Vexchange = -i0 / pi
-    correlation_energy, Vcorrelation = correlation(rho)
-    exchange_energy + correlation_energy, Vexchange + Vcorrelation
+    exchange_potential = -i0 / pi
+    correlation_energy, correlation_potential = correlation(rho)
+    exchange_energy + correlation_energy, exchange_potential + correlation_potential
 end
 function XCTable(;
     npoints = 2048,

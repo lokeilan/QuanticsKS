@@ -72,9 +72,12 @@ MPO application through TCI's conversion extension. KrylovKit supplies scalar
 and block Lanczos recurrences and modified Gram-Schmidt for Davidson as well.
 Their shared `QTTVector` adapter in `solvers.jl` implements VectorInterface
 with QTT working tolerances and rank caps. It accumulates linear expressions
-during orthogonalization and fits a state when its consumer needs QTT cores.
-The workflows call `lanczos_step`
-or `davidson_step` directly; both Davidson variants share one implementation.
+during orthogonalization and reconstructs a state when its consumer needs QTT
+cores; a single active term uses direct scaling.
+The `lanczos` and `block_lanczos` workflows call the shared `lanczos_step`.
+Both Davidson variants call `davidson_step` directly.
+`DeferredPotentialMPO` caches potential cores when a sampled Hamiltonian first
+needs a core-algebra fallback or projection.
 Hamiltonian projection reuses converted orbitals and operators within a call.
 Checkpoints store QTT cores and retain their package type identities.
 
