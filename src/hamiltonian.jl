@@ -610,9 +610,9 @@ function Q.h_residual(
         initial_zero_fallback = () -> Q.h_core_fallback(H, psi, energy; tol, cap),
     )
 end
-function Q.h_project(f, psi, H::CartesianHamiltonian)
+function Q.h_project(f, psi, H::CartesianHamiltonian; projected_psi = nothing)
     result = Q.project(f, psi, H.diagonal)
-    center = Q.project(f, psi)
+    center = projected_psi === nothing ? Q.project(f, psi) : projected_psi
     for a = 1:3
         result +=
             (center - (Q.project(f, psi, H.plus[a]) + Q.project(f, psi, H.minus[a])) / 2) /

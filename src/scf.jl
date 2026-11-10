@@ -57,6 +57,7 @@ function ground_state(
         )
         orbitals = state.orbitals
         previous_density = nothing
+        output_density = nothing
         search_directions = nothing
         previous_energy = Inf
         density_history = Q.QTT[]
@@ -70,7 +71,10 @@ function ground_state(
             rec.inner = 0
             start = time_ns()
             # Mix the current orbital density, then hold H fixed during the inner low-rank updates.
-            orbital_density = density(problem, orbitals, accuracy, rec; renormalize = true)
+            # The previous output density already represents these unchanged incoming orbitals.
+            orbital_density =
+                output_density === nothing ?
+                density(problem, orbitals, accuracy, rec; renormalize = true) : output_density
             rho, mixing = Q.mix_density(
                 previous_density,
                 orbital_density,
@@ -168,38 +172,78 @@ function ground_state(
                 label = "output_density",
             )
             canonical = (final_output_ritz = false,)
-            # Strict mode rotates with the output H, then clears directions tied to the old orbital basis.
-            if scf.criterion == :strict
-                orbitals, output_density, canonical =
-                    canonicalize_output_orbitals(problem, orbitals, ops, accuracy, cfg, rec)
-                state = OrbitalState(problem, orbitals)
-                stored_gram_defect = canonical.canonical_gram_defect
-                # Search directions belonged to the pre-Ritz orbital basis.
-                search_directions = nothing
-            end
             energy = total_energy(problem, orbitals, output_density, ops, accuracy, rec)
             density_residual =
                 Q.difference_norm(output_density, rho; rec, label = "scf_density_residual") /
                 Q.ttnorm(output_density; cfg)
             change = isfinite(previous_energy) ? abs(energy.total - previous_energy) : Inf
-            if scf.criterion == :strict
-                check = audit_state(
-                    state,
-                    rho,
-                    accuracy,
-                    audit,
-                    physics,
-                    rec;
-                    reference_energy = energy.total,
-                    scf,
-                )
-                canonical = merge(
-                    canonical,
-                    (
-                        output_eigen_residual_max_Ha = check.max_residual,
-                        output_audit_passed = check.passed,
+            strict_accepted = false
+            # Verify a separate final-state candidate only after the inexpensive stopping gates.
+            if scf.criterion == :strict &&
+               k >= 2 &&
+               change < scf.energy_tolerance &&
+               density_residual < scf.density_tolerance &&
+               stored_gram_defect < scf.gram_tolerance
+                candidate = Q.timed(rec, "scf_candidate_verification") do
+                    ys, candidate_density, candidate_compression, candidate_metrics =
+                        canonicalize_output_orbitals(
+                            problem, orbitals, output_density, ops, accuracy, cfg, rec,
+                        )
+                    candidate_state = OrbitalState(problem, ys)
+                    candidate_energy =
+                        total_energy(problem, ys, candidate_density, ops, accuracy, rec)
+                    candidate_density_residual = Q.difference_norm(
+                        candidate_density, rho; rec, label = "candidate_density_residual",
+                    ) / Q.ttnorm(candidate_density; cfg)
+                    candidate_audit = audit_state(
+                        candidate_state, rho, accuracy, audit, physics, rec;
+                        reference_energy = candidate_energy.total, scf,
+                    )
+                    (;
+                        state = candidate_state,
+                        density = candidate_density,
+                        energy = candidate_energy,
+                        density_residual = candidate_density_residual,
+                        energy_change = abs(candidate_energy.total - previous_energy),
+                        compression = candidate_compression,
+                        metrics = candidate_metrics,
+                        audit = candidate_audit,
+                    )
+                end
+                strict_accepted =
+                    candidate.energy_change < scf.energy_tolerance &&
+                    candidate.density_residual < scf.density_tolerance &&
+                    candidate.compression.stored_gram_defect < scf.gram_tolerance &&
+                    candidate.audit.passed
+                Q.event!(
+                    rec.stage_io,
+                    (;
+                        scf = k, inner = 0, stage = "scf_candidate_acceptance",
+                        parent_stage = rec.stage, seconds = 0.0, gc_seconds = 0.0,
+                        allocated_bytes = 0, event = "candidate_acceptance",
+                        accepted = strict_accepted,
+                        energy_change = candidate.energy_change,
+                        max_residual = candidate.audit.max_residual,
+                        density_residual = candidate.audit.density_residual,
+                        gram_defect = candidate.compression.stored_gram_defect,
                     ),
                 )
+                if strict_accepted
+                    # Rejected candidates leave the iteration orbitals and search history intact.
+                    state = candidate.state
+                    orbitals = state.orbitals
+                    output_density = candidate.density
+                    energy = candidate.energy
+                    density_residual = candidate.density_residual
+                    change = candidate.energy_change
+                    compression = candidate.compression
+                    stored_gram_defect = compression.stored_gram_defect
+                    check = candidate.audit
+                    canonical = merge(candidate.metrics, (
+                        output_eigen_residual_max_Ha = check.max_residual,
+                        output_audit_passed = check.passed,
+                    ))
+                end
             end
             row = merge(
                 (
@@ -237,41 +281,28 @@ function ground_state(
             flush(stdout)
             previous_density = rho
             previous_energy = energy.total
-            # Track energy stopping separately from audit acceptance; strict mode requires both.
-            if k >= 2 &&
-               change < scf.energy_tolerance &&
-               (
-                   scf.criterion == :energy || (
-                       density_residual < scf.density_tolerance &&
-                       check.passed &&
-                       row.gram_defect < scf.gram_tolerance
-                   )
-               )
-                if scf.criterion == :energy
-                    check = audit_state(
-                        state,
-                        rho,
-                        accuracy,
-                        audit,
-                        physics,
-                        rec;
-                        reference_energy = energy.total,
-                        scf,
-                    )
-                end
-                if scf.criterion == :energy || check.passed
-                    converged = true
-                    reason = scf.criterion == :energy ? :energy_tolerance : :strict
-                    break
-                end
+            if strict_accepted
+                converged = true
+                reason = :strict
+                break
+            end
+            # Energy mode retains its stopping rule and reports physical acceptance separately.
+            if scf.criterion == :energy && k >= 2 && change < scf.energy_tolerance
+                check = audit_state(
+                    state, rho, accuracy, audit, physics, rec;
+                    reference_energy = energy.total, scf,
+                )
+                converged = true
+                reason = :energy_tolerance
+                break
             end
             if dir !== nothing && isfile(joinpath(dir, "STOP"))
                 reason = :requested_stop
                 break
             end
         end
-        # If a strict candidate failed and iterations continued, audit the final state again.
-        (check === nothing || (!converged && scf.criterion == :energy)) && (
+        # A rejected candidate was not saved; audit the actual final iteration state.
+        check === nothing && (
             check = audit_state(
                 state,
                 previous_density,
@@ -312,10 +343,8 @@ end
 # Rotate occupied orbitals with H of the output density, then recompute the density change.
 
 "Canonicalize occupied orbitals using their output-density Hamiltonian."
-function canonicalize_output_orbitals(problem, orbitals, ops, accuracy, cfg, rec)
-    before =
-        density(problem, orbitals, accuracy, rec; renormalize = true, label = "ritz_output_density")
-    Hout = effective_hamiltonian(problem, before, ops, accuracy, rec)
+function canonicalize_output_orbitals(problem, orbitals, output_density, ops, accuracy, cfg, rec)
+    Hout = effective_hamiltonian(problem, output_density, ops, accuracy, rec)
     # The complete operator path is used for this final projected matrix.
     # No spatial symmetry reduction or dense reference enters the solver.
     ys, offdiag = Q.ritz_rotate(orbitals, Hout, cfg, rec; work_tol = 0.0, force = true)
@@ -323,14 +352,16 @@ function canonicalize_output_orbitals(problem, orbitals, ops, accuracy, cfg, rec
     after =
         density(problem, ys, accuracy, rec; renormalize = true, label = "canonical_output_density")
     density_change =
-        Q.difference_norm(after, before; rec, label = "ritz_density_change") / Q.ttnorm(before)
+        Q.difference_norm(after, output_density; rec, label = "ritz_density_change") /
+        Q.ttnorm(output_density)
     ys,
     after,
+    compression,
     (
         final_output_ritz = true,
         final_ritz_offdiagonal_before = offdiag,
         final_ritz_density_relative_change = density_change,
-        final_ritz_direction_history_reset = true,
+        final_ritz_direction_history_reset = false,
         canonical_gram_defect = compression.stored_gram_defect,
     )
 end
@@ -413,7 +444,7 @@ function audit_state(
     de = abs(energy.total - reference_energy)
     passed =
         all(isfinite, residuals) &&
-        maximum(residuals) < scf.eigen_tolerance &&
+        maximum(residuals) < something(scf.orbital_residual_tolerance, scf.eigen_tolerance) &&
         gd < opts.gram_tolerance &&
         abs(charge - sum(problem.occupations)) < opts.charge_tolerance &&
         drho < scf.density_tolerance &&

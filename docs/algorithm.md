@@ -53,17 +53,21 @@ noninteracting.
 ## SCF loop
 
 1. Construct static external and interaction operators and initialize orbitals.
-2. Fit the orbital density, normalize its integral to the electron number, and
-   apply linear or Anderson density mixing.
+2. Fit the initial orbital density and normalize its integral to the electron
+   number. Later iterations reuse the density already computed from the previous
+   stored output orbitals. Apply linear or Anderson density mixing.
 3. Build the Hamiltonian from the mixed density. Keep it fixed during the
    configured inner orbital updates.
 4. Round orbitals to the storage budget and check their Gram matrix. Recompute
-   density from the stored orbitals. In `strict` mode, perform an output Ritz
-   rotation with this density's Hamiltonian, store the rotated orbitals, and
-   recompute density again.
+   density from the stored orbitals.
 5. Evaluate total energy, the change from the previous iteration, and the
    difference between output and mixed input densities. Apply the stopping
-   criterion and audit the final state.
+   criterion and audit the final state. In `strict` mode, only an iterate that
+   meets the energy, density, and Gram gates becomes a final-state candidate.
+   Rotate that candidate with the output-density Hamiltonian, compress it,
+   recompute its density and energy, and audit the resulting stored orbitals.
+   Accept the candidate only when all conditions pass; otherwise retain the
+   original iterate and search directions and continue SCF.
 
 The total energy includes occupied kinetic energy, external energy, half the
 Hartree integral, XC energy, and nuclear repulsion. The XC potential itself is
@@ -83,6 +87,8 @@ not added as an XC energy term.
 | L7 | Restore orthogonality and apply the required Ritz rotation. |
 
 Tangent projection contracts the operator directly into tangent coordinates.
+L4 reuses the orbital projections from L3 and forms the projected Hamiltonian
+with one matrix multiplication after collecting its tangent action columns.
 The 1D Green operator has an analytic discrete periodic kernel. The 3D Green
 operation uses truncated QTT conjugate gradients. It accepts a result only when
 the residual of the stored state meets `green_relative_tolerance`. That residual

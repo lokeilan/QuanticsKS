@@ -28,6 +28,11 @@ These examples demonstrate the workflow. Physical accuracy requires grid, box,
 rank, and tolerance convergence. SCF stopping and the final physical audit are
 reported separately.
 
+The calibrated [1D H100 R16 input](inputs/h100-r16.toml) records the current
+tolerance and rank-cap profile for 50 occupied orbitals. Its numerical budgets
+and physical acceptance thresholds are described in the
+[configuration guide](docs/configuration.md#calibrated-1d-r16-profile).
+
 ## Use from Julia
 
 ```julia

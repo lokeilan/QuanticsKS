@@ -95,6 +95,33 @@ For the 3D Green solve, `[physics].green_relative_tolerance` defaults to `1e-8`
 and `green_max_iterations` to `300`. Failure to meet the stored-state residual
 budget raises an error.
 
+## Calibrated 1D R16 profile
+
+[h100-r16.toml](../inputs/h100-r16.toml) specifies a periodic 1D soft-Coulomb
+chain with 100 hydrogen atoms and 50 doubly occupied orbitals on an R16 grid.
+These budgets are input-specific; the constructor defaults are listed above.
+
+The profile uses `field_tolerance=1e-5`, `work_tolerance=1e-4`, and
+`mixing_tolerance=1e-8`, with `work_cap=80`. Explicit field caps are 32 for the
+external potential, 16 for the interaction kernel, 64 for Hartree and the
+effective potential, and 128 for density and XC energy density. Orbital
+reconstruction uses `orbital_tolerance=1e-8` and `orbital_cap=48`; stored
+orbitals use `storage_tolerance=1e-10`.
+
+Strict stopping uses `energy_tolerance=1e-6 Ha` and final orbital and density
+thresholds of `3e-4 Ha` and `3e-4`, respectively. The inner eigensolver target
+remains `eigen_tolerance=5e-5 Ha`. Passing these configured final thresholds
+does not establish the tighter `5e-5` orbital or density target.
+
+```sh
+julia --threads=8,1 --project=. run.jl plan inputs/h100-r16.toml
+julia --threads=8,1 --project=. run.jl solve inputs/h100-r16.toml results/h100-r16
+```
+
+The input selects available orbital workers with `parallel_tasks=0` and one
+BLAS thread. The full configuration is in the input file. Logs, checkpoints,
+and calibration reports remain local calculation outputs.
+
 ## SCF, propagation, and threads
 
 | Setting | Meaning |
@@ -106,10 +133,21 @@ budget raises an error.
 | `scf.solver` | `"lrrap"` (default), `"lanczos"`, `"davidson"`, or `"block_davidson"` |
 | `scf.mixing` | Density mixing weight |
 | `scf.anderson` | Enable Anderson mixing |
-| `scf.eigen_tolerance` | Final orbital residual threshold |
+| `scf.eigen_tolerance` | Inner eigensolver residual target and Ritz rotation threshold |
+| `scf.orbital_residual_tolerance` | Final stored-orbital residual threshold; unset inherits `eigen_tolerance` |
 | `scf.density_tolerance` | Density self-consistency threshold |
 | `time.dt`, `time.steps` | Time step and number of propagation steps |
 | `time.observe_every`, `time.snapshot_every` | Observation and saved-state intervals |
+
+`strict` first checks energy change, density consistency, and stored Gram defect.
+Only a candidate that meets these inexpensive gates receives an output-density
+Ritz rotation and independent physical audit. The candidate replaces the stored
+iteration state only if its energy, density, Gram, and audit checks all pass.
+Rejected candidates leave the orbital and search-direction state unchanged;
+their sampling work can still update recorder pivot caches. A final audit at an
+iteration limit checks the actual returned state. Set
+`orbital_residual_tolerance` explicitly to change physical acceptance without
+changing the inner eigensolver decisions.
 
 `"lanczos"` uses a scalar three-term recurrence for one orbital and block
 Lanczos for several orbitals. Each `inner_steps` update advances one recurrence

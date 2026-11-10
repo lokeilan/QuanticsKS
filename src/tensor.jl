@@ -124,22 +124,53 @@ function phase_tt(x::QTT, k::Int)
     end
     QTT(c)
 end
+"Convert each orbital once before contracting a block of pairwise overlaps."
+function mps_basis(orbitals, sites)
+    [
+        begin
+            isempty(psi.c) && throw(ArgumentError("An inner product needs nonempty tensor trains"))
+            length(psi) == length(sites) || throw(DimensionMismatch("QTT inner-product lengths"))
+            check_compression_shapes(psi.c)
+            all(size(g, 2) == ITensors.dim(s) for (g, s) in zip(psi.c, sites)) ||
+                throw(DimensionMismatch("QTT physical dimensions"))
+            size(first(psi.c), 1) == size(last(psi.c), 3) == 1 ||
+                throw(DimensionMismatch("QTT inner-product boundaries"))
+            ITensorMPS.MPS(tensortrain(psi); sites)
+        end for psi in orbitals
+    ]
+end
 function gram(xs; cfg = (;))
     g = zeros(ComplexF64, length(xs), length(xs))
-    foreach_independent(length(xs), cfg) do j
-        for i = firstindex(xs):j
-            value = inner(xs[i], xs[j]; cfg)
-            g[i, j] = value
-            i == j || (g[j, i] = conj(value))
+    isempty(xs) && return g
+    # Conversion and the library's internal link IDs must not consume TCI randomness.
+    with_sampling_seed(0) do
+        sites = [ITensors.Index(size(core, 2), "n=$k") for (k, core) in enumerate(first(xs).c)]
+        kets = mps_basis(xs, sites)
+        foreach_independent(length(xs), cfg) do j
+            with_sampling_seed(j) do
+                for i = firstindex(xs):j
+                    value = ITensorMPS.inner(kets[i], kets[j]; make_inds_match = false)
+                    g[i, j] = value
+                    i == j || (g[j, i] = conj(value))
+                end
+            end
         end
     end
     g
 end
 function gram(xs, ys; cfg = (;))
     g = zeros(ComplexF64, length(xs), length(ys))
-    foreach_independent(length(ys), cfg) do j
-        for i in eachindex(xs)
-            g[i, j] = inner(xs[i], ys[j]; cfg)
+    (isempty(xs) || isempty(ys)) && return g
+    with_sampling_seed(0) do
+        sites = [ITensors.Index(size(core, 2), "n=$k") for (k, core) in enumerate(first(xs).c)]
+        left = mps_basis(xs, sites)
+        right = mps_basis(ys, sites)
+        foreach_independent(length(ys), cfg) do j
+            with_sampling_seed(j) do
+                for i in eachindex(xs)
+                    g[i, j] = ITensorMPS.inner(left[i], right[j]; make_inds_match = false)
+                end
+            end
         end
     end
     g

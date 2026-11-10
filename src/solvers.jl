@@ -184,9 +184,10 @@ function h_action(H, psi, cfg, rec; label = "", work_tol = 0.0, potential = noth
         label = (work_tol > 0 ? "Hpsi_work_" : "Hpsi_") * label,
     )
 end
-function h_project(f, psi, H)
-    project(f, psi, H.diagonal) +
-    (project(f, psi) - (project(f, psi, H.plus) + project(f, psi, H.minus)) / 2) / H.h^2
+function h_project(tangent_basis, psi, H; projected_psi = nothing)
+    center = projected_psi === nothing ? project(tangent_basis, psi) : projected_psi
+    project(tangent_basis, psi, H.diagonal) +
+    (center - (project(tangent_basis, psi, H.plus) + project(tangent_basis, psi, H.minus)) / 2) / H.h^2
 end
 
 "Project H on gauge-constrained tangent coordinates, such as L4's projected/SVD columns."
@@ -599,13 +600,15 @@ function lrrap_step(orbitals, previous, H, green, cfg, rec; work_tol = 0.0, pote
         )
         W = Diagonal(1 ./ column_norms) * fac.V[:, good] * Diagonal(1 ./ fac.S[good])
         D = view(fac.U, :, 1:length(good))
-        H_vv = independent_columns(size(D, 2), size(D, 2), cfg) do j
-            hv = h_project_tangent(tangent_basis, view(D, :, j), H)
-            D' * hv
+        projected_actions = independent_columns(size(D, 1), size(D, 2), cfg) do j
+            h_project_tangent(tangent_basis, view(D, :, j), H)
         end
+        H_vv = D' * projected_actions
         H_vv = (H_vv + H_vv') / 2
         # Exact contractions with H, independently of the TCI approximation used in L1.
-        phx = independent_columns(i -> h_project(tangent_basis, orbitals[i], H), size(D, 1), b, cfg)
+        phx = independent_columns(size(D, 1), b, cfg) do i
+            h_project(tangent_basis, orbitals[i], H; projected_psi = view(DX, :, i))
+        end
         D, W, H_vv, D' * DX, D' * phx, gram(orbitals; cfg)
     end
     # L5: optimize the small coefficient problem under the orbital orthogonality constraints.

@@ -102,6 +102,9 @@ function validate(s::SCFOptions)
     end
     isfinite(s.green_update_residual_threshold) && s.green_update_residual_threshold >= 0 ||
         throw(ArgumentError("Invalid Green update residual threshold"))
+    s.orbital_residual_tolerance === nothing ||
+        (isfinite(s.orbital_residual_tolerance) && s.orbital_residual_tolerance > 0) ||
+        throw(ArgumentError("Invalid final orbital residual tolerance"))
     s
 end
 function prepare_run(output, kind, p; options...)

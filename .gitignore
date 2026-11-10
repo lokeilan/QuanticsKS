@@ -15,7 +15,7 @@
 /tests/
 /scripts/
 
-# Publish only the user guides and basic runnable examples.
+# Publish the user guides, basic examples, and selected R16 parameter profile.
 /docs/*
 !/docs/algorithm.md
 !/docs/configuration.md
@@ -24,6 +24,7 @@
 !/inputs/h4.toml
 !/inputs/helium.toml
 !/inputs/propagation.toml
+!/inputs/h100-r16.toml
 
 # Caches, process receipts, and generated binary states.
 __pycache__/

@@ -384,6 +384,8 @@ Base.@kwdef struct SCFOptions
     anderson::Bool = true
     green_shift::Float64 = 0.5
     eigen_tolerance::Float64 = 1e-4
+    # Final stored-state acceptance can differ from the inner eigensolver target.
+    orbital_residual_tolerance::Union{Nothing,Float64} = nothing
     density_tolerance::Float64 = 1e-4
     criterion::Symbol = :energy
     seed::Int = 20261030

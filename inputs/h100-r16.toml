@@ -1,0 +1,60 @@
+# One-dimensional periodic H100 R16 SCF.
+# The measured profile uses Julia --threads=8,1 with one BLAS thread.
+[run]
+kind = "scf"
+blas_threads = 1
+
+[grid]
+R = 16
+cell = 400.0
+
+[system]
+kind = "hydrogen_chain"
+natoms = 100
+distance = 4.0
+
+[accuracy]
+field_tolerance = 1e-5
+orbital_tolerance = 1e-8
+work_tolerance = 1e-4
+storage_tolerance = 1e-10
+algebra_tolerance = 1e-10
+orthogonalization_tolerance = 1e-10
+mixing_tolerance = 1e-8
+green_rhs_tolerance = 1e-7
+density_tolerance = 1e-8
+kernel_tolerance = 1e-9
+external_tolerance = 1e-9
+xc_energy_tolerance = 1e-8
+green_rhs_cap = 128
+orbital_cap = 48
+work_cap = 80
+field_cap = 128
+external_cap = 32
+kernel_cap = 16
+hartree_cap = 64
+effective_potential_cap = 64
+density_cap = 128
+xc_energy_cap = 128
+
+[scf]
+parallel_tasks = 0
+criterion = "strict"
+energy_tolerance = 1e-6
+max_iterations = 80
+mixing = 0.3
+eigen_tolerance = 5e-5
+orbital_residual_tolerance = 3e-4
+density_tolerance = 3e-4
+seed = 20261030
+
+[tci]
+environment_cache_bits = 8
+
+[physics]
+exchange_quadrature_rtol = 2e-9
+
+[refinement]
+degree = 5
+tolerance = 1e-11
+max_added_bits = 8
