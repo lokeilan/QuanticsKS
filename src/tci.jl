@@ -947,7 +947,11 @@ function linear_combination(
     isempty(active) && return constant_tt(R, 0.0)
     trains = [xs[i] for i in active]
     weights = ComplexF64[coefficients[i] for i in active]
-    length(trains) == 1 && return rounded(scale(only(trains), only(weights)); tol, cap)
+    if length(trains) == 1
+        psi, coefficient = only(trains), only(weights)
+        result = isone(coefficient) ? psi : scale(psi, coefficient)
+        return rank(result) <= cap ? result : rounded(result; tol, cap)
+    end
     # Combine all amplitudes before rounding so intermediate sums cannot lose cancellation.
     core_sum() = reconstruct_expression(linear_expression(trains, weights); tol, cap)
     R == 1 && return core_sum()

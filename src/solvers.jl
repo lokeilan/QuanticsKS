@@ -526,7 +526,15 @@ function block_green(orbitals, energies, H, green, cfg, rec; potential = nothing
             label = "block_green_$i",
         )
         # Truncated MPO action establishes its own QR gauge when needed.
-        normalize(apply_mpo(green, rhs; tol = cfg.algebra_tolerance, cap = cfg.orbital_cap))
+        normalize(
+            apply_mpo(
+                green,
+                rhs;
+                tol = cfg.algebra_tolerance,
+                cap = cfg.orbital_cap,
+                rec = localrec,
+            ),
+        )
     end
 end
 function lrrap_step(orbitals, previous, H, green, cfg, rec; work_tol = 0.0, potential = nothing)
@@ -792,31 +800,79 @@ function compress_orbitals(orbitals, cfg; tol = cfg.orbital_tolerance, input_gra
 end
 
 # VectorInterface keeps solver tolerances and rank caps separate from the stored QTT type.
-struct QTTVector
-    psi::QTT
+mutable struct QTTVector
+    psi::Union{QTT,QTTExpression}
     tol::Float64
     cap::Int
+    rec::Recorder
 end
 VI.scalartype(::Type{QTTVector}) = ComplexF64
-VI.inner(x::QTTVector, y::QTTVector) = inner(x.psi, y.psi)
-LinearAlgebra.norm(x::QTTVector) = ttnorm(x.psi)
+function reconstruct_orbital!(x::QTTVector)
+    if x.psi isa QTTExpression
+        expression = x.psi
+        x.psi =
+            isempty(expression.terms) ? constant_tt(expression.R, 0) :
+            linear_combination(
+                x.rec,
+                expression.terms,
+                expression.coefficients;
+                tol = x.tol,
+                cap = x.cap,
+                label = "krylov_combination",
+            )
+    end
+    x.psi::QTT
+end
+VI.inner(x::QTTVector, y::QTTVector) = x === y ? ComplexF64(norm(x)^2) : inner(x.psi, y.psi)
+LinearAlgebra.norm(x::QTTVector) = ttnorm(reconstruct_orbital!(x))
 VI.zerovector(x::QTTVector, ::Type{<:Number}) =
-    QTTVector(constant_tt(length(x.psi), 0), x.tol, x.cap)
+    QTTVector(linear_expression((x.psi,), (0,)), x.tol, x.cap, x.rec)
 VI.zerovector!!(x::QTTVector) = VI.zerovector(x)
-VI.scale(x::QTTVector, a::Number) = QTTVector(scale(x.psi, a), x.tol, x.cap)
+VI.scale(x::QTTVector, a::Number) =
+    QTTVector(linear_expression((x.psi,), (a,)), x.tol, x.cap, x.rec)
 VI.scale!!(x::QTTVector, a::Number) = VI.scale(x, a)
 VI.scale!!(::QTTVector, x::QTTVector, a::Number) = VI.scale(x, a)
 function VI.add(y::QTTVector, x::QTTVector, a::Number, b::Number)
     iszero(a) && return VI.scale(y, b)
     iszero(b) && return VI.scale(x, a)
-    # Use TT addition for recurrence algebra, with exact contractions for overlaps.
-    psi = add(y.psi, x.psi; a = b, b = a, tol = y.tol, cap = y.cap)
-    QTTVector(psi, y.tol, y.cap)
+    # Accumulate projection coefficients; fit once when a norm or operator needs cores.
+    psi = linear_expression((y.psi, x.psi), (b, a))
+    QTTVector(psi, y.tol, y.cap, y.rec)
 end
 VI.add!!(y::QTTVector, x::QTTVector, a::Number, b::Number) = VI.add(y, x, a, b)
 
-"Advance a scalar or block Lanczos factorization and extract its lowest Ritz orbitals."
-function lanczos_step(orbitals, subspace, H, cfg, rec; work_tol, ritz_tol, potential)
+function lanczos_orbitals(factorization, norbitals, cfg, rec; tol)
+    dimension = length(factorization)
+    projected =
+        norbitals == 1 ? KrylovKit.rayleighquotient(factorization) :
+        Hermitian(view(factorization.H, 1:dimension, 1:dimension))
+    spectrum = eigen(projected)
+    basis = reconstruct_orbital!.(KrylovKit.basis(factorization))
+    orbitals = combine_orbitals(
+        basis,
+        spectrum.vectors[:, 1:norbitals],
+        cfg,
+        rec;
+        tol,
+        cap = cfg.orbital_cap,
+        label = "lanczos_ritz",
+    )
+    # Repair the returned orbitals without changing the retained recurrence basis.
+    orthogonalize(orbitals, cfg, rec)
+end
+
+"Advance Lanczos; reconstruct Ritz orbitals only when a caller or restart needs them."
+function lanczos_step(
+    orbitals,
+    subspace,
+    H,
+    cfg,
+    rec;
+    work_tol,
+    ritz_tol,
+    potential,
+    extract_ritz = true,
+)
     norbitals = length(orbitals)
     limit = min(2^cfg.R, max(16, 4norbitals))
     width =
@@ -828,14 +884,26 @@ function lanczos_step(orbitals, subspace, H, cfg, rec; work_tol, ritz_tol, poten
         KrylovKit.normres(subspace.factorization) <= sqrt(width) * residual_floor
     restarted = subspace !== nothing && !breakdown && length(subspace.factorization) + width > limit
     initialized = subspace === nothing || restarted
+    if restarted && subspace.ritz_dimension != length(subspace.factorization)
+        orbitals, _ = lanczos_orbitals(subspace.factorization, norbitals, cfg, rec; tol = ritz_tol)
+    end
     if initialized
         action =
             x -> QTTVector(
-                h_action(H, x.psi, cfg, rec; label = "lanczos_action", work_tol, potential),
+                h_action(
+                    H,
+                    reconstruct_orbital!(x),
+                    cfg,
+                    rec;
+                    label = "lanczos_action",
+                    work_tol,
+                    potential,
+                ),
                 work_tol,
                 cfg.work_cap,
+                rec,
             )
-        initial = [QTTVector(psi, work_tol, cfg.work_cap) for psi in orbitals]
+        initial = [QTTVector(psi, work_tol, cfg.work_cap, rec) for psi in orbitals]
         # A block preserves independent directions within degenerate eigenspaces.
         iterator = if norbitals == 1
             KrylovKit.LanczosIterator(action, only(initial), KrylovKit.ModifiedGramSchmidt2())
@@ -850,7 +918,7 @@ function lanczos_step(orbitals, subspace, H, cfg, rec; work_tol, ritz_tol, poten
         end
         factorization = KrylovKit.initialize(iterator)
         length(factorization) >= norbitals || error("The initial Lanczos block lost occupied rank")
-        subspace = (; iterator, factorization, gram_defect = Inf)
+        subspace = (; iterator, factorization, gram_defect = nothing, ritz_dimension = 0)
     end
     factorization = subspace.factorization
     previous_dimension = length(factorization)
@@ -862,26 +930,10 @@ function lanczos_step(orbitals, subspace, H, cfg, rec; work_tol, ritz_tol, poten
         KrylovKit.expand!(subspace.iterator, factorization)
     end
     dimension = length(factorization)
-    basis = [x.psi for x in KrylovKit.basis(factorization)]
-    if initialized || dimension > previous_dimension
-        projected = if norbitals == 1
-            KrylovKit.rayleighquotient(factorization) # Real symmetric tridiagonal matrix.
-        else
-            Hermitian(view(factorization.H, 1:dimension, 1:dimension)) # Block tridiagonal.
-        end
-        spectrum = eigen(projected)
-        orbitals = combine_orbitals(
-            basis,
-            spectrum.vectors[:, 1:norbitals],
-            cfg,
-            rec;
-            tol = ritz_tol,
-            cap = cfg.orbital_cap,
-            label = "lanczos_ritz",
-        )
-        # Repair only the returned orbitals; the retained recurrence basis must stay fixed.
-        orbitals, gram_defect = orthogonalize(orbitals, cfg, rec)
-        subspace = (; subspace.iterator, factorization, gram_defect)
+    basis = reconstruct_orbital!.(KrylovKit.basis(factorization))
+    if extract_ritz && subspace.ritz_dimension != dimension
+        orbitals, gram_defect = lanczos_orbitals(factorization, norbitals, cfg, rec; tol = ritz_tol)
+        subspace = (; subspace.iterator, factorization, gram_defect, ritz_dimension = dimension)
     end
     width = norbitals == 1 ? 1 : length(KrylovKit.residual(factorization))
     breakdown = KrylovKit.normres(factorization) <= sqrt(width) * residual_floor
@@ -893,7 +945,7 @@ function lanczos_step(orbitals, subspace, H, cfg, rec; work_tol, ritz_tol, poten
         restarted,
         breakdown,
         recurrence_residual = KrylovKit.normres(factorization),
-        gram_defect = subspace.gram_defect,
+        gram_defect = subspace.ritz_dimension == dimension ? subspace.gram_defect : nothing,
         work_tolerance = work_tol,
         work_rank_cap = cfg.work_cap,
         max_trial_bond = maximum(rank, basis),
@@ -952,7 +1004,8 @@ end
 function extend_subspace(basis, directions, room, cfg, rec; tol, metric = gram(basis; cfg))
     (isempty(directions) || room == 0) && return QTT[]
     norms = ttnorm.(directions)
-    directions = [scale(x, inv(n)) for (x, n) in zip(directions, norms) if n > 100eps(Float64)]
+    active = findall(>(100eps(Float64)), norms)
+    directions, norms = directions[active], norms[active]
     isempty(directions) && return directions
     # Compression can spoil basis orthogonality; use the full Gram pseudoinverse.
     projection =
@@ -961,30 +1014,27 @@ function extend_subspace(basis, directions, room, cfg, rec; tol, metric = gram(b
             rtol = cfg.metric_relative_cutoff,
             atol = cfg.metric_absolute_cutoff,
         ) * gram(basis, directions; cfg)
-    remainders = combine_orbitals(
-        vcat(basis, directions),
-        vcat(-projection, Matrix{ComplexF64}(I, length(directions), length(directions))),
-        cfg,
-        rec;
-        tol,
-        cap = cfg.work_cap,
-        label = "davidson_direction",
-    )
     appended = KrylovKit.OrthonormalBasis{QTTVector}()
     orth = KrylovKit.ModifiedGramSchmidt2()
     norm_floor = max(tol, 100eps(Float64))
-    for remainder in remainders
+    for i in eachindex(directions)
+        # Keep the projection as coefficients until an independent direction is needed.
+        remainder =
+            linear_expression(vcat(basis, [directions[i]]), vcat(-projection[:, i], 1) ./ norms[i])
         n = ttnorm(remainder)
         n > norm_floor || continue
-        vector = QTTVector(scale(remainder, inv(n)), tol, cfg.work_cap)
+        vector = QTTVector(scale(remainder, inv(n)), tol, cfg.work_cap, rec)
         # Test dependence within the new block after removing the retained space.
         vector, _ = KrylovKit.orthogonalize!!(vector, appended, orth)
+        ttnorm(vector.psi)^2 > max(cfg.metric_relative_cutoff, cfg.metric_absolute_cutoff) ||
+            continue
+        # One fit for the accepted expression; its stored norm sets normalization.
         n = norm(vector)
-        n^2 > max(cfg.metric_relative_cutoff, cfg.metric_absolute_cutoff) || continue
+        n > norm_floor || continue
         push!(appended, VI.scale!!(vector, inv(n)))
         length(appended) == room && break
     end
-    [x.psi for x in appended]
+    reconstruct_orbital!.(appended)
 end
 
 function davidson_directions(solver, orbitals, energies, H, green, cfg, rec, potential; tol)
@@ -1004,10 +1054,16 @@ function davidson_directions(solver, orbitals, energies, H, green, cfg, rec, pot
     norms = ttnorm.(residuals)
     selected = findall(>(max(cfg.eigen_tolerance, tol, 100eps(Float64))), norms)
     solver == :davidson && !isempty(selected) && (selected = [argmax(norms)])
-    candidates = independent_map(QTT, length(selected), cfg) do j
+    candidates = recorded_map(QTT, length(selected), cfg, rec) do j, localrec
         i = selected[j]
         # Normalize the inverse's input so its work budget is independent of residual size.
-        apply_mpo(green, scale(residuals[i], inv(norms[i])); tol, cap = cfg.work_cap)
+        apply_mpo(
+            green,
+            scale(residuals[i], inv(norms[i]));
+            tol,
+            cap = cfg.work_cap,
+            rec = localrec,
+        )
     end
     candidates, maximum(norms), norm(norms) / sqrt(length(norms))
 end

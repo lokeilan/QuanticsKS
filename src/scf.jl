@@ -114,6 +114,7 @@ function ground_state(
                         work_tol = min(accuracy.work_tolerance, cfg.eigen_tolerance / 10),
                         ritz_tol = cfg.orthogonalization_tolerance,
                         potential = subspace_field,
+                        extract_ritz = j == scf.inner_steps,
                     )
                 else
                     orbitals, subspace, metrics = Q.davidson_step(

@@ -246,6 +246,12 @@ function compensated_sum(values)
     total
 end
 
+inner(x::QTTExpression, y::QTT; cfg = (;)) =
+    compensated_sum(conj(c) * inner(t, y; cfg) for (t, c) in zip(x.terms, x.coefficients))
+inner(x::QTT, y::QTTExpression; cfg = (;)) = conj(inner(y, x; cfg))
+inner(x::QTTExpression, y::QTTExpression; cfg = (;)) =
+    compensated_sum(c * inner(x, t; cfg) for (t, c) in zip(y.terms, y.coefficients))
+
 struct ExpressionEvaluator
     evaluators::Vector{Evaluator}
     coefficients::Vector{ComplexF64}
@@ -394,6 +400,8 @@ function expression_gram(xs; rec = nothing)
     G
 end
 
+ttnorm(x::QTTExpression) = sqrt(max(0, real(only(expression_gram([x])))))
+
 function difference_norm(x::QTT, y::QTT; rec = nothing, label = "density_difference_norm")
     expression_stage(rec, label) do
         residual = linear_expression((x, y), (1, -1))
@@ -466,7 +474,7 @@ function shift_mpo(R::Int, step::Int = 1; boundary = :periodic)
     cores
 end
 "Apply an MPO with library-owned canonicalization and rank control."
-function apply_mpo(w, x::QTT; tol = 1e-11, cap = 64, algorithm = :zipup)
+function apply_mpo(w, x::QTT; tol = 1e-11, cap = 64, algorithm = :zipup, rec = nothing)
     validate_truncation(tol, cap)
     length(w) == length(x) || throw(DimensionMismatch("MPO action lengths"))
     if algorithm === :TCI

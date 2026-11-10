@@ -114,6 +114,8 @@ budget raises an error.
 `"lanczos"` uses a scalar three-term recurrence for one orbital and block
 Lanczos for several orbitals. Each `inner_steps` update advances one recurrence
 step, with an explicit restart when the trial space reaches its size limit.
+SCF reconstructs Ritz orbitals at a restart and at the final inner step;
+fixed-potential spectra reconstruct them for each physical diagnostic.
 The shared working tolerance and rank cap also control its QTT vector algebra.
 `"davidson"` and `"block_davidson"` select generalized Davidson with the
 shifted kinetic inverse, controlled by `scf.green_shift`. The first expands

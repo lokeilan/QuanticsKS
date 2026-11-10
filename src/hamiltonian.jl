@@ -689,14 +689,36 @@ function green_residual(G::CartesianGreen, psi, rhs)
     Q.linear_expression((rhs, kinetic_expression(G.kinetic, psi), psi), (1, -1, -G.shift))
 end
 
-function Q.apply_mpo(G::CartesianGreen, rhs::Q.QTT; tol = 1e-11, cap = G.cap, kwargs...)
+function Q.apply_mpo(
+    G::CartesianGreen,
+    rhs::Q.QTT;
+    tol = 1e-11,
+    cap = G.cap,
+    rec = recorder(nothing, TCIOptions()),
+)
     Q.validate_truncation(tol, cap)
     target = G.tolerance
     work_tolerance = min(max(tol, eps(Float64)), target / 100)
     work_cap = max(cap, G.cap)
-    combine(xs, ws) =
-        Q.reconstruct_expression(Q.linear_expression(xs, ws); tol = work_tolerance, cap = work_cap)
-    action(x) = combine((kinetic_expression(G.kinetic, x), x), (1, G.shift))
+    combine(xs, ws) = Q.linear_combination(
+        rec,
+        xs,
+        ws;
+        tol = work_tolerance,
+        cap = work_cap,
+        label = "green_combination",
+    )
+    # Evaluate all six neighbors in one FD2 expression, without constructing shifted states.
+    accuracy = (; algebra_tolerance = work_tolerance, work_cap)
+    action(x) = Q.h_residual(
+        G.kinetic,
+        x,
+        -G.shift,
+        accuracy,
+        rec;
+        potential = _ -> 0.0,
+        label = "green_action",
+    )
     rhs_norm = Q.ttnorm(rhs)
     rhs_norm == 0 && return Q.constant_tt(length(rhs), 0)
     x, r, direction = Q.constant_tt(length(rhs), 0), rhs, rhs

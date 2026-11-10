@@ -88,8 +88,9 @@ operation uses truncated QTT conjugate gradients. It accepts a result only when
 the residual of the stored state meets `green_relative_tolerance`. That residual
 uses exact open shifts and an untruncated linear expression, with a QR fallback
 for cancellation. Fine 3D grids can require many CG iterations and large ranks.
-The Green action and its residual share one FD2 expression. Its exact shift
-terms are combined before the working result is compressed.
+The Green iteration samples the complete FD2 action and its vector updates,
+without constructing the six shifted QTT states. Acceptance still contracts
+the untruncated discrete residual independently of these sampled updates.
 
 ## Lanczos and Davidson solvers
 
@@ -114,8 +115,11 @@ Gram-Schmidt reorthogonalization and deflates dependent residual directions.
 An invariant subspace ends expansion before a zero residual is normalized;
 subsequent calls reuse the existing orbitals without refitting or restarting.
 
-Lanczos and Davidson share a `QTTVector` adapter for exact QTT inner products
-and TT addition with the effective working tolerance and `work_cap`.
+Lanczos and Davidson share a `QTTVector` adapter. Consecutive projection
+updates retain a linear expression over existing QTT states. Inner products
+contract its terms directly; a norm or operator action constructs the combined
+state with TCI at the effective working tolerance and `work_cap`. This avoids
+constructing and compressing a separate QTT for every Gram-Schmidt subtraction.
 Hamiltonian actions use the same sampled FD2 expression as the physical residual.
 QTT fitting and truncation make these actions inexact, so the recurrence residual is a diagnostic, not an acceptance
 criterion. The solver checks the residuals of the reconstructed orbitals
@@ -137,16 +141,19 @@ The sign of `t_i` does not change the expanded subspace.
 Residuals below `eigen_tolerance` do not generate corrections. The retained
 space is removed using `LinearAlgebra.pinv` of its full Gram matrix, since
 QTT compression can change basis orthogonality. The Gram matrix is reused
-from the previous Ritz projection while that basis is unchanged. KrylovKit's
-two-pass modified Gram-Schmidt selects independent directions within the new
-block. The small Ritz problem also uses the full overlap matrix; canonical
+from the previous Ritz projection while that basis is unchanged. Projected
+corrections remain linear expressions during dependence screening and
+KrylovKit's two-pass modified Gram-Schmidt. Directions that survive screening
+are fitted, and their stored norms determine normalization. Small expression norms use an
+amplitude-space QR fallback to avoid subtracting nearly equal squared norms.
+The small Ritz problem also uses the full overlap matrix; canonical
 orthogonalization drops overlap eigenvalues below the metric cutoffs.
 
 KrylovKit supplies the Lanczos recurrence and the shared orthogonalization,
 but has no Davidson eigensolver. The Davidson iteration remains in
 `solvers.jl`; its QTT corrections, rank controls, and shared SCF interface
 do not require a dense spatial vector. Small projected eigenproblems use
-Julia's `LinearAlgebra.eigen`, TT addition uses TensorCrossInterpolation,
+Julia's `LinearAlgebra.eigen`, combined states use TensorCrossInterpolation,
 and the existing MPO application uses ITensorMPS.
 
 The trial dimension is capped at the smaller of the grid size and
@@ -154,6 +161,9 @@ The trial dimension is capped at the smaller of the grid size and
 factorization from the current Ritz orbital or block; each inner update
 advances one recurrence step. Davidson also restarts from the current Ritz
 orbitals. SCF starts a new search space for each new Hamiltonian.
+Within SCF, Lanczos reconstructs Ritz orbitals only for a restart or the final
+inner step. Fixed-potential spectra reconstruct them at every requested
+physical diagnostic. A deferred step leaves the orbital Gram metric unset.
 Ritz reconstruction shares a basis cache across orbitals. A Gram check after
 fitting determines whether the returned orbitals need orthogonality repair;
 this repair does not alter the retained Lanczos basis.
