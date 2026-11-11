@@ -90,7 +90,7 @@ function map_slice(f, ::Type{T}, R, left, right, ::Val{M}) where {T,M}
     reshape(out, length(left), ntuple(_ -> 2, M)..., length(right))
 end
 
-"Fill missing entries in rectangular batches without reevaluating cached points."
+"Fill cache misses with bounded rectangular contractions."
 function cached_slice!(compute, cache::SampleCache{T}, R, left, right, middle::Val{M}) where {T,M}
     if isempty(left) || isempty(right)
         return Array{T,M + 2}(undef, ntuple(_ -> 0, M + 2)), 0, 0
@@ -119,26 +119,29 @@ function cached_slice!(compute, cache::SampleCache{T}, R, left, right, middle::V
         end
         return result, nmissing, 1
     end
-    # For each central configuration, combine columns having the same missing
-    # row set. Each subproblem is still a matrix contraction, with M=0.
+    # A separate contraction for every missing-row pattern fragments a TT slice.
+    # Use one rectangle per central configuration, retaining its matrix structure.
     batches = 0
+    evaluations = 0
     for m = 1:(1 << M)
-        groups = Dict{Tuple{Vararg{Int}},Vector{Int}}()
-        for j in eachindex(right)
-            rows = Tuple(findall(view(mask, :, m, j)))
-            isempty(rows) || push!(get!(() -> Int[], groups, rows), j)
-        end
-        for (rows, columns) in groups
-            extended = [vcat(left[i], bits(m - 1, M)) for i in rows]
-            values = compute(extended, right[columns], Val(0))
-            for (jj, j) in enumerate(columns), (ii, i) in enumerate(rows)
+        missing_slice = view(mask, :, m, :)
+        rows = findall(vec(any(missing_slice; dims = 2)))
+        isempty(rows) && continue
+        columns = findall(vec(any(missing_slice; dims = 1)))
+        extended = [vcat(left[i], bits(m - 1, M)) for i in rows]
+        values = compute(extended, right[columns], Val(0))
+        size(values) == (length(rows), length(columns)) ||
+            throw(DimensionMismatch("Batch result shape"))
+        for (jj, j) in enumerate(columns), (ii, i) in enumerate(rows)
+            if mask[i, m, j]
                 index = lp[i] | ((m - 1) << nl) | (rp[j] << (nl + M))
                 out[i, m, j] = cache_put!(cache, index, values[ii, jj])
             end
-            batches += 1
         end
+        evaluations += length(values)
+        batches += 1
     end
-    result, nmissing, batches
+    result, evaluations, batches
 end
 
 # Use endpoint dot products when both ends cover the grid; contract larger-grid slices.
@@ -173,10 +176,17 @@ function TensorSamples(e::Evaluator; tt_cache_capacity = 2048)
     tt_cache = e.prefix + e.suffix == length(e.x) ? nothing : TCI.TTCache(e.x.c)
     TensorSamples(e, tt_cache, tt_cache_capacity)
 end
-sampled(x::QTT, rec) = TensorSamples(
-    evaluate(x, rec);
-    tt_cache_capacity = get(rec.options, :slice_cache_capacity, 2048),
-)
+function sampled(x::QTT, rec)
+    budget = rec.options.environment_cache_max_bytes
+    plan = endpoint_plan((x,), 3budget ÷ 4)
+    evaluator = Evaluator(x; plan)
+    entry_bytes = 16rank(x) + 128 + 8length(x)
+    capacity = min(
+        rec.options.slice_cache_capacity,
+        (budget - plan.bytes - plan.buffer_bytes) ÷ entry_bytes,
+    )
+    TensorSamples(evaluator; tt_cache_capacity = capacity)
+end
 sample_length(f::TensorSamples) = length(f.evaluator.x)
 uses_batch_contraction(::TensorSamples) = true
 uses_scalar_evaluation(f::TensorSamples) =
@@ -196,12 +206,52 @@ function trim_tt_cache!(tt_cache, capacity)
         end
     end
 end
-function (f::TensorSamples)(left, right, middle::Val)
+
+"Reuse endpoint tables in partial-grid batches without expanding them into dictionaries."
+function cache_endpoint_tables!(f::TensorSamples, left, right)
+    evaluator, tt_cache = f.evaluator, f.tt_cache
+    p, s = evaluator.prefix, evaluator.suffix
+    if 2 <= p <= length(first(left))
+        cache = tt_cache.cacheleft[p]
+        for indices in left
+            key = indices[1:p]
+            haskey(cache, key) || (cache[key] = copy(view(evaluator.left, :, indexof(key) + 1)))
+        end
+    end
+    if 2 <= s <= length(first(right))
+        cache = tt_cache.cacheright[length(evaluator.x) - s + 1]
+        for indices in right
+            key = indices[(end - s + 1):end]
+            haskey(cache, key) || (cache[key] = copy(view(evaluator.right, :, indexof(key) + 1)))
+        end
+    end
+    nothing
+end
+
+function (f::TensorSamples)(left, right, middle::Val{M}) where {M}
     tt_cache = f.tt_cache
     tt_cache === nothing &&
         return map_slice(f.evaluator, ComplexF64, sample_length(f), left, right, middle)
-    result = TCI.batchevaluate(tt_cache, left, right, middle)
-    trim_tt_cache!(tt_cache, f.tt_cache_capacity)
+    (isempty(left) || isempty(right)) &&
+        return map_slice(f.evaluator, ComplexF64, sample_length(f), left, right, middle)
+    nl, nr = length(first(left)), length(first(right))
+    capacity = f.tt_cache_capacity
+    # Reserve all possible new prefix entries before a library batch, not after
+    # its temporary cache growth. Tiny budgets use the bounded point evaluator.
+    capacity < nl + nr &&
+        return map_slice(f.evaluator, ComplexF64, sample_length(f), left, right, middle)
+    rows = min(length(left), max(1, min(capacity ÷ 2, capacity - nr) ÷ max(nl, 1)))
+    columns = min(length(right), max(1, (capacity - rows * nl) ÷ max(nr, 1)))
+    result = Array{ComplexF64}(undef, length(left), ntuple(_ -> 2, M)..., length(right))
+    view_result = reshape(result, length(left), 1 << M, length(right))
+    for j = 1:columns:length(right), i = 1:rows:length(left)
+        ir, jr = i:min(i + rows - 1, length(left)), j:min(j + columns - 1, length(right))
+        reserve = length(ir) * nl + length(jr) * nr
+        trim_tt_cache!(tt_cache, capacity - reserve)
+        cache_endpoint_tables!(f, left[ir], right[jr])
+        values = TCI.batchevaluate(tt_cache, left[ir], right[jr], middle)
+        view_result[ir, :, jr] = reshape(values, length(ir), 1 << M, length(jr))
+    end
     result
 end
 
@@ -361,32 +411,51 @@ mutable struct BlockEvaluator
     evaluations::Int
     uses_endpoint_contraction::Bool
     parallel_tasks::Int
+    endpoint_bytes::Int
+    buffer_bytes::Int
+    workspace_bytes::Int
+    budget_bytes::Int
 end
 function BlockEvaluator(
     xs;
     cap = 8192,
-    cachebits = 10,
     tt_cache_capacity = 2048,
-    dense_limit = 0,
-    max_bytes = 64 * 1024^2,
+    max_bytes = 128 * 1024^2,
     parallel_tasks = 1,
 )
-    evaluators = [Evaluator(x; cachebits) for x in xs]
-    samples = [TensorSamples(e; tt_cache_capacity) for e in evaluators]
     R = length(first(xs))
-    # Include vector headers and references; values are populated only on demand.
-    bytes_per_point = sizeof(ComplexF64) * length(evaluators) + 64
-    limit = min(dense_limit, max_bytes ÷ bytes_per_point)
-    cache = SampleCache{Vector{ComplexF64}}(R; capacity = cap, dense_limit = limit)
+    # Reserve construction/fit workspace and CLOCK metadata before choosing endpoints.
+    bytes_per_point = sizeof(ComplexF64) * length(xs) + 256
+    workspace_bytes = max_bytes ÷ 16
+    capacity = min(cap, max_bytes ÷ (8bytes_per_point))
+    capacity > 0 || throw(ArgumentError("Orbital cache budget cannot hold one block sample"))
+    sample_bytes = capacity * bytes_per_point
+    workers = parallel_workers((; parallel_tasks), typemax(Int))
+    worker_buffer_bytes = workers <= 1 ? 0 : workers * 32sum(x -> max(rank(x), 1), xs)
+    endpoint_budget = max_bytes - workspace_bytes - sample_bytes - worker_buffer_bytes
+    plan = endpoint_plan(xs, endpoint_budget)
+    if plan.prefix + plan.suffix < R
+        plan = endpoint_plan(xs, endpoint_budget - workspace_bytes)
+    end
+    evaluators = [Evaluator(x; plan) for x in xs]
+    entry_bytes = 16maximum(rank, xs) + 128 + 8R
+    contraction_capacity = min(tt_cache_capacity, workspace_bytes ÷ (length(xs) * entry_bytes))
+    samples = [TensorSamples(e; tt_cache_capacity = contraction_capacity) for e in evaluators]
+    # Use the same bounded addressing at every R; no full-grid allocation threshold.
+    cache = SampleCache{Vector{ComplexF64}}(R; capacity)
     BlockEvaluator(
         evaluators,
         samples,
         cache,
-        isempty(cache.values) ? cap : length(cache.values),
+        capacity,
         0,
         0,
         all(uses_scalar_evaluation, samples),
         parallel_tasks,
+        plan.bytes,
+        plan.buffer_bytes + worker_buffer_bytes,
+        workspace_bytes,
+        max_bytes,
     )
 end
 uses_scalar_evaluation(o::BlockEvaluator) = o.uses_endpoint_contraction
@@ -399,23 +468,27 @@ function (o::BlockEvaluator)(j::Int)
     end
     value
 end
+function evaluate_block_slice(o::BlockEvaluator, left, right, middle::Val{M}) where {M}
+    shape = (length(left), ntuple(_ -> 2, M)..., length(right))
+    out = Array{Vector{ComplexF64}}(undef, shape)
+    for i in eachindex(out)
+        out[i] = Vector{ComplexF64}(undef, length(o.samples))
+    end
+    for k in eachindex(o.samples)
+        column = o.samples[k](left, right, middle)
+        for i in eachindex(out)
+            out[i][k] = column[i]
+        end
+    end
+    out
+end
 function (o::BlockEvaluator)(left, right, middle::Val{M}) where {M}
     R = sample_length(first(o.samples))
     uses_scalar_evaluation(o) && return map_slice(o, Vector{ComplexF64}, R, left, right, middle)
     o.requests += length(left) * (1 << M) * length(right)
     result, evaluations, _ = cached_slice!(o.cache, R, left, right, middle) do l, r, m
-        columns = independent_map(
-            Array{ComplexF64,M + 2},
-            length(o.samples),
-            (; parallel_tasks = o.parallel_tasks),
-        ) do i
-            o.samples[i](l, r, m)
-        end
-        out = Array{Vector{ComplexF64}}(undef, size(first(columns)))
-        for i in eachindex(out)
-            out[i] = ComplexF64[c[i] for c in columns]
-        end
-        out
+        # Partially cached requests use matrix sub-batches with m = Val(0).
+        evaluate_block_slice(o, l, r, m)
     end
     o.evaluations += evaluations
     result
@@ -426,6 +499,12 @@ block_cache_stats(o::BlockEvaluator) = (;
     block_cache_evictions = o.cache.evictions,
     block_sample_requests = o.requests,
     block_sample_evaluations = o.evaluations,
+    endpoint_bytes = o.endpoint_bytes,
+    block_buffer_bytes = o.buffer_bytes,
+    endpoint_prefix = first(o.evaluators).prefix,
+    endpoint_suffix = first(o.evaluators).suffix,
+    block_workspace_bytes = o.workspace_bytes,
+    block_budget_bytes = o.budget_bytes,
 )
 
 struct LinearSamples{O} <: SampledFunction
@@ -438,9 +517,7 @@ uses_scalar_evaluation(f::LinearSamples) = uses_scalar_evaluation(f.evaluator)
 # Linear-combination coefficients are not conjugated.
 (f::LinearSamples)(j::Int) = transpose(f.weights) * f.evaluator(j)
 function (f::LinearSamples)(left, right, middle::Val)
-    values = f.evaluator(left, right, middle)
-    isempty(values) && return zeros(ComplexF64, size(values))
-    map(v -> transpose(f.weights) * v, values)
+    reduce_block_slice(v -> transpose(f.weights) * v, f.evaluator, left, right, middle)
 end
 
 struct DensitySamples{O} <: SampledFunction
@@ -454,7 +531,7 @@ weighted_density(weights, values) =
     ComplexF64(sum(weights[i] * abs2(values[i]) for i in eachindex(weights, values)))
 (f::DensitySamples)(j::Int) = weighted_density(f.weights, f.evaluator(j))
 function (f::DensitySamples)(left, right, middle::Val)
-    map(v -> weighted_density(f.weights, v), f.evaluator(left, right, middle))
+    reduce_block_slice(v -> weighted_density(f.weights, v), f.evaluator, left, right, middle)
 end
 
 sample_length(o::BlockEvaluator) = sample_length(first(o.samples))
@@ -487,6 +564,112 @@ function (f::Union{SynchronizedSamples,SynchronizedBlockEvaluator})(left, right,
     end
 end
 block_cache_stats(f::SynchronizedBlockEvaluator) = block_cache_stats(f.input)
+
+block_workspace(o::BlockEvaluator) = o.workspace_bytes, length(o.samples)
+block_workspace(o::SynchronizedBlockEvaluator) = block_workspace(o.input)
+"Reduce bounded orbital rectangles immediately, retaining only the consumer's scalar slice."
+function reduce_block_slice(reduce, evaluator, left, right, middle::Val{M}) where {M}
+    budget, orbitals = block_workspace(evaluator)
+    points = max(1, budget ÷ (2 * (16orbitals + 256) * (1 << M)))
+    rows = min(length(left), max(1, floor(Int, sqrt(points))))
+    columns = max(1, points ÷ max(1, rows))
+    out = Array{ComplexF64}(undef, length(left), 1 << M, length(right))
+    for j = 1:columns:length(right), i = 1:max(1, rows):length(left)
+        ir, jr = i:min(i + rows - 1, length(left)), j:min(j + columns - 1, length(right))
+        values = reshape(evaluator(left[ir], right[jr], middle), length(ir), 1 << M, length(jr))
+        for c in eachindex(jr), m = 1:(1 << M), r in eachindex(ir)
+            out[ir[r], m, jr[c]] = reduce(values[r, m, c])
+        end
+    end
+    reshape(out, length(left), ntuple(_ -> 2, M)..., length(right))
+end
+
+"Private contraction buffers per worker Task; endpoint matrices are shared read-only."
+struct WorkerBlockEvaluators
+    template::BlockEvaluator
+    capacity::Int
+    tt_cache_capacity::Int
+    workers::Int
+    evaluators::IdDict{Task,BlockEvaluator}
+    mutex::ReentrantLock
+end
+
+function orbital_evaluators(xs, columns, cfg, rec; group_size = 1)
+    template = block_evaluator(xs, rec)
+    workers = parallel_workers(cfg, cld(columns, group_size))
+    slice_capacity = first(template.samples).tt_cache_capacity
+    if workers <= 1 || template.cap < workers
+        return synchronized(template)
+    end
+    WorkerBlockEvaluators(
+        template,
+        template.cap ÷ workers,
+        slice_capacity ÷ workers,
+        workers,
+        IdDict{Task,BlockEvaluator}(),
+        ReentrantLock(),
+    )
+end
+
+orbital_evaluator(evaluator::SynchronizedBlockEvaluator) = evaluator
+function orbital_evaluator(workers::WorkerBlockEvaluators)
+    # Setup alone is synchronized. Each Task owns all mutable contraction state.
+    lock(workers.mutex) do
+        get!(workers.evaluators, current_task()) do
+            template = workers.template
+            evaluators = [
+                Evaluator(
+                    e.x,
+                    similar(e.buffer),
+                    similar(e.next_buffer),
+                    e.left,
+                    e.right,
+                    e.prefix,
+                    e.suffix,
+                ) for e in template.evaluators
+            ]
+            samples = [
+                TensorSamples(e; tt_cache_capacity = workers.tt_cache_capacity) for e in evaluators
+            ]
+            cache = SampleCache{Vector{ComplexF64}}(
+                sample_length(template);
+                capacity = workers.capacity,
+            )
+            BlockEvaluator(
+                evaluators,
+                samples,
+                cache,
+                workers.capacity,
+                0,
+                0,
+                template.uses_endpoint_contraction,
+                1,
+                template.endpoint_bytes,
+                32sum(e -> max(rank(e.x), 1), evaluators),
+                template.workspace_bytes ÷ workers.workers,
+                template.budget_bytes,
+            )
+        end
+    end
+end
+
+function block_cache_stats(workers::WorkerBlockEvaluators)
+    evaluators = collect(values(workers.evaluators))
+    (;
+        block_cache_mode = "worker_local_bounded_clock",
+        block_cache_workers = length(evaluators),
+        block_cache_capacity = sum(e.cap for e in evaluators),
+        block_cache_evictions = sum(e.cache.evictions for e in evaluators),
+        block_sample_requests = sum(e.requests for e in evaluators),
+        block_sample_evaluations = sum(e.evaluations for e in evaluators),
+        endpoint_bytes = workers.template.endpoint_bytes,
+        block_buffer_bytes = workers.template.buffer_bytes,
+        endpoint_prefix = first(workers.template.evaluators).prefix,
+        endpoint_suffix = first(workers.template.evaluators).suffix,
+        block_workspace_bytes = workers.template.workspace_bytes,
+        block_budget_bytes = workers.template.budget_bytes,
+    )
+end
 
 # TCI fitting, pivot reuse, and fit records.
 
@@ -724,13 +907,11 @@ end
 debug_snapshot(r::Recorder, name, data) =
     r.dir === nothing ? nothing : serialize(joinpath(r.dir, name), data)
 
-evaluate(x, r::Recorder) = Evaluator(x; cachebits = r.options.environment_cache_bits)
+evaluate(x, r::Recorder) = Evaluator(x; max_bytes = r.options.environment_cache_max_bytes)
 block_evaluator(xs, r::Recorder) = BlockEvaluator(
     xs;
     cap = r.options.orbital_cache_capacity,
-    cachebits = r.options.environment_cache_bits,
     tt_cache_capacity = get(r.options, :slice_cache_capacity, 2048),
-    dense_limit = get(r.options, :dense_cache_max_points, 262144),
     max_bytes = get(r.options, :orbital_cache_max_bytes, 64 * 1024^2),
     parallel_tasks = get(r.options, :parallel_tasks, 1),
 )
@@ -747,6 +928,7 @@ function cross(
     pivots = Int[],
     shared_pivots = "",
     initial_zero_fallback = nothing,
+    require_convergence = r.options.require_convergence,
     rounding_tolerance = iszero(r.options.post_rounding_factor) ? nothing :
                          tol * r.options.post_rounding_factor,
 )
@@ -921,7 +1103,7 @@ function cross(
             post_rounding_tolerance = rounding_tolerance,
         ),
     )
-    r.options.require_convergence &&
+    require_convergence &&
         (isempty(err) || last(err) > tol) &&
         error("TCI did not meet tolerance: $label")
     if tci !== nothing
@@ -939,7 +1121,9 @@ function linear_combination(
     cap = 64,
     label = "linear_combination",
     evaluator = nothing,
+    samples = nothing,
     shared_pivots = "",
+    require_convergence = rec.options.require_convergence,
 )
     validate_truncation(tol, cap)
     isempty(xs) && throw(ArgumentError("A QTT linear combination needs at least one term"))
@@ -959,14 +1143,26 @@ function linear_combination(
     # Combine all amplitudes before rounding so intermediate sums cannot lose cancellation.
     core_sum() = reconstruct_expression(linear_expression(trains, weights); tol, cap)
     R == 1 && return core_sum()
-    samples = if evaluator === nothing
+    samples = if samples !== nothing
+        sampled(samples, R)
+    elseif evaluator === nothing
         LinearSamples(block_evaluator(trains, rec), weights)
     elseif evaluator isa Union{BlockEvaluator,SynchronizedBlockEvaluator}
         LinearSamples(evaluator, ComplexF64[coefficients...])
     else
         sampled(j -> sum(w * v for (w, v) in zip(weights, view(evaluator(j), active))), R)
     end
-    cross(rec, R, samples; tol, cap, label, shared_pivots, initial_zero_fallback = core_sum)
+    cross(
+        rec,
+        R,
+        samples;
+        tol,
+        cap,
+        label,
+        shared_pivots,
+        require_convergence,
+        initial_zero_fallback = core_sum,
+    )
 end
 
 # Fit batches own their recorder and RNG; fit records are merged in input order.

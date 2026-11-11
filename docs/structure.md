@@ -45,7 +45,7 @@ methods supply the grid, fields, kinetic operator, and Green operation.
 |---|---|
 | [QuanticsKS.jl](../src/QuanticsKS.jl) | Package imports, source loading, and exports |
 | [configuration.jl](../src/configuration.jl) | TOML parsing, validation, command line, and run output |
-| [models.jl](../src/models.jl) | 1D and 3D grids, physical models, occupations, and options |
+| [models.jl](../src/models.jl) | 1D and 3D grids, per-axis bit ordering, physical models, occupations, and options |
 | [states.jl](../src/states.jl) | Initial orbitals, refinement, checkpoints, and 1D low-pass filtering |
 | [hamiltonian.jl](../src/hamiltonian.jl) | 1D and 3D fields, Hamiltonian operators, Green solves, and total energy |
 | [scf.jl](../src/scf.jl) | Shared SCF loop, output Ritz rotation, and physical audit |
@@ -76,6 +76,12 @@ during orthogonalization and reconstructs a state when its consumer needs QTT
 cores; a single active term uses direct scaling.
 The `lanczos` and `block_lanczos` workflows call the shared `lanczos_step`.
 Both Davidson variants call `davidson_step` directly.
+`block_lobpcg` calls LOBPCGEigensolver.jl for both dense and QTT orbitals.
+`QTTBlock` supplies block algebra, deferred linear combinations, sampled
+Hamiltonian actions and residuals, and reconstruction under the caller's rank
+controls. Its scalar indexing rejects implicit grid traversal. The library owns
+the iteration; the adapter accounts for the actual QTT metric in Ritz and
+history coefficients, and audits residuals after reconstruction.
 `DeferredPotentialMPO` caches potential cores when a sampled Hamiltonian first
 needs a core-algebra fallback or projection.
 Hamiltonian projection reuses converted orbitals and operators within a call.

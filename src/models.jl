@@ -156,7 +156,7 @@ function compatible_problem(a, b; refinement = false)
     typeof(a.grid) == typeof(b.grid) &&
         a.grid.L == b.grid.L &&
         a.mass == b.mass &&
-        (refinement || a.grid.R == b.grid.R) &&
+        (refinement || same_resolution(a.grid, b.grid)) &&
         a.occupations == b.occupations &&
         model_descriptor(a.model) == model_descriptor(b.model)
 end
@@ -165,32 +165,61 @@ end
 
 "Cell-centered box [-Lx/2,Lx/2] x ... with zero exterior orbital amplitudes."
 struct BoxGrid3D <: AbstractGrid
-    R::Int
+    R::Union{Int,NTuple{3,Int}}
     L::NTuple{3,Float64}
-    function BoxGrid3D(R::Integer, lengths)
+    bit_positions::NTuple{3,Vector{Int}}
+    function BoxGrid3D(R, lengths)
         # The signed convolution grid needs three additional binary sites.
-        2 <= R <= 19 || throw(ArgumentError("3D R must be 2:19 bits per axis"))
+        bits = R isa Integer ? (R, R, R) : Tuple(R)
+        length(bits) == 3 && all(r -> r isa Integer && 2 <= r <= 19, bits) ||
+            throw(ArgumentError("3D R must be 2:19 bits on each axis"))
         ls = lengths isa Real ? ntuple(_ -> Float64(lengths), 3) : Tuple(Float64.(lengths))
         length(ls) == 3 && all(x -> isfinite(x) && x > 0, ls) ||
             throw(ArgumentError("Provide three positive box lengths in bohr"))
-        new(Int(R), ls)
+        positions = ntuple(_ -> Int[], 3)
+        site = 0
+        for b = 0:(maximum(bits) - 1), a = 1:3
+            b < bits[a] || continue
+            push!(positions[a], site)
+            site += 1
+        end
+        new(R isa Integer ? Int(R) : Int.(bits), ls, positions)
     end
 end
 Base.length(g::BoxGrid3D) = 1 << nsites(g)
-nsites(g::BoxGrid3D) = 3g.R
-spacing(g::BoxGrid3D) = g.L ./ (1 << g.R)
+axis_bits(g::BoxGrid3D) = length.(g.bit_positions)
+grid_shape(g::BoxGrid3D) = 1 .<< axis_bits(g)
+nsites(g::BoxGrid3D) = sum(axis_bits(g))
+spacing(g::BoxGrid3D) = g.L ./ grid_shape(g)
 cell_volume(g::BoxGrid3D) = prod(g.L)
 volume_element(g::BoxGrid3D) = prod(spacing(g))
-Base.:(==)(a::BoxGrid3D, b::BoxGrid3D) = a.R == b.R && a.L == b.L
+Base.:(==)(a::BoxGrid3D, b::BoxGrid3D) = same_resolution(a, b) && a.L == b.L
+
+function grid_axes(g::BoxGrid3D)
+    axes = Vector{Int}(undef, nsites(g))
+    for a = 1:3, site in g.bit_positions[a]
+        axes[site + 1] = a
+    end
+    axes
+end
+same_resolution(a::AbstractGrid, b::AbstractGrid) = a.R == b.R
+same_resolution(a::BoxGrid3D, b::BoxGrid3D) = axis_bits(a) == axis_bits(b)
+is_refinement(a::AbstractGrid, b::AbstractGrid) = typeof(a) == typeof(b) && b.R > a.R
+is_refinement(a::BoxGrid3D, b::BoxGrid3D) =
+    all(axis_bits(b) .>= axis_bits(a)) && any(axis_bits(b) .> axis_bits(a))
 
 function grid_indices(g::BoxGrid3D, j::Integer)
     0 <= j < length(g) || throw(BoundsError(g, j))
-    ntuple(a -> sum(((j >> (3b + a - 1)) & 1) << b for b = 0:(g.R - 1)), 3)
+    ntuple(a -> sum(((j >> site) & 1) << (b - 1) for (b, site) in enumerate(g.bit_positions[a])), 3)
 end
 function grid_index(g::BoxGrid3D, indices)
-    length(indices) == 3 && all(i -> i isa Integer && 0 <= i < 1 << g.R, indices) ||
+    length(indices) == 3 &&
+        all(a -> indices[a] isa Integer && 0 <= indices[a] < grid_shape(g)[a], 1:3) ||
         throw(ArgumentError("3D indices must be zero-based and inside the box"))
-    sum(((indices[a] >> b) & 1) << (3b + a - 1) for b = 0:(g.R - 1), a = 1:3)
+    sum(
+        ((indices[a] >> (b - 1)) & 1) << site for a = 1:3 for
+        (b, site) in enumerate(g.bit_positions[a])
+    )
 end
 function grid_position(g::BoxGrid3D, j::Integer)
     indices, h = grid_indices(g, j), spacing(g)
@@ -233,27 +262,6 @@ function validate_model_grid(g::BoxGrid3D, m::AbstractModel3D, w, mass)
     nothing
 end
 
-const ANGSTROM_TO_BOHR = 1.8897261246257702
-"Simple-cubic finite H cluster; paper spacing is 2 angstrom (Section 8.5)."
-function hydrogen_cluster(;
-    R = 7,
-    shape = (3, 2, 2),
-    distance = 2ANGSTROM_TO_BOHR,
-    padding = 10.0,
-    cell = nothing,
-    xc = :pz81,
-)
-    length(shape) == 3 && all(n -> n isa Integer && n > 0, shape) && iseven(prod(shape)) ||
-        throw(ArgumentError("Use three positive lattice sizes with an even atom count"))
-    isfinite(distance) && distance > 0 && isfinite(padding) && padding > 0 ||
-        throw(ArgumentError("Invalid cluster distance or padding"))
-    positions = [
-        ntuple(a -> (i[a] - (shape[a] - 1) / 2) * distance, 3) for
-        i in Iterators.product((0:(n - 1) for n in shape)...)
-    ]
-    lengths = cell === nothing ? ntuple(a -> (shape[a] - 1) * distance + 2padding, 3) : cell
-    Problem(BoxGrid3D(R, lengths), AllElectronLDA3D(vec(positions); xc), fill(2.0, prod(shape) ÷ 2))
-end
 model_descriptor(m::AllElectronLDA3D) = Dict(
     "kind" => "all_electron_lda_3d",
     "positions" => collect.(m.positions),
@@ -280,10 +288,13 @@ end
 
 # field, work, and storage set error budgets for fields, iteration tensors, and saved orbitals.
 Base.@kwdef struct Accuracy
+    adaptive::Bool = false
+    residual_error_fraction::Float64 = 0.1
     field_tolerance::Float64 = 1e-8
     work_tolerance::Float64 = 1e-6
     storage_tolerance::Float64 = 1e-10
     algebra_tolerance::Float64 = 1e-12
+    kinetic_action_tolerance::Union{Nothing,Float64} = nothing
     # Optional SCF sampling budgets; nothing retains the algebra/work defaults.
     mixing_tolerance::Union{Nothing,Float64} = nothing
     # Unset orbital tolerance inherits the field tolerance.
@@ -331,12 +342,12 @@ Base.@kwdef struct TCIOptions
     scalar_cache_capacity::Int = 16384
     dense_cache_max_points::Int = 262144
     orbital_cache_capacity::Int = 8192
-    orbital_cache_max_bytes::Int = 64 * 1024^2
+    orbital_cache_max_bytes::Int = 128 * 1024^2
     slice_cache_capacity::Int = 2048
     reuse_pivots::Bool = true
     pivot_cache_capacity::Int = 512
     orbital_pivot_group_size::Int = 4
-    environment_cache_bits::Int = 10
+    environment_cache_max_bytes::Int = 8 * 1024^2
     require_convergence::Bool = false
     zero_check_limit::Int = 4096
 end
@@ -360,6 +371,7 @@ Base.@kwdef struct AuditOptions
     field_tolerance::Float64 = 1e-9
     kernel_tolerance::Float64 = 1e-13
     algebra_tolerance::Float64 = 1e-13
+    residual_fit_tolerance::Float64 = 1e-4
     gram_tolerance::Float64 = 1e-6
     charge_tolerance::Float64 = 1e-6
 end
@@ -375,6 +387,10 @@ const LANCZOS_SOLVERS = (:lanczos, :block_lanczos)
 const SUBSPACE_SOLVERS = (LANCZOS_SOLVERS..., :davidson, :block_davidson)
 
 Base.@kwdef struct SCFOptions
+    initial_spacing::Union{Nothing,Float64} = nothing
+    refinement_bits::Int = 2
+    coarse_energy_tolerance::Float64 = 1e-3
+    coarse_density_tolerance::Float64 = 1e-2
     # 0 uses the default Julia thread pool; 1 keeps core contractions serial.
     parallel_tasks::Int = 1
     energy_tolerance::Float64 = 1e-6
@@ -382,6 +398,7 @@ Base.@kwdef struct SCFOptions
     inner_steps::Int = 1
     coefficient_sweeps::Int = 2
     mixing::Float64 = 0.3
+    adaptive_mixing::Bool = false
     anderson::Bool = true
     green_shift::Float64 = 0.5
     eigen_tolerance::Float64 = 1e-4
@@ -407,6 +424,7 @@ Base.@kwdef struct SCFOptions
     solver::Symbol = :lrrap
 end
 function validate(a::Accuracy)
+    0 < a.residual_error_fraction < 1 || throw(ArgumentError("Invalid adaptive accuracy controls"))
     all(
         x -> isfinite(x) && x > 0,
         (
@@ -422,7 +440,7 @@ function validate(a::Accuracy)
             a.storage_gram_tolerance,
         ),
     ) || throw(ArgumentError("Tolerances must be positive and finite"))
-    for tol in (a.mixing_tolerance, a.orbital_tolerance)
+    for tol in (a.mixing_tolerance, a.orbital_tolerance, a.kinetic_action_tolerance)
         tol === nothing ||
             (isfinite(tol) && tol > 0) ||
             throw(ArgumentError("SCF sampling tolerances must be positive and finite"))
@@ -439,6 +457,46 @@ function validate(a::Accuracy)
     end
     a
 end
+
+"FD2 spectral bound, including anisotropic axes and the physical mass."
+kinetic_bound(problem) =
+    2sum(
+        inv(h^2) for
+        h in (spacing(problem.grid) isa Tuple ? spacing(problem.grid) : (spacing(problem.grid),))
+    ) / problem.mass
+
+"Tighten representation error as density feedback settles; never change the acceptance gates."
+function iteration_accuracy(problem, base::Accuracy, scf, factor = 1.0)
+    base.adaptive || return base
+    residual = something(scf.orbital_residual_tolerance, scf.eigen_tolerance)
+    orbital = min(
+        something(base.orbital_tolerance, base.field_tolerance),
+        factor * base.residual_error_fraction * residual / kinetic_bound(problem),
+    )
+    energy_scale = scf.energy_tolerance / max(1.0, sum(problem.occupations))
+    Accuracy(;
+        merge(
+            option_tuple(base),
+            (;
+                orbital_tolerance = orbital,
+                orthogonalization_tolerance = min(base.orthogonalization_tolerance, orbital),
+                storage_tolerance = min(base.storage_tolerance, orbital),
+                kinetic_action_tolerance = problem.grid isa PeriodicGrid1D ?
+                                           min(
+                    something(base.kinetic_action_tolerance, Inf),
+                    factor * base.residual_error_fraction * residual / 100,
+                ) : base.kinetic_action_tolerance,
+                field_tolerance = min(
+                    base.field_tolerance,
+                    factor * min(base.residual_error_fraction * residual, energy_scale),
+                ),
+                density_tolerance = min(base.density_tolerance, factor * energy_scale / 100),
+                xc_energy_tolerance = min(base.xc_energy_tolerance, factor * energy_scale / 100),
+                work_tolerance = min(1e-2, factor * base.work_tolerance),
+            ),
+        )...,
+    )
+end
 function solver_config(problem, accuracy, scf = SCFOptions())
     validate(accuracy)
     merge(
@@ -448,11 +506,14 @@ function solver_config(problem, accuracy, scf = SCFOptions())
             volume_element = volume_element(problem.grid),
             electrons = sum(problem.occupations),
             orbital_cap = accuracy.orbital_cap,
+            adaptive_accuracy = accuracy.adaptive,
+            kinetic_spectral_bound = kinetic_bound(problem),
             effective_potential_cap = field_caps(accuracy).effective_potential_cap,
             density_cap = field_caps(accuracy).density_cap,
             work_cap = accuracy.work_cap,
             orbital_tolerance = something(accuracy.orbital_tolerance, accuracy.field_tolerance),
             algebra_tolerance = accuracy.algebra_tolerance,
+            kinetic_action_tolerance = accuracy.kinetic_action_tolerance,
             eigen_tolerance = scf.eigen_tolerance,
             inner_steps = scf.inner_steps,
             coefficient_sweeps = scf.coefficient_sweeps,

@@ -1,3 +1,547 @@
+# Standard Block LOBPCG uses the same library iteration for both representations.
+
+struct BlockHamiltonian{F}
+    apply::F
+end
+function LinearAlgebra.mul!(result::AbstractMatrix, H::BlockHamiltonian, orbitals::AbstractMatrix)
+    copyto!(result, H.apply(orbitals))
+end
+
+"An optional callback applies the inverse preconditioner to a whole block."
+struct BlockPreconditioner{F}
+    apply::F
+end
+function LinearAlgebra.ldiv!(preconditioner::BlockPreconditioner, residuals::AbstractMatrix)
+    copyto!(residuals, preconditioner.apply(residuals))
+end
+
+"""
+    block_lobpcg(H, orbitals; preconditioner=nothing, tolerance=1e-6,
+                 max_iterations=100, gram_tolerance=1e-8, callback=identity)
+
+Find the lowest Hermitian eigenpairs using LOBPCGEigensolver's block iteration.
+`H` is a matrix or a block-action callback. A preconditioner callback applies
+an inverse to a whole residual block; dense matrices and factorizations are
+applied through a linear solve. Omission uses the identity.
+The final residuals are recomputed from the returned orbitals independently
+of the library's cached Hamiltonian actions. `H` must remain fixed throughout.
+"""
+function block_lobpcg(
+    H,
+    orbitals::AbstractMatrix;
+    preconditioner = nothing,
+    tolerance = 1e-6,
+    max_iterations = 100,
+    gram_tolerance = 1e-8,
+    callback = identity,
+)
+    isfinite(tolerance) && tolerance > 0 || throw(ArgumentError("Invalid residual tolerance"))
+    isfinite(gram_tolerance) && gram_tolerance > 0 || throw(ArgumentError("Invalid Gram tolerance"))
+    max_iterations >= 0 || throw(ArgumentError("Invalid iteration limit"))
+    size(orbitals, 2) > 0 || throw(ArgumentError("An initial orbital block is required"))
+    operator = H isa Union{AbstractMatrix,BlockHamiltonian} ? H : BlockHamiltonian(H)
+    inverse =
+        preconditioner === nothing ? I :
+        preconditioner isa AbstractMatrix ? factorize(preconditioner) :
+        preconditioner isa Union{Factorization,UniformScaling,BlockPreconditioner} ?
+        preconditioner : BlockPreconditioner(preconditioner)
+    started = time_ns()
+    residual_history = Vector{Vector{Float64}}()
+    residual_norms = fill(Inf, size(orbitals, 2))
+    eigenvalues = zeros(size(orbitals, 2))
+    locked = 0
+    monitor =
+        info -> begin
+            active = (locked + 1):length(residual_norms)
+            residual_norms[active] = info.resid_history[active, info.n_iter + 1]
+            eigenvalues[active] = info.λs
+            push!(residual_history, copy(residual_norms))
+            locked = info.n_locked
+            callback((;
+                iteration = info.n_iter,
+                eigenvalues = copy(eigenvalues),
+                residual_norms = copy(residual_norms),
+                locked,
+            ))
+        end
+    result = LOBPCGEigensolver.lobpcg(
+        operator,
+        orbitals,
+        I,
+        inverse,
+        tolerance,
+        max_iterations;
+        miniter = 0,
+        callback = monitor,
+    )
+    stored_orbitals, residual_norms, gram_defect = lobpcg_audit(operator, result.X, result.λ)
+    (;
+        orbitals = stored_orbitals,
+        eigenvalues = result.λ,
+        residual_norms,
+        gram_defect,
+        converged = maximum(residual_norms) <= tolerance && gram_defect <= gram_tolerance,
+        iterations = length(residual_history) - 1,
+        residual_history = reduce(hcat, residual_history),
+        elapsed_seconds = (time_ns() - started) / 1e9,
+    )
+end
+
+function lobpcg_audit(H, orbitals::AbstractMatrix, energies)
+    action = similar(orbitals)
+    mul!(action, H, orbitals)
+    residuals = action - orbitals * Diagonal(energies)
+    norms = sqrt.(vec(sum(abs2, orbitals; dims = 1)))
+    residual_norms = sqrt.(vec(sum(abs2, residuals; dims = 1))) ./ norms
+    orbitals, residual_norms, norm(orbitals' * orbitals - I)
+end
+
+# Block algebra for the library LOBPCG loop. Scalar grid access is deliberately absent.
+
+mutable struct QTTBlockWorkspace{C,R,H,P}
+    accuracy::C
+    recorder::R
+    H::H
+    potential::P
+    actions::IdDict{Any,QTT}
+    overlap_basis::Vector{QTT}
+    overlap_positions::IdDict{Any,Int}
+    overlap_metric::Matrix{ComplexF64}
+end
+
+"A block of deferred orbital expressions, or their symbolic Hamiltonian actions."
+struct QTTBlock{V<:AbstractVector{QTTExpression},W} <: AbstractMatrix{ComplexF64}
+    columns::V
+    workspace::W
+    action::Base.RefValue{Bool}
+end
+
+"Cache exact core overlaps within one iteration; transforms use only small matrices."
+function block_core_gram(workspace, basis)
+    missing = [psi for psi in basis if !haskey(workspace.overlap_positions, psi.c)]
+    if !isempty(missing)
+        old = workspace.overlap_basis
+        cross_metric = gram(old, missing; cfg = workspace.accuracy)
+        new_metric = gram(missing; cfg = workspace.accuracy)
+        workspace.overlap_metric = [workspace.overlap_metric cross_metric; cross_metric' new_metric]
+        for psi in missing
+            push!(old, psi)
+            workspace.overlap_positions[psi.c] = length(old)
+        end
+    end
+    indices = [workspace.overlap_positions[psi.c] for psi in basis]
+    workspace.overlap_metric[indices, indices]
+end
+
+function block_metric(x::QTTBlock)
+    basis, coefficients = expression_components(x.columns)
+    isempty(basis) && return zeros(ComplexF64, size(x, 2), size(x, 2))
+    metric = block_core_gram(x.workspace, basis)
+    result = coefficients' * metric * coefficients
+    scales = real.(diag(abs.(coefficients)' * abs.(metric) * abs.(coefficients)))
+    # A cancelled direction needs amplitudes. Do not build a global high-rank QR sum.
+    if any(real.(diag(result)) .< sqrt(eps(Float64)) .* scales) &&
+       any(e -> length(e.terms) > 1, x.columns)
+        orbitals = reconstruct_orbitals!(x; label = "lobpcg_cancelled_direction")
+        return block_core_gram(x.workspace, orbitals)
+    end
+    (result + result') / 2
+end
+
+QTTBlock(columns, workspace; action = false) = QTTBlock(columns, workspace, Ref(action))
+Base.size(x::QTTBlock) = (1 << x.workspace.accuracy.R, length(x.columns))
+Base.copy(x::QTTBlock) = QTTBlock(copy(x.columns), x.workspace; action = x.action[])
+Base.view(x::QTTBlock, ::Colon, columns) = QTTBlock(view(x.columns, columns), x.workspace, x.action)
+Base.getindex(x::QTTBlock, ::Colon, columns::AbstractVector) = copy(view(x, :, columns))
+Base.getindex(x::QTTBlock, i::Int, j::Int) =
+    error("Scalar grid traversal is not part of QTT block algebra; use evaluate explicitly")
+function Base.similar(x::QTTBlock, ::Type{T}, dims::Dims) where {T}
+    length(dims) == 2 && dims[1] == size(x, 1) && T == ComplexF64 || return Array{T}(undef, dims)
+    zero_expression = QTTExpression(QTT[], ComplexF64[], x.workspace.accuracy.R)
+    QTTBlock(fill(zero_expression, dims[2]), x.workspace)
+end
+Base.similar(x::QTTBlock) = similar(x, ComplexF64, size(x))
+Base.similar(x::QTTBlock, ::Type{T}) where {T} = similar(x, T, size(x))
+Base.similar(x::QTTBlock, dims::Int...) = similar(x, ComplexF64, dims)
+Base.similar(x::QTTBlock, ::Type{T}, dims::Int...) where {T} = similar(x, T, dims)
+Base.zero(x::QTTBlock) = similar(x)
+function Base.copyto!(destination::QTTBlock, source::QTTBlock)
+    size(destination) == size(source) || throw(DimensionMismatch("QTT block copy"))
+    copyto!(destination.columns, source.columns)
+    destination.action[] = source.action[]
+    destination
+end
+Base.any(::typeof(isnan), x::QTTBlock) =
+    any(x.columns) do expression
+        any(isnan, expression.coefficients) ||
+            any(t -> any(g -> any(isnan, g), t.c), expression.terms)
+    end
+
+"Materialize only when a consumer needs independent QTT cores."
+function reconstruct_orbitals!(x::QTTBlock; label = "lobpcg_orbitals")
+    x.action[] && error("Reconstruct the source orbitals of a Hamiltonian action")
+    isempty(x.columns) && return QTT[]
+    accuracy, rec = x.workspace.accuracy, x.workspace.recorder
+    if all(e -> length(e.terms) == 1 && only(e.coefficients) == 1, x.columns)
+        return [only(e.terms) for e in x.columns]
+    end
+    basis, coefficients = expression_components(x.columns)
+    orbitals =
+        isempty(basis) ? [constant_tt(accuracy.R, 0) for _ in x.columns] :
+        combine_orbitals(
+            basis,
+            coefficients,
+            accuracy,
+            rec;
+            tol = accuracy.orthogonalization_tolerance,
+            cap = accuracy.orbital_cap,
+            label,
+        )
+    x.columns .= [linear_expression((psi,), (1,)) for psi in orbitals]
+    orbitals
+end
+
+function block_actions(x::QTTBlock)
+    workspace = x.workspace
+    accuracy = workspace.accuracy
+    stored = [
+        length(e.terms) == 1 && only(e.coefficients) == 1 ? only(e.terms) : nothing for
+        e in x.columns
+    ]
+    missing = findall(
+        i -> stored[i] === nothing || !haskey(workspace.actions, stored[i].c),
+        eachindex(stored),
+    )
+    basis, coefficients = expression_components(x.columns)
+    evaluators =
+        any(isnothing, stored) ?
+        orbital_evaluators(basis, length(missing), accuracy, workspace.recorder) : nothing
+    computed = recorded_map(QTT, length(missing), accuracy, workspace.recorder) do k, rec
+        i = missing[k]
+        if stored[i] !== nothing
+            return h_action(
+                workspace.H,
+                stored[i],
+                accuracy,
+                rec;
+                work_tol = accuracy.work_tolerance,
+                potential = workspace.potential,
+                label = "lobpcg_$i",
+            )
+        end
+        # Fit the complete action. Combining independently fitted H terms amplifies cancellation error.
+        orbital = LinearSamples(orbital_evaluator(evaluators), coefficients[:, i])
+        samples = hamiltonian_samples(workspace.H, orbital, workspace.potential, accuracy.R)
+        cross(
+            rec,
+            accuracy.R,
+            samples;
+            tol = accuracy.work_tolerance,
+            cap = accuracy.work_cap,
+            label = "Hpsi_work_lobpcg_$i",
+            initial_zero_fallback = () -> begin
+                psi = reconstruct_expression(
+                    x.columns[i];
+                    tol = accuracy.orthogonalization_tolerance,
+                    cap = accuracy.orbital_cap,
+                )
+                h_core_fallback(
+                    workspace.H,
+                    psi,
+                    0.0;
+                    tol = accuracy.work_tolerance,
+                    cap = accuracy.work_cap,
+                    rec,
+                )
+            end,
+        )
+    end
+    actions = Vector{QTT}(undef, length(stored))
+    for (i, action) in zip(missing, computed)
+        actions[i] = action
+        stored[i] === nothing || (workspace.actions[stored[i].c] = action)
+    end
+    for i in eachindex(stored)
+        stored[i] === nothing || (actions[i] = workspace.actions[stored[i].c])
+    end
+    actions
+end
+
+function block_overlap(x::QTTBlock, y::QTTBlock)
+    x.action[] && error("Hamiltonian action is only supported on the right of an overlap")
+    if y.action[]
+        actions = block_actions(y)
+        basis, coefficients = expression_components(x.columns)
+        return coefficients' * gram(basis, actions; cfg = x.workspace.accuracy)
+    end
+    x === y && return block_metric(x)
+    nx = size(x, 2)
+    basis, coefficients = expression_components(vcat(x.columns, y.columns))
+    isempty(basis) && return zeros(ComplexF64, nx, size(y, 2))
+    metric = block_core_gram(x.workspace, basis)
+    coefficients[:, 1:nx]' * metric * coefficients[:, (nx + 1):end]
+end
+Base.:*(x::Adjoint{ComplexF64,<:QTTBlock}, y::QTTBlock) = block_overlap(parent(x), y)
+function LOBPCGEigensolver.mul_hermi(x::Adjoint{ComplexF64,<:QTTBlock}, y::QTTBlock)
+    metric = parent(x) === y && !y.action[] ? block_metric(y) : block_overlap(parent(x), y)
+    Hermitian((metric + metric') / 2)
+end
+LOBPCGEigensolver.columnwise_norms(x::QTTBlock) = sqrt.(max.(0, real.(diag(block_metric(x)))))
+LOBPCGEigensolver.columnwise_dots(x::QTTBlock, y::QTTBlock) = diag(block_overlap(x, y))
+LOBPCGEigensolver.compute_λ(x::QTTBlock, hx::QTTBlock, bx::QTTBlock) =
+    real.(diag(block_overlap(x, hx)) ./ diag(block_overlap(x, bx)))
+
+function LinearAlgebra.mul!(
+    destination::QTTBlock,
+    source::QTTBlock,
+    coefficients::AbstractMatrix,
+    a::Number = true,
+    b::Number = false,
+)
+    columns = [
+        linear_expression(source.columns, a .* view(coefficients, :, j)) for
+        j in axes(coefficients, 2)
+    ]
+    if !iszero(b)
+        source.action[] == destination.action[] || error("Incompatible symbolic actions")
+        columns = [
+            linear_expression((columns[j], destination.columns[j]), (1, b)) for
+            j in eachindex(columns)
+        ]
+    end
+    copyto!(destination.columns, columns)
+    destination.action[] = source.action[]
+    destination
+end
+LinearAlgebra.rmul!(x::QTTBlock, coefficients::AbstractMatrix) = mul!(x, copy(x), coefficients)
+LinearAlgebra.rmul!(
+    x::QTTBlock,
+    coefficients::Union{UpperTriangular,LowerTriangular,UnitUpperTriangular,UnitLowerTriangular},
+) = mul!(x, copy(x), Matrix(coefficients))
+function LinearAlgebra.mul!(destination::QTTBlock, H::BlockHamiltonian, source::QTTBlock)
+    # H times a deferred search block is needed only through its projected matrix.
+    copyto!(destination, source)
+    destination.action[] = true
+    destination
+end
+function LinearAlgebra.ldiv!(preconditioner::BlockPreconditioner, residuals::QTTBlock)
+    orbitals = reconstruct_orbitals!(residuals; label = "lobpcg_residual")
+    updated = preconditioner.apply(orbitals)
+    length(updated) == length(orbitals) || throw(DimensionMismatch("Preconditioned block size"))
+    residuals.columns .= [linear_expression((psi,), (1,)) for psi in updated]
+    residuals
+end
+
+const QTTLazyBlock = LOBPCGEigensolver.LazyHcat{ComplexF64,<:Tuple{Vararg{QTTBlock}}}
+function collect_block(x::QTTLazyBlock)
+    QTTBlock(
+        reduce(vcat, [block.columns for block in x.blocks]),
+        first(x.blocks).workspace;
+        action = first(x.blocks).action[],
+    )
+end
+Base.:*(x::Adjoint{ComplexF64,<:QTTLazyBlock}, y::QTTBlock) =
+    block_overlap(collect_block(parent(x)), y)
+Base.:*(x::Adjoint{ComplexF64,<:QTTLazyBlock}, y::QTTLazyBlock) =
+    block_overlap(collect_block(parent(x)), collect_block(y))
+function LinearAlgebra.mul!(
+    destination::QTTBlock,
+    source::QTTLazyBlock,
+    coefficients::AbstractMatrix,
+    a::Number,
+    b::Number,
+)
+    mul!(destination, collect_block(source), coefficients, a, b)
+end
+function LinearAlgebra.mul!(
+    destination::QTTBlock,
+    source::QTTLazyBlock,
+    coefficients::AbstractMatrix,
+)
+    mul!(destination, source, coefficients, true, false)
+    destination.action[] || reconstruct_orbitals!(destination; label = "lobpcg_update")
+    destination
+end
+function Base.:*(source::QTTLazyBlock, coefficients::AbstractMatrix)
+    destination = similar(first(source.blocks), size(source, 1), size(coefficients, 2))
+    mul!(destination, source, coefficients)
+end
+
+"Ritz coefficients carry the search metric needed by the history update."
+struct QTTBlockCoefficients <: AbstractMatrix{ComplexF64}
+    values::Matrix{ComplexF64}
+    metric::Matrix{ComplexF64}
+end
+Base.size(c::QTTBlockCoefficients) = size(c.values)
+Base.getindex(c::QTTBlockCoefficients, i::Int, j::Int) = c.values[i, j]
+function LOBPCGEigensolver.get_new_P_duersch(
+    c::QTTBlockCoefficients,
+    complement,
+    active;
+    tol,
+    timer,
+)
+    overlap = -(complement' * c.metric[:, active])
+    complement * LOBPCGEigensolver.ortho!(overlap; tol).X
+end
+
+"Use the actual search Gram after QTT reconstruction, not an assumed identity."
+function LOBPCGEigensolver.rayleigh_ritz(x::QTTLazyBlock, hx::QTTLazyBlock, keep)
+    # Refresh symbolic sources and release expressions from earlier iterations.
+    for (source, action) in zip(x.blocks, hx.blocks)
+        copyto!(action.columns, source.columns)
+    end
+    source, action = collect_block(x), collect_block(hx)
+    projected = block_overlap(source, action)
+    metric = block_metric(source)
+    factor = eigen(Hermitian((projected + projected') / 2), Hermitian(metric))
+    (;
+        vectors = QTTBlockCoefficients(factor.vectors[:, 1:keep], metric),
+        values = factor.values[1:keep],
+        vectors_ortho = factor.vectors[:, (keep + 1):end],
+    )
+end
+
+struct QTTBlockStyle <: Base.Broadcast.AbstractArrayStyle{2} end
+Base.BroadcastStyle(::Type{<:QTTBlock}) = QTTBlockStyle()
+Base.BroadcastStyle(::QTTBlockStyle, ::Base.Broadcast.DefaultArrayStyle{N}) where {N} =
+    QTTBlockStyle()
+Base.BroadcastStyle(::Base.Broadcast.DefaultArrayStyle{N}, ::QTTBlockStyle) where {N} =
+    QTTBlockStyle()
+block_argument(x::Base.Broadcast.Extruded) = x.x
+block_argument(x) = x
+block_column(x::QTTBlock, j) = x.columns[j]
+block_column(x::Number, j) = x
+block_column(x::AbstractMatrix, j) = x[1, j]
+block_column(x::Base.Broadcast.Extruded, j) = block_column(x.x, j)
+function block_column(x::Base.Broadcast.Broadcasted, j)
+    arguments = map(a -> block_column(a, j), x.args)
+    x.f === identity && return only(arguments)
+    if x.f === (*) || x.f === (/)
+        left, right = arguments
+        return left isa Number ? scale(right, left) : scale(left, x.f === (/) ? inv(right) : right)
+    elseif x.f === (+) || x.f === (-)
+        return linear_expression(arguments, (1, x.f === (-) ? -1 : 1))
+    end
+    error("Unsupported QTT block broadcast: $(x.f)")
+end
+function Base.copyto!(destination::QTTBlock, expression::Base.Broadcast.Broadcasted)
+    arguments = map(block_argument, expression.args)
+    if expression.f === identity && only(arguments) isa QTTBlock
+        return copyto!(destination, only(arguments))
+    end
+    # Refresh physical residuals from stored orbitals, never from cached H combinations.
+    if expression.f === (-) && first(arguments) isa QTTBlock && first(arguments).action[]
+        scaled = last(arguments)
+        source = block_argument(first(scaled.args))
+        energies = block_argument(last(scaled.args))
+        orbitals = reconstruct_orbitals!(source; label = "lobpcg_ritz")
+        workspace = destination.workspace
+        residuals =
+            recorded_map(QTT, length(orbitals), workspace.accuracy, workspace.recorder) do i, rec
+                h_residual(
+                    workspace.H,
+                    orbitals[i],
+                    real(energies[i]),
+                    workspace.accuracy,
+                    rec;
+                    tol = workspace.accuracy.work_tolerance,
+                    cap = workspace.accuracy.work_cap,
+                    potential = workspace.potential,
+                    label = "lobpcg_residual_$i",
+                )
+            end
+        destination.columns .= [linear_expression((psi,), (1,)) for psi in residuals]
+        destination.action[] = false
+        return destination
+    end
+    destination.columns .= [block_column(expression, j) for j in axes(destination, 2)]
+    destination
+end
+
+function Random.randn!(rng::AbstractRNG, x::QTTBlock)
+    accuracy = x.workspace.accuracy
+    bonds = [min(4, 1 << min(k, accuracy.R - k)) for k = 0:(accuracy.R)]
+    x.columns .= [
+        linear_expression(
+            (
+                normalize(
+                    QTT([
+                        randn(rng, ComplexF64, bonds[k], 2, bonds[k + 1]) for k = 1:(accuracy.R)
+                    ]),
+                ),
+            ),
+            (1,),
+        ) for _ in x.columns
+    ]
+    x
+end
+
+function lobpcg_audit(H, block::QTTBlock, energies)
+    orbitals = reconstruct_orbitals!(block; label = "lobpcg_final")
+    workspace = block.workspace
+    accuracy, rec = workspace.accuracy, workspace.recorder
+    residuals = recorded_map(Float64, length(orbitals), accuracy, rec) do i, localrec
+        h_residual_norm(
+            workspace.H,
+            orbitals[i],
+            energies[i],
+            accuracy,
+            localrec;
+            tol = accuracy.algebra_tolerance,
+            cap = max(accuracy.work_cap, accuracy.orbital_cap),
+            potential = workspace.potential,
+            label = "lobpcg_audit_$i",
+        ) / ttnorm(orbitals[i])
+    end
+    orbitals, residuals, norm(gram(orbitals; cfg = accuracy) - I)
+end
+
+"Run the library's unchanged LOBPCG iteration on QTT block algebra."
+function block_lobpcg(
+    H,
+    orbitals::AbstractVector{QTT},
+    accuracy,
+    rec;
+    preconditioner = nothing,
+    tolerance = accuracy.eigen_tolerance,
+    work_tolerance = accuracy.algebra_tolerance,
+    max_iterations = 100,
+    gram_tolerance = accuracy.gram_tolerance,
+    callback = identity,
+)
+    isempty(orbitals) && throw(ArgumentError("An initial orbital block is required"))
+    validate_truncation(work_tolerance, accuracy.work_cap)
+    accuracy = merge(accuracy, (; work_tolerance))
+    workspace = QTTBlockWorkspace(
+        accuracy,
+        rec,
+        H,
+        synchronized(potential_samples(H, rec)),
+        IdDict{Any,QTT}(),
+        QTT[],
+        IdDict{Any,Int}(),
+        zeros(ComplexF64, 0, 0),
+    )
+    block = QTTBlock([linear_expression((psi,), (1,)) for psi in orbitals], workspace)
+    monitor = info -> begin
+        empty!(workspace.actions)
+        empty!(workspace.overlap_basis)
+        empty!(workspace.overlap_positions)
+        workspace.overlap_metric = zeros(ComplexF64, 0, 0)
+        callback(info)
+    end
+    block_lobpcg(
+        BlockHamiltonian(H),
+        block;
+        preconditioner,
+        tolerance,
+        max_iterations,
+        gram_tolerance,
+        callback = monitor,
+    )
+end
+
 # TT tangent-space projection and reconstruction; see Rakhuba et al., Sec. 3.
 # https://arxiv.org/abs/1811.11049
 # left/right hold orthogonal cores U/V; variations satisfy the left gauge condition.
@@ -107,7 +651,9 @@ struct DeferredPotentialMPO{F}
     lock::ReentrantLock
 end
 DeferredPotentialMPO(build) = DeferredPotentialMPO(
-    build, Ref{Union{Nothing,Vector{Array{ComplexF64,4}}}}(nothing), ReentrantLock(),
+    build,
+    Ref{Union{Nothing,Vector{Array{ComplexF64,4}}}}(nothing),
+    ReentrantLock(),
 )
 potential_mpo(H, rec = nothing) = potential_mpo(H.diagonal, rec)
 potential_mpo(cores::Vector{Array{ComplexF64,4}}, rec = nothing) = cores
@@ -132,6 +678,16 @@ struct Hamiltonian{S,D}
 end
 Hamiltonian(v, d, plus, minus, h) = Hamiltonian(v, d, plus, minus, Float64(h), nothing)
 
+"Evaluate a complete periodic FD2 action before fitting its QTT representation."
+function hamiltonian_samples(H::Hamiltonian, orbital, potential, R; energy = 0.0)
+    n = 1 << R
+    sampled(R) do j
+        center = orbital(j)
+        kinetic = ((center - orbital(mod(j - 1, n))) + (center - orbital(mod(j + 1, n)))) / (2H.h^2)
+        kinetic + (potential(j) - energy) * center
+    end
+end
+
 "Share the fixed local field across all sampled actions of one Hamiltonian."
 potential_samples(H::Hamiltonian, rec) =
     H.samples === nothing ? memoized_sample(H.potential, rec) : H.samples
@@ -149,7 +705,31 @@ function h_core_fallback(H, psi, energy; tol, cap, rec = nothing)
     reconstruct_expression(linear_expression(terms, weights); tol, cap)
 end
 
-"Sample just the final FD2 residual, without fitting H*x, V*x or shifted states."
+"Construct FD2 amplitudes by differencing cores before division by the grid spacing."
+function kinetic_action(
+    H::Hamiltonian,
+    psi,
+    action_tol;
+    absolute_tolerance = nothing,
+    cap = nothing,
+)
+    if absolute_tolerance !== nothing
+        # ||D|| <= 2. Allocate half the physical action error to each difference.
+        gradient =
+            shift_difference(H.plus, psi; cap, absolute_tolerance = absolute_tolerance * H.h^2 / 2)
+        second = shift_difference(
+            H.minus,
+            gradient;
+            cap,
+            absolute_tolerance = absolute_tolerance * H.h^2,
+        )
+        return scale(second, 1 / (2H.h^2))
+    end
+    gradient = shift_difference(H.plus, psi; cap, tol = action_tol * min(1.0, H.h))
+    scale(shift_difference(H.minus, gradient; cap, tol = action_tol), 1 / (2H.h^2))
+end
+
+"Sample the final unfiltered physical residual."
 function h_residual(
     H,
     psi,
@@ -172,15 +752,17 @@ function h_residual(
             potential;
             tt_cache_capacity = get(rec.options, :slice_cache_capacity, 2048),
         ) : sampled(potential, length(psi))
-    inverse_two_h_squared = 1 / (2H.h^2)
-    fn = pointwise(
-        (center, left, right, v) ->
-            ((center - left) + (center - right)) * inverse_two_h_squared + (v - energy) * center,
-        orbital,
-        shifted(orbital, -1),
-        shifted(orbital, 1),
-        field,
+    # A relative residual tolerance cannot be compared to eps/h^2 before the
+    # residual scale is known. Control rounding after each core difference.
+    action_tol = min(tol, cfg.algebra_tolerance)
+    kinetic = kinetic_action(
+        H,
+        psi,
+        action_tol;
+        absolute_tolerance = get(cfg, :kinetic_action_tolerance, nothing),
+        cap = cfg.work_cap,
     )
+    fn = pointwise((t, value, v) -> t + (v - energy) * value, sampled(kinetic, rec), orbital, field)
     cross(
         rec,
         length(psi),
@@ -191,6 +773,32 @@ function h_residual(
         initial_zero_fallback = () -> h_core_fallback(H, psi, energy; tol, cap, rec),
     )
 end
+
+"Contract a residual norm without interpolating its high-frequency kinetic component."
+function h_residual_norm(H::Hamiltonian, psi, energy, cfg, rec; tol, cap, label, potential)
+    kinetic = kinetic_action(
+        H,
+        psi,
+        min(tol, cfg.algebra_tolerance);
+        absolute_tolerance = get(cfg, :kinetic_action_tolerance, nothing),
+        cap = cfg.work_cap,
+    )
+    source = cross(
+        rec,
+        length(psi),
+        pointwise((v, value) -> (v - energy) * value, potential, sampled(psi, rec));
+        tol = min(tol, 0.01cfg.eigen_tolerance),
+        cap,
+        label = label * "_potential",
+        initial_zero_fallback = () -> begin
+            product = apply_mpo(potential_mpo(H, rec), psi; tol = cfg.algebra_tolerance, cap)
+            reconstruct_expression(linear_expression((product, psi), (1, -energy)); tol, cap)
+        end,
+    )
+    ttnorm(linear_expression((kinetic, source), (1, 1)))
+end
+h_residual_norm(H, psi, energy, cfg, rec; kwargs...) =
+    ttnorm(h_residual(H, psi, energy, cfg, rec; kwargs...))
 
 function h_action(H, psi, cfg, rec; label = "", work_tol = 0.0, potential = nothing)
     isfinite(work_tol) && work_tol >= 0 || throw(ArgumentError("Invalid H-action tolerance"))
@@ -209,14 +817,24 @@ end
 function h_project(tangent_basis, psi, H; projected_psi = nothing)
     center = projected_psi === nothing ? project(tangent_basis, psi) : projected_psi
     project(tangent_basis, psi, potential_mpo(H)) +
-    (center - (project(tangent_basis, psi, H.plus) + project(tangent_basis, psi, H.minus)) / 2) / H.h^2
+    kinetic_project(tangent_basis, psi, H.plus, H.minus, H.h, center)
+end
+
+"Use the gradient form when subtracting unit-scale shift projections loses digits."
+function kinetic_project(tangent_basis, psi, plus, minus, h, center)
+    left, right = project(tangent_basis, psi, minus), project(tangent_basis, psi, plus)
+    numerator = ((center - left) + (center - right)) / 2
+    if norm(numerator) <= sqrt(eps(Float64)) * (norm(center) + (norm(left) + norm(right)) / 2)
+        gradient = shift_difference(plus, psi)
+        return (project(tangent_basis, gradient, minus) - project(tangent_basis, gradient)) / (2h^2)
+    end
+    numerator / h^2
 end
 
 "Project H on gauge-constrained tangent coordinates, such as L4's projected/SVD columns."
 function h_project_tangent(tangent_basis, z, H)
     tangent = tangent_vector(tangent_basis, z)
-    project(tangent_basis, tangent, potential_mpo(H)) +
-    (z - (project(tangent_basis, tangent, H.plus) + project(tangent_basis, tangent, H.minus)) / 2) / H.h^2
+    h_project(tangent_basis, tangent, H; projected_psi = z)
 end
 function h_expectation(H, psi)
     # All coefficient-Hamiltonian blocks must use the same MPO contraction.
@@ -240,8 +858,7 @@ function kinetic_expectations(orbitals, plus, minus, h; cfg = (;))
             )
             numerator = compensated_sum(terms)
             # Nearly equal FD2 terms lose digits; use the exact low-rank gradient.
-            if abs(numerator) <= sqrt(eps(Float64)) * sum(abs, terms) ||
-               real(numerator) < 0
+            if abs(numerator) <= sqrt(eps(Float64)) * sum(abs, terms) || real(numerator) < 0
                 gradient = shift_difference(plus, orbitals[i])
                 numerator = inner(gradient, gradient; cfg) / 2
             end
@@ -252,15 +869,16 @@ function kinetic_expectations(orbitals, plus, minus, h; cfg = (;))
     out
 end
 
-function shift_difference(shift, psi)
-    # Exact low-rank shift, used only for cancellation-prone kinetic entries.
-    # No sampled fit or finite-tolerance truncation enters this fallback.
-    cap = maximum(size(w, 4) * size(g, 3) for (w, g) in zip(shift, psi.c))
-    shifted = apply_mpo(shift, psi; tol = 0.0, cap)
+function shift_difference(shift, psi; tol = 0.0, absolute_tolerance = nothing, cap = nothing)
+    # Apply the shift exactly; round only after cancellation in the common QR basis.
+    # Energy contractions use the default zero tolerance.
+    exact_cap = maximum(size(w, 4) * size(g, 3) for (w, g) in zip(shift, psi.c))
+    shifted = apply_mpo(shift, psi; tol = 0.0, cap = exact_cap)
     reconstruct_expression(
         linear_expression((shifted, psi), (1, -1));
-        tol = 0.0,
-        cap = rank(shifted) + rank(psi),
+        tol,
+        cap = cap === nothing ? rank(shifted) + rank(psi) : cap,
+        absolute_tolerance,
     )
 end
 
@@ -268,7 +886,8 @@ end
 function h_gram(orbitals, H; cfg = (;))
     with_sampling_seed(0) do
         b = length(orbitals)
-        bras, kets, (potential, plus, minus) = mpo_basis(orbitals, (potential_mpo(H), H.plus, H.minus))
+        bras, kets, (potential, plus, minus) =
+            mpo_basis(orbitals, (potential_mpo(H), H.plus, H.minus))
         overlaps = gram(orbitals; cfg)
         A = zeros(ComplexF64, b, b)
         fallback = fill(false, b, b)
@@ -381,30 +1000,41 @@ function ritz_coefficients!(
     offdiag
 end
 
-function reconstruct_orbitals(x::OrbitalTransform, cfg, rec; label)
-    evaluator = synchronized(block_evaluator(x.basis, rec))
+function reconstruct_orbitals(x::OrbitalTransform, cfg, rec; label, combination_samples = nothing)
     group_size = get(rec.options, :orbital_pivot_group_size, 4)
+    evaluators =
+        combination_samples === nothing ?
+        orbital_evaluators(x.basis, size(x.coefficients, 2), cfg, rec; group_size) : nothing
     updated_orbitals =
         recorded_map(QTT, size(x.coefficients, 2), cfg, rec; group_size) do i, localrec
             y = linear_combination(
                 localrec,
                 x.basis,
                 view(x.coefficients, :, i);
-                evaluator,
+                evaluator = evaluators === nothing ? nothing : orbital_evaluator(evaluators),
+                samples = combination_samples === nothing ? nothing :
+                          combination_samples(view(x.coefficients, :, i)),
                 tol = cfg.orthogonalization_tolerance,
                 cap = cfg.orbital_cap,
                 label = "$(label)_$i",
                 shared_pivots = "orbital_basis_group_$(cld(i, group_size))",
+                require_convergence = get(cfg, :adaptive_accuracy, false),
             )
             x.rotated ? normalize(y) : y
         end
-    updated_orbitals, block_cache_stats(evaluator)
+    updated_orbitals, evaluators === nothing ? (;) : block_cache_stats(evaluators)
 end
 
-function finish_orbital_transform(x::OrbitalTransform, original, cfg, rec)
+function finish_orbital_transform(
+    x::OrbitalTransform,
+    original,
+    cfg,
+    rec;
+    combination_samples = nothing,
+)
     x.transforms == 0 && return original, norm(x.metric - I)
     label = x.rotated ? "ritz_rotate" : "orthogonalize"
-    updated_orbitals, cache_stats = reconstruct_orbitals(x, cfg, rec; label)
+    updated_orbitals, cache_stats = reconstruct_orbitals(x, cfg, rec; label, combination_samples)
     metric = gram(updated_orbitals; cfg)
     defect = norm(metric - I)
     repaired = false
@@ -439,10 +1069,17 @@ function finish_orbital_transform(x::OrbitalTransform, original, cfg, rec)
     updated_orbitals, defect
 end
 
-function orthogonalize(orbitals, cfg, rec; force = false, metric = gram(orbitals; cfg))
+function orthogonalize(
+    orbitals,
+    cfg,
+    rec;
+    force = false,
+    metric = gram(orbitals; cfg),
+    combination_samples = nothing,
+)
     transform = OrbitalTransform(orbitals; cfg, metric)
     orthogonalize_coefficients!(transform, cfg; force)
-    finish_orbital_transform(transform, orbitals, cfg, rec)
+    finish_orbital_transform(transform, orbitals, cfg, rec; combination_samples)
 end
 
 function ritz_rotate(orbitals, H, cfg, rec; work_tol = 0.0, force = false)
@@ -496,13 +1133,21 @@ function coefficients(
     foreach_independent(b, (; parallel_tasks)) do i
         local ids, a
         ids = vcat(i, (b + 1):(b + m))
-        g = Hermitian(G[ids, ids])
-        e = eigen(g)
+        # Preserve the old orbital exactly when removing near-dependent tangent
+        # directions; truncating the joint Gram eigenvectors can discard it.
+        xnorm = sqrt(real(S_xx[i, i]))
+        overlap = S_vx[:, i] / xnorm
+        e = eigen(Hermitian(Matrix{ComplexF64}(I, m, m) - overlap * overlap'))
         good = findall(
-            >(max(maximum(e.values) * metric_relative_cutoff, metric_absolute_cutoff)),
+            >(max(maximum(e.values; init = 0.0) * metric_relative_cutoff, metric_absolute_cutoff)),
             e.values,
         )
-        orthogonalizers[i] = e.vectors[:, good] * Diagonal(1 ./ sqrt.(e.values[good]))
+        tangent_coefficients = e.vectors[:, good] * Diagonal(1 ./ sqrt.(e.values[good]))
+        orthogonalizer = zeros(ComplexF64, m + 1, length(good) + 1)
+        orthogonalizer[1, 1] = inv(xnorm)
+        orthogonalizer[1, 2:end] = vec(-(overlap' * tangent_coefficients) / xnorm)
+        orthogonalizer[2:end, 2:end] = tangent_coefficients
+        orthogonalizers[i] = orthogonalizer
         a = zeros(ComplexF64, m + 1, m + 1)
         a[1, 1] = energies[i] * real(S_xx[i, i])
         a[2:end, 1] = H_vx[:, i]
@@ -540,40 +1185,52 @@ function coefficients(
         coef[:, i] .= 0
         coef[ids, i] = v
     end
-    trace_after = sum(
+    orbital_energies = [
         real(
             dot(
                 coef[vcat(i, (b + 1):(b + m)), i],
                 hamiltonians[i] * coef[vcat(i, (b + 1):(b + m)), i],
             ),
         ) for i = 1:b
-    )
+    ]
     (
         c = diag(coef[1:b, :]),
         C = coef[(b + 1):end, :],
         gram_defect = norm(coef' * G * coef - I),
-        trace_after = trace_after,
+        trace_after = sum(orbital_energies),
+        orbital_energies = orbital_energies,
     )
 end
 
 # Low-rank orbital update; stages L1 to L7 match the performance logs.
 
 "Green fixed-point update: (T + mu*I)^(-1) * (mu + epsilon - V) * psi."
+function green_rhs(H, psi, energy, cfg, rec; potential, label)
+    cross(
+        rec,
+        cfg.R,
+        pointwise(
+            (v, value) -> (cfg.green_shift + energy - v) * value,
+            potential,
+            sampled(psi, rec),
+        );
+        tol = cfg.green_rhs_tolerance,
+        cap = get(cfg, :green_rhs_cap, cfg.work_cap),
+        label,
+    )
+end
+
 function block_green(orbitals, energies, H, green, cfg, rec; potential = nothing)
     potential_samples_shared =
         synchronized(potential === nothing ? potential_samples(H, rec) : potential)
     recorded_map(QTT, length(orbitals), cfg, rec) do i, localrec
-        psi_samples = sampled(orbitals[i], localrec)
-        rhs = cross(
-            localrec,
-            cfg.R,
-            pointwise(
-                (v, value) -> (cfg.green_shift + energies[i] - v) * value,
-                potential_samples_shared,
-                psi_samples,
-            );
-            tol = cfg.green_rhs_tolerance,
-            cap = get(cfg, :green_rhs_cap, cfg.work_cap),
+        rhs = green_rhs(
+            H,
+            orbitals[i],
+            energies[i],
+            cfg,
+            localrec;
+            potential = potential_samples_shared,
             label = "block_green_$i",
         )
         # Truncated MPO action establishes its own QR gauge when needed.
@@ -581,7 +1238,7 @@ function block_green(orbitals, energies, H, green, cfg, rec; potential = nothing
             apply_mpo(
                 green,
                 rhs;
-                tol = cfg.algebra_tolerance,
+                tol = min(cfg.algebra_tolerance, cfg.orbital_tolerance),
                 cap = cfg.orbital_cap,
                 rec = localrec,
             ),
@@ -595,12 +1252,12 @@ function lrrap_step(orbitals, previous, H, green, cfg, rec; work_tol = 0.0, pote
     state_tol = min(algebra_tol, cfg.orbital_tolerance)
     b = length(orbitals)
     field = potential === nothing ? potential_samples(H, rec) : potential
-    # L1: contract Rayleigh energies and sample only the final residuals.
-    energies, residuals = timed(rec, "L1") do
+    # L1 needs Rayleigh energies and residual norms, not residual tensor fits.
+    energies, residual_norms = timed(rec, "L1") do
         potential_samples_shared = synchronized(field)
-        results = recorded_map(Tuple{Float64,QTT}, b, cfg, rec) do i, localrec
+        results = recorded_map(Tuple{Float64,Float64}, b, cfg, rec) do i, localrec
             e = h_expectation(H, orbitals[i]) / real(inner(orbitals[i], orbitals[i]))
-            r = h_residual(
+            r = h_residual_norm(
                 H,
                 orbitals[i],
                 e,
@@ -615,17 +1272,37 @@ function lrrap_step(orbitals, previous, H, green, cfg, rec; work_tol = 0.0, pote
         end
         first.(results), last.(results)
     end
-    residual_norms = independent_map(i -> ttnorm(residuals[i]), Float64, b, cfg)
     # Cycle the tangent-space base point through the occupied orbitals.
     tangent_orbital = mod((rec.scf - 1) * cfg.inner_steps + rec.inner - 1, b) + 1
-    tangent_basis = timed(rec, "L2") do
-        tangent_space(orbitals[tangent_orbital]; cfg)
+    tangent_basis, tangent_base_rank = timed(rec, "L2") do
+        base = orbitals[tangent_orbital]
+        if work_tol > 0
+            # The trial tangent space uses the work budget; stored orbitals retain
+            # their finer representation and enter S_xx/H_vx without this rounding.
+            base = rounded(base; tol = min(work_tol, cfg.green_rhs_tolerance), cap = cfg.work_cap)
+        end
+        tangent_space(base; cfg), rank(base)
     end
     # L3: project orbitals, Green-preconditioned residuals, and prior directions into one tangent space.
     DX, DZ, DP = timed(rec, "L3") do
         rows = tangent_basis.offsets[end]
         dx = independent_columns(i -> project(tangent_basis, orbitals[i]), rows, b, cfg)
-        dz = independent_columns(i -> project(tangent_basis, residuals[i], green), rows, b, cfg)
+        # G*(H-epsilon)*psi = psi - G*(mu+epsilon-V)*psi.
+        # Fit the smooth source before applying G, avoiding a noisy FD2 intermediate.
+        shared_field = synchronized(field)
+        preconditioned = recorded_map(Vector{ComplexF64}, b, cfg, rec) do i, localrec
+            rhs = green_rhs(
+                H,
+                orbitals[i],
+                energies[i],
+                cfg,
+                localrec;
+                potential = shared_field,
+                label = "green_direction_rhs_$i",
+            )
+            view(dx, :, i) - project(tangent_basis, rhs, green)
+        end
+        dz = reduce(hcat, preconditioned)
         dp = independent_columns(
             i -> project(tangent_basis, previous[i]),
             rows,
@@ -635,7 +1312,6 @@ function lrrap_step(orbitals, previous, H, green, cfg, rec; work_tol = 0.0, pote
         dx, dz, dp
     end
     # Only tangent coordinates are needed beyond this point.
-    empty!(residuals)
     D, W, H_vv, S_vx, H_vx, S_xx = timed(rec, "L4") do
         raw = hcat(DX, DZ, DP)
         # Orthonormalize the tangent coordinates with SVD. X retains diagonal coefficients.
@@ -661,6 +1337,15 @@ function lrrap_step(orbitals, previous, H, green, cfg, rec; work_tol = 0.0, pote
         end
         D, W, H_vv, D' * DX, D' * phx, gram(orbitals; cfg)
     end
+    # Canonical orthogonalization amplifies Hamiltonian roundoff by 1/lambda(S).
+    # Resolve overlap directions only while that estimate stays below the eigen tolerance.
+    coefficient_metric_cutoff =
+        get(cfg, :adaptive_accuracy, false) ?
+        max(
+            cfg.metric_relative_cutoff,
+            eps(Float64) * cfg.kinetic_spectral_bound / cfg.eigen_tolerance,
+        ) : cfg.metric_relative_cutoff
+    coefficient_metric_cutoff < 1 || error("Grid exceeds the Float64 coefficient resolution budget")
     # L5: optimize the small coefficient problem under the orbital orthogonality constraints.
     coefficient_solution = timed(rec, "L5") do
         debug_snapshot(
@@ -676,7 +1361,7 @@ function lrrap_step(orbitals, previous, H, green, cfg, rec; work_tol = 0.0, pote
             energies;
             parallel_tasks = get(cfg, :parallel_tasks, 1),
             nsweeps = cfg.coefficient_sweeps,
-            metric_relative_cutoff = cfg.metric_relative_cutoff,
+            metric_relative_cutoff = coefficient_metric_cutoff,
             metric_absolute_cutoff = cfg.metric_absolute_cutoff,
             constraint_relative_cutoff = cfg.constraint_relative_cutoff,
             constraint_absolute_cutoff = cfg.constraint_absolute_cutoff,
@@ -699,14 +1384,11 @@ function lrrap_step(orbitals, previous, H, green, cfg, rec; work_tol = 0.0, pote
         results = recorded_map(Tuple{QTT,QTT}, b, cfg, rec) do i, localrec
             t = tangent_vector(tangent_basis, view(correction_coordinates, :, i))
             y = normalize(
-                add(
-                    orbitals[i],
-                    t;
-                    a = coefficient_solution.c[i],
+                reconstruct_expression(
+                    linear_expression((orbitals[i], t), (coefficient_solution.c[i], 1));
                     tol = state_tol,
                     cap = cfg.orbital_cap,
-                    rec = localrec,
-                    label = "orbital_update_$i",
+                    absolute_tolerance = get(cfg, :adaptive_accuracy, false) ? state_tol : nothing,
                 ),
             )
             p = if green_update
@@ -732,7 +1414,16 @@ function lrrap_step(orbitals, previous, H, green, cfg, rec; work_tol = 0.0, pote
         # Accepted orbitals keep the original tight Green output accuracy;
         # the looser work budget applies to search directions, not this state.
         updated_orbitals = timed(rec, "L6G") do
-            block_green(updated_orbitals, energies, H, green, cfg, rec; potential = field)
+            # The coefficient solve already supplies Rayleigh values for these updated orbitals.
+            block_green(
+                updated_orbitals,
+                coefficient_solution.orbital_energies,
+                H,
+                green,
+                cfg,
+                rec;
+                potential = field,
+            )
         end
     end
     updated_orbitals, gramdef, ritz_offdiag = timed(rec, "L7") do
@@ -748,14 +1439,19 @@ function lrrap_step(orbitals, previous, H, green, cfg, rec; work_tol = 0.0, pote
     end
     metrics = (
         tangent_orbital = tangent_orbital,
+        tangent_base_rank = tangent_base_rank,
         tangent_dimension = size(D, 2),
         residual_max = maximum(residual_norms),
         residual_rms = sqrt(sum(abs2, residual_norms) / b),
         trace_before = sum(energies),
         trace_after = coefficient_solution.trace_after,
+        coefficient_metric_cutoff,
         coefficient_gram_defect = coefficient_solution.gram_defect,
         gram_defect = gramdef,
         green_update = green_update,
+        green_energy_update_max_Ha = maximum(
+            abs.(coefficient_solution.orbital_energies .- energies),
+        ),
         ritz_offdiagonal_before = ritz_offdiag,
         max_rank = maximum(rank.(updated_orbitals)),
         inner_output_max_rank = maximum(rank.(updated_orbitals)),
@@ -837,7 +1533,18 @@ function compress_orbitals(orbitals, cfg; tol = cfg.orbital_tolerance, input_gra
         end
         # Compression must not sacrifice occupied-space orthogonality.
         defect = norm(gram(updated_orbitals; cfg) - I)
-        if defect <= max(cfg.storage_gram_tolerance, 2input_defect)
+        representation_error =
+            get(cfg, :adaptive_accuracy, false) ?
+            maximum(
+                independent_map(
+                    i -> difference_norm(updated_orbitals[i], orbitals[i]),
+                    Float64,
+                    length(orbitals),
+                    cfg,
+                ),
+            ) : nothing
+        accurate = representation_error === nothing || representation_error <= 2tol + 16eps(Float64)
+        if defect <= max(cfg.storage_gram_tolerance, 2input_defect) && accurate
             return updated_orbitals,
             (
                 orbital_storage_tolerance = actual,
@@ -846,10 +1553,11 @@ function compress_orbitals(orbitals, cfg; tol = cfg.orbital_tolerance, input_gra
                 orbital_bytes_before_compression = before,
                 orbital_compression_attempts = attempt,
                 stored_gram_defect = defect,
+                storage_orbital_error_max = representation_error,
             )
         end
     end
-    error("Orbital compression failed the Gram check at requested tolerances")
+    error("Orbital compression failed the Gram or representation-error budget")
 end
 
 # VectorInterface keeps solver tolerances and rank caps separate from the stored QTT type.
@@ -897,7 +1605,8 @@ VI.add!!(y::QTTVector, x::QTTVector, a::Number, b::Number) = VI.add(y, x, a, b)
 function lanczos_orbitals(factorization, norbitals, cfg, rec; tol)
     dimension = length(factorization)
     projected =
-        factorization isa KrylovKit.LanczosFactorization ? KrylovKit.rayleighquotient(factorization) :
+        factorization isa KrylovKit.LanczosFactorization ?
+        KrylovKit.rayleighquotient(factorization) :
         Hermitian(view(factorization.H, 1:dimension, 1:dimension))
     spectrum = eigen(projected)
     basis = reconstruct_orbital!.(KrylovKit.basis(factorization))
@@ -1019,18 +1728,19 @@ function canonical_orthogonalizer(overlap, relative_cutoff, absolute_cutoff)
     metric.vectors[:, independent] * Diagonal(inv.(sqrt.(metric.values[independent])))
 end
 
-"Fit each final orbital from one shared basis cache."
+"Fit final orbitals with shared endpoint tables and bounded contraction caches."
 function combine_orbitals(basis, coefficients, cfg, rec; tol, cap, label)
-    evaluator = synchronized(block_evaluator(basis, rec))
+    evaluators = orbital_evaluators(basis, size(coefficients, 2), cfg, rec)
     recorded_map(QTT, size(coefficients, 2), cfg, rec) do i, localrec
         linear_combination(
             localrec,
             basis,
             view(coefficients, :, i);
-            evaluator,
+            evaluator = orbital_evaluator(evaluators),
             tol,
             cap,
             label = "$(label)_$i",
+            require_convergence = get(cfg, :adaptive_accuracy, false),
         )
     end
 end

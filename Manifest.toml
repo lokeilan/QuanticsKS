@@ -2,7 +2,7 @@
 
 julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "e3b50668f30c54dfca7b318d7dd5fe2e178d9d80"
+project_hash = "53a62df91ba263471f6933d3b7f825b5efc0eaa2"
 
 [[deps.Accessors]]
 deps = ["CompositionsBase", "ConstructionBase", "Dates", "InverseFunctions", "MacroTools"]
@@ -283,6 +283,12 @@ deps = ["Random"]
 uuid = "9fa8497b-333b-5362-9e8d-4d0656e87820"
 version = "1.11.0"
 
+[[deps.GPUArraysCore]]
+deps = ["Adapt"]
+git-tree-sha1 = "f60436514e6d73f8ee069ae4ee0ff038fe96b69d"
+uuid = "46192b85-c4d5-4398-a991-12ede77f4527"
+version = "0.2.2"
+
 [[deps.HalfIntegers]]
 git-tree-sha1 = "9c3149243abb5bc0bad0431d6c4fcac0f4443c7c"
 uuid = "f0d1745a-41c9-11e9-1dd9-e5d34d218721"
@@ -399,6 +405,18 @@ weakdeps = ["ChainRulesCore"]
 
     [deps.KrylovKit.extensions]
     KrylovKitChainRulesCoreExt = "ChainRulesCore"
+
+[[deps.LOBPCGEigensolver]]
+deps = ["GPUArraysCore", "LinearAlgebra", "Printf", "Random", "TimerOutputs"]
+git-tree-sha1 = "f43386ca5fd5d0437358aab793fbe15724b0d3e7"
+uuid = "87a0849e-8492-4fcc-8734-ba6a5d902784"
+version = "0.1.4"
+
+    [deps.LOBPCGEigensolver.extensions]
+    LOBPCGEigensolverAMDGPUExt = "AMDGPU"
+
+    [deps.LOBPCGEigensolver.weakdeps]
+    AMDGPU = "21141c5a-9bdb-4563-92ae-f87d6854732e"
 
 [[deps.LRUCache]]
 git-tree-sha1 = "5519b95a490ff5fe629c4a7aa3b3dfc9160498b3"

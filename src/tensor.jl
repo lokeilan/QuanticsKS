@@ -87,11 +87,21 @@ function rounded(x::QTT; tol = 1e-11, cap = 64)
 end
 
 "Pointwise addition uses recorded TCI when rec is supplied, otherwise library TT addition."
-function add(x::QTT, y::QTT; a = 1, b = 1, tol = 1e-11, cap = 64, rec = nothing, label = "add")
+function add(
+    x::QTT,
+    y::QTT;
+    a = 1,
+    b = 1,
+    tol = 1e-11,
+    cap = 64,
+    rec = nothing,
+    label = "add",
+    require_convergence = false,
+)
     validate_truncation(tol, cap)
     length(x) == length(y) || throw(DimensionMismatch("QTT addition lengths"))
     if rec !== nothing
-        return linear_combination(rec, (x, y), (a, b); tol, cap, label)
+        return linear_combination(rec, (x, y), (a, b); tol, cap, label, require_convergence)
     end
     # TCI 0.9.19's block addition assumes distinct first and last sites.
     length(x) == 1 && return QTT([a .* only(x.c) .+ b .* only(y.c)])
@@ -187,16 +197,76 @@ mutable struct Evaluator
     prefix::Int
     suffix::Int
 end
-function Evaluator(x::QTT; cachebits = 10)
-    0 <= cachebits <= 16 || throw(ArgumentError("Environment cache bits must be 0:16"))
-    # Cache this many binary sites at each end. At R16, cachebits=8 stores
-    # two sets of 256 vectors and reduces each query to one dot product.
-    # Reusable buffers bound memory for the uncached middle of larger grids.
-    p = min(cachebits, length(x) ÷ 2)
-    s = min(cachebits, length(x) - p)
-    cache = TCI.TTCache(tensortrain(x))
-    l = hcat([TCI.evaluateleft(cache, bits(j, p)) for j = 0:(2^p - 1)]...)
-    r = hcat([TCI.evaluateright(cache, bits(j, s)) for j = 0:(2^s - 1)]...)
+"Choose endpoint tables from actual bond sizes and a block-wide byte budget."
+function endpoint_plan(xs, max_bytes)
+    R = length(first(xs))
+    all(x -> length(x) == R, xs) || throw(DimensionMismatch("Endpoint grids"))
+    buffer_bytes = 32sum(x -> max(rank(x), 1), xs)
+    max_bytes >= 32length(xs) + buffer_bytes ||
+        throw(ArgumentError("Endpoint budget is too small for contraction buffers"))
+    ranks = [sum(p == 0 ? 1 : size(x.c[p], 3) for x in xs) for p = 0:R]
+    costs = [sum(size(x.c[k], 1) * size(x.c[k], 3) for x in xs) for k = 1:R]
+    limit = min(R, floor(Int, log2((max_bytes - buffer_bytes) / 16)))
+    left_extra, right_extra = zeros(Int, limit + 1), zeros(Int, limit + 1)
+    for x in xs
+        left_sizes = [16 * (1 << k) * (k == 0 ? 1 : size(x.c[k], 3)) for k = 0:limit]
+        right_sizes = [16 * (1 << k) * (k == 0 ? 1 : size(x.c[R - k + 1], 1)) for k = 0:limit]
+        for k = 1:limit
+            left_extra[k + 1] = max(
+                left_extra[k + 1],
+                maximum(left_sizes[j] + left_sizes[j + 1] for j = 1:k) - left_sizes[k + 1],
+            )
+            right_extra[k + 1] = max(
+                right_extra[k + 1],
+                maximum(right_sizes[j] + right_sizes[j + 1] for j = 1:k) - right_sizes[k + 1],
+            )
+        end
+    end
+    best = (
+        prefix = 0,
+        suffix = 0,
+        bytes = 32length(xs),
+        buffer_bytes,
+        peak_bytes = 32length(xs) + buffer_bytes,
+        cost = sum(costs),
+    )
+    for p = 0:limit, s = 0:min(limit, R - p)
+        R > 1 && (p == R || s == R) && continue
+        bytes = 16 * ((1 << p) * ranks[p + 1] + (1 << s) * ranks[R - s + 1])
+        peak_bytes = bytes + buffer_bytes + max(left_extra[p + 1], right_extra[s + 1])
+        peak_bytes <= max_bytes || continue
+        # Once endpoints meet, choose the smallest tables instead of a near-dense lookup.
+        cost = sum(view(costs, (p + 1):(R - s)); init = 0)
+        (cost < best.cost || (cost == best.cost && bytes < best.bytes)) &&
+            (best = (; prefix = p, suffix = s, bytes, buffer_bytes, peak_bytes, cost))
+    end
+    best
+end
+
+"Build each endpoint by matrix products without a second dictionary of partial tables."
+function endpoint_table(x, count, left)
+    table = ones(ComplexF64, 1, 1)
+    for k = 1:count
+        core = x.c[left ? k : length(x) - k + 1]
+        n = size(table, 2)
+        next = Matrix{ComplexF64}(undef, size(core, left ? 3 : 1), 2n)
+        for digit = 1:2
+            columns = left ? (((digit - 1) * n + 1):(digit * n)) : (digit:2:(2n))
+            if left
+                mul!(view(next, :, columns), transpose(view(core, :, digit, :)), table)
+            else
+                mul!(view(next, :, columns), view(core, :, digit, :), table)
+            end
+        end
+        table = next
+    end
+    table
+end
+
+function Evaluator(x::QTT; max_bytes = 8 * 1024^2, plan = endpoint_plan((x,), max_bytes))
+    p, s = plan.prefix, plan.suffix
+    l = endpoint_table(x, p, true)
+    r = endpoint_table(x, s, false)
     Evaluator(x, zeros(ComplexF64, max(rank(x), 1)), zeros(ComplexF64, max(rank(x), 1)), l, r, p, s)
 end
 function (e::Evaluator)(j::Int)
@@ -288,8 +358,11 @@ struct ExpressionEvaluator
     coefficients::Vector{ComplexF64}
     R::Int
 end
-Evaluator(x::QTTExpression; cachebits = 10) =
-    ExpressionEvaluator([Evaluator(t; cachebits) for t in x.terms], x.coefficients, x.R)
+Evaluator(x::QTTExpression; max_bytes = 8 * 1024^2) = ExpressionEvaluator(
+    [Evaluator(t; max_bytes = max_bytes ÷ max(1, length(x.terms))) for t in x.terms],
+    x.coefficients,
+    x.R,
+)
 function (e::ExpressionEvaluator)(j::Int)
     0 <= j < (1 << e.R) || throw(BoundsError(e, j))
     compensated_sum(c * f(j) for (c, f) in zip(e.coefficients, e.evaluators))
@@ -443,13 +516,33 @@ function difference_norm(x::QTT, y::QTT; rec = nothing, label = "density_differe
 end
 
 "Reconstruct the linear combination, then round it with numerical failure recovery."
-function reconstruct_expression(x::QTTExpression; tol, cap)
+function reconstruct_expression(x::QTTExpression; tol, cap, absolute_tolerance = nothing)
     validate_truncation(tol, cap)
     isempty(x.terms) && return constant_tt(x.R, 0)
-    length(x.terms) == 1 && return rounded(scale(only(x.terms), only(x.coefficients)); tol, cap)
+    if length(x.terms) == 1
+        value = scale(only(x.terms), only(x.coefficients))
+        return absolute_tolerance === nothing ? rounded(value; tol, cap) :
+               rounded_absolute(value, absolute_tolerance; cap)
+    end
     C, cores = expression_qr(x.terms, reshape(x.coefficients, :, 1); keep_cores = true)
     push!(cores, reshape(C, size(C, 1) ÷ 2, 2, 1))
-    rounded(QTT(cores); tol, cap)
+    value = QTT(cores)
+    absolute_tolerance === nothing ? rounded(value; tol, cap) :
+    rounded_absolute(value, absolute_tolerance; cap, amplitude_norm = norm(C))
+end
+
+"Round only when the measured amplitude error satisfies its absolute budget."
+function rounded_absolute(x, tolerance; cap, amplitude_norm = ttnorm(x))
+    isfinite(tolerance) && tolerance > 0 ||
+        throw(ArgumentError("Invalid absolute amplitude tolerance"))
+    amplitude_norm <= tolerance && return constant_tt(length(x), 0.0)
+    relative = tolerance / (amplitude_norm * max(1, length(x) - 1))
+    for attempt = 1:4
+        value = rounded(x; tol = relative, cap)
+        difference_norm(value, x) <= tolerance && return value
+        relative /= 10
+    end
+    error("Tensor rounding could not meet the absolute amplitude budget $tolerance")
 end
 
 # MPO construction and action; axes are left bond, output site, input site, right bond.
@@ -537,7 +630,7 @@ function apply_mpo(w, x::QTT; tol = 1e-11, cap = 64, algorithm = :zipup, rec = n
                 psi;
                 alg = "zipup",
                 cutoff = (tol / length(x))^2,
-                maxdim = max(2cap, 16),
+                maxdim = cap,
                 truncate_kwargs = (; cutoff = tol^2, maxdim = cap),
             )
         end
@@ -601,14 +694,14 @@ struct PeriodicRefinement
     nodes::Vector{Int}
     weights::Matrix{Float64}
 end
-function PeriodicRefinement(x::QTT, target_R::Int; degree = 5, cachebits = 10)
+function PeriodicRefinement(x::QTT, target_R::Int; degree = 5, max_bytes = 8 * 1024^2)
     target_R > length(x) || throw(ArgumentError("Refinement requires a finer grid"))
     q = 1 << (target_R - length(x))
     nodes = collect((-(degree ÷ 2)):(degree ÷ 2 + 1))
     weights = [
         prod((s / q - b) / (a - b) for b in nodes if b != a) / sqrt(q) for a in nodes, s = 0:(q - 1)
     ]
-    PeriodicRefinement(Evaluator(x; cachebits), 1 << length(x), q, nodes, weights)
+    PeriodicRefinement(Evaluator(x; max_bytes), 1 << length(x), q, nodes, weights)
 end
 function (p::PeriodicRefinement)(j::Int)
     coarse, offset = divrem(j, p.ratio)

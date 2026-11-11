@@ -14,11 +14,10 @@ function validate(t::TCIOptions)
         t.zero_check_limit,
     ) > 0 || throw(ArgumentError("Invalid TCI counts"))
     t.dense_cache_max_points >= 0 || throw(ArgumentError("Negative dense cache limit"))
-    t.orbital_cache_max_bytes >= 0 || throw(ArgumentError("Negative orbital cache budget"))
+    min(t.orbital_cache_max_bytes, t.environment_cache_max_bytes) >= 1024 ||
+        throw(ArgumentError("Cache byte budgets must be at least 1024"))
     min(t.global_pivot_search, t.max_global_pivots, t.initial_random_pivots) >= 0 ||
         throw(ArgumentError("Negative pivot count"))
-    0 <= t.environment_cache_bits <= 16 ||
-        throw(ArgumentError("Environment cache bits must be 0:16"))
     isfinite(t.post_rounding_factor) && 0 <= t.post_rounding_factor <= 1 ||
         throw(ArgumentError("Invalid post-rounding factor"))
     t
@@ -62,6 +61,7 @@ function validate(a::AuditOptions)
             a.field_tolerance,
             a.kernel_tolerance,
             a.algebra_tolerance,
+            a.residual_fit_tolerance,
             a.gram_tolerance,
             a.charge_tolerance,
         ),
@@ -75,6 +75,10 @@ function validate(s::SCFOptions)
         ),
     )
     s.parallel_tasks >= 0 || throw(ArgumentError("parallel_tasks must be nonnegative"))
+    s.refinement_bits > 0 || throw(ArgumentError("Refinement bits must be positive"))
+    s.initial_spacing === nothing ||
+        (isfinite(s.initial_spacing) && s.initial_spacing > 0) ||
+        throw(ArgumentError("Initial spacing must be positive"))
     s.criterion in (:energy, :strict) ||
         throw(ArgumentError("SCF criterion must be :energy or :strict"))
     min(s.max_iterations, s.inner_steps, s.coefficient_sweeps, s.anderson_history) > 0 &&
@@ -82,6 +86,8 @@ function validate(s::SCFOptions)
     s.green_update_interval >= 0 || throw(ArgumentError("Negative Green update interval"))
     for key in (
         :energy_tolerance,
+        :coarse_energy_tolerance,
+        :coarse_density_tolerance,
         :eigen_tolerance,
         :density_tolerance,
         :green_shift,
@@ -243,18 +249,8 @@ function problem_from_config(d)
     throw(ArgumentError("Unsupported system kind: $kind"))
 end
 function problem_from_config3d(gd, sd)
-    kind = get(sd, "kind", "hydrogen_cluster")
-    if kind == "hydrogen_cluster"
-        require_keys(sd, ["kind", "shape", "distance", "padding", "xc"], "3D system")
-        return hydrogen_cluster(;
-            R = get(gd, "R", 7),
-            shape = Tuple(get(sd, "shape", [3, 2, 2])),
-            distance = get(sd, "distance", 2ANGSTROM_TO_BOHR),
-            padding = get(sd, "padding", 10.0),
-            cell = get(gd, "cell", nothing),
-            xc = Symbol(get(sd, "xc", "pz81")),
-        )
-    elseif kind == "all_electron"
+    kind = get(sd, "kind", "all_electron")
+    if kind == "all_electron"
         require_keys(sd, ["kind", "positions", "charges", "occupations", "mass", "xc"], "3D system")
         m = AllElectronLDA3D(sd["positions"], sd["charges"]; xc = Symbol(get(sd, "xc", "pz81")))
         return Problem(
@@ -362,6 +358,11 @@ function configuration_plan(path)
         "note" => "Dense storage comparison only; not an estimate of peak memory.",
     )
     options.kind == "scf" && (plan["solver"] = string(options.scf.solver))
+    if problem.grid isa BoxGrid3D
+        plan["axis_bits"] = collect(axis_bits(problem.grid))
+        plan["grid_shape"] = collect(grid_shape(problem.grid))
+        plan["grid_spacing"] = collect(spacing(problem.grid))
+    end
     plan
 end
 
@@ -392,12 +393,12 @@ function run_config(settings::AbstractDict, path; output = nothing, checkpoint =
         initial =
             checkpoint_path === nothing ? nothing :
             load_checkpoint(checkpoint_path; model = problem.model)
-        if initial !== nothing && initial.problem.grid.R < problem.grid.R
+        if initial !== nothing && is_refinement(initial.problem.grid, problem.grid)
             tasks = kind == "scf" ? scf.parallel_tasks : time_options.parallel_tasks
             initial = refine_state(
                 initial,
                 problem;
-                accuracy = accuracy,
+                accuracy = kind == "scf" ? iteration_accuracy(problem, accuracy, scf) : accuracy,
                 tci,
                 refinement = refinement,
                 parallel_tasks = tasks,
@@ -423,6 +424,7 @@ function run_config(settings::AbstractDict, path; output = nothing, checkpoint =
                 guess,
                 physics,
                 audit,
+                refinement,
                 output = output_directory,
             )
         else

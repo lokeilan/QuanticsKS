@@ -90,7 +90,8 @@ function build_operators(problem, accuracy, rec, physics::PhysicsNumerics)
         xc_table,
         Q.shift_mpo(grid.R, 1),
         Q.shift_mpo(grid.R, -1),
-        external_samples,
+        # All consumers reuse the static field fitted at its own accuracy budget.
+        Q.memoized_sample(external, rec),
         nuclear_energy(model, grid.L),
     )
 end
@@ -156,8 +157,14 @@ function local_potential_samples(problem, rho, ops, accuracy, rec; time = 0.0, d
 end
 
 function effective_hamiltonian(
-    problem, rho, ops, accuracy, rec;
-    time = 0.0, drive = NoDrive(), fit_potential = true,
+    problem,
+    rho,
+    ops,
+    accuracy,
+    rec;
+    time = 0.0,
+    drive = NoDrive(),
+    fit_potential = true,
 )
     field = local_potential_samples(problem, rho, ops, accuracy, rec; time, drive)
     # Core projections need one shared field representation; sampled residuals
@@ -175,8 +182,9 @@ function effective_hamiltonian(
             label = "effective_potential",
         )
     potential = fit_potential ? build_potential() : nothing
-    diagonal = fit_potential ? Q.diagonal(potential) :
-               Q.DeferredPotentialMPO(localrec -> Q.diagonal(build_potential(something(localrec, rec))))
+    diagonal =
+        fit_potential ? Q.diagonal(potential) :
+        Q.DeferredPotentialMPO(localrec -> Q.diagonal(build_potential(something(localrec, rec))))
     Q.Hamiltonian(
         potential,
         diagonal,
@@ -201,8 +209,7 @@ function total_energy(problem, orbitals, rho, ops, accuracy, rec; time = 0.0, dr
     # Contract <rho|K|rho> directly instead of materializing the Hartree field.
     # V_H = dx * K*rho, so the Hartree integral carries dx^2.
     hartree_energy =
-        ops.interaction === nothing ? 0.0 :
-        0.5dx^2 * real(Q.inner_mpo(rho, ops.interaction, rho))
+        ops.interaction === nothing ? 0.0 : 0.5dx^2 * real(Q.inner_mpo(rho, ops.interaction, rho))
     xc_energy = 0.0
     if ops.xc_table !== nothing
         rho_samples = Q.sampled(rho, rec)
@@ -248,13 +255,16 @@ end
 # Cartesian operators for isolated 3D systems.
 
 "Lift a one-axis MPO into interleaved Cartesian sites with identity operators on the other axes."
-function axis_mpo(w, axis::Int)
+function axis_mpo(w, axis::Int, axes = repeat(collect(1:3), length(w)))
     1 <= axis <= 3 || throw(ArgumentError("Axis must be 1:3"))
+    count(==(axis), axes) == length(w) || throw(DimensionMismatch("Axis MPO sites"))
     out = Array{ComplexF64,4}[]
     bond = 1
-    for k = 1:(3length(w))
-        if mod1(k, 3) == axis
-            core = w[cld(k, 3)]
+    bit = 0
+    for a in axes
+        if a == axis
+            bit += 1
+            core = w[bit]
             push!(out, core)
             bond = size(core, 4)
         else
@@ -268,10 +278,11 @@ function axis_mpo(w, axis::Int)
     out
 end
 
-"Open 3D convolution from a signed displacement QTT on (2N)^3 points."
-function cartesian_toeplitz(kernel::Q.QTT, R::Int)
-    length(kernel) == 3(R + 1) || throw(DimensionMismatch("Signed kernel grid"))
-    d = 3R
+"Open 3D convolution with one signed displacement bit per axis."
+cartesian_toeplitz(kernel::Q.QTT, R::Int) = cartesian_toeplitz(kernel, repeat(collect(1:3), R))
+function cartesian_toeplitz(kernel::Q.QTT, axes::AbstractVector{Int})
+    d = length(axes)
+    length(kernel) == d + 3 || throw(DimensionMismatch("Signed kernel grid"))
     # The final three kernel bits encode the sign of each coordinate difference.
     cache = Q.TCI.TTCache(Q.tensortrain(kernel))
     tail = hcat([Q.TCI.evaluateright(cache, Q.bits(mask, 3)) for mask = 0:7]...)
@@ -279,7 +290,7 @@ function cartesian_toeplitz(kernel::Q.QTT, R::Int)
     for k = 1:d
         g = kernel.c[k]
         rl, _, rr = size(g)
-        axis = mod1(k, 3)
+        axis = axes[k]
         w = zeros(ComplexF64, k == 1 ? 1 : 8rl, 2, 2, k == d ? 1 : 8rr)
         # One borrow bit per axis implements signed displacement without periodic wrap.
         for mask in (k == 1 ? (0:0) : (0:7)), i = 0:1, j = 0:1
@@ -396,7 +407,7 @@ function build_operators(
                     a -> clamp(
                         floor(Int, (r[a] + grid.L[a] / 2) / spacing(grid)[a]),
                         0,
-                        (1 << grid.R) - 1,
+                        grid_shape(grid)[a] - 1,
                     ),
                     3,
                 ),
@@ -412,13 +423,14 @@ function build_operators(
         pivots,
     )
     interaction = if model isa AllElectronLDA3D
-        n = 1 << grid.R
+        n = grid_shape(grid)
         kernel = Q.cross(
             rec,
             nsites(grid) + 3,
             j -> begin
-                q = ntuple(a -> sum(((j >> (3b + a - 1)) & 1) << b for b = 0:(grid.R)), 3)
-                r = ntuple(a -> (q[a] < n ? q[a] : q[a] - 2n) * spacing(grid)[a], 3)
+                q = grid_indices(grid, j & (length(grid) - 1))
+                signs = j >> nsites(grid)
+                r = ntuple(a -> (q[a] - ((signs >> (a - 1)) & 1) * n[a]) * spacing(grid)[a], 3)
                 coulomb_cell_average(r, spacing(grid))
             end;
             tol = accuracy.kernel_tolerance,
@@ -426,7 +438,7 @@ function build_operators(
             label = "interaction",
             pivots = [0],
         )
-        cartesian_toeplitz(kernel, grid.R)
+        cartesian_toeplitz(kernel, grid_axes(grid))
     else
         nothing
     end
@@ -434,8 +446,22 @@ function build_operators(
         external,
         interaction,
         model isa AllElectronLDA3D && model.xc == :pz81 ? PZ81Table() : nothing,
-        ntuple(axis -> axis_mpo(Q.shift_mpo(grid.R, 1; boundary = :open), axis), 3),
-        ntuple(axis -> axis_mpo(Q.shift_mpo(grid.R, -1; boundary = :open), axis), 3),
+        ntuple(
+            axis -> axis_mpo(
+                Q.shift_mpo(axis_bits(grid)[axis], 1; boundary = :open),
+                axis,
+                grid_axes(grid),
+            ),
+            3,
+        ),
+        ntuple(
+            axis -> axis_mpo(
+                Q.shift_mpo(axis_bits(grid)[axis], -1; boundary = :open),
+                axis,
+                grid_axes(grid),
+            ),
+            3,
+        ),
         samples,
         nuclear_energy(model, grid),
     )
@@ -552,9 +578,18 @@ function effective_hamiltonian(
             label = "effective_potential",
         )
     potential = fit_potential ? build_potential() : nothing
-    diagonal = fit_potential ? Q.diagonal(potential) :
-               Q.DeferredPotentialMPO(localrec -> Q.diagonal(build_potential(something(localrec, rec))))
-    CartesianHamiltonian(potential, diagonal, ops.plus, ops.minus, problem.grid, problem.mass, field)
+    diagonal =
+        fit_potential ? Q.diagonal(potential) :
+        Q.DeferredPotentialMPO(localrec -> Q.diagonal(build_potential(something(localrec, rec))))
+    CartesianHamiltonian(
+        potential,
+        diagonal,
+        ops.plus,
+        ops.minus,
+        problem.grid,
+        problem.mass,
+        field,
+    )
 end
 
 "Keep all FD2 terms until the caller combines and truncates its final expression."
@@ -576,6 +611,26 @@ function Q.h_core_fallback(H::CartesianHamiltonian, psi, energy; tol, cap, rec =
         cap,
     )
 end
+function Q.hamiltonian_samples(H::CartesianHamiltonian, ev, v, R; energy = 0.0)
+    n, h = grid_shape(H.grid), spacing(H.grid)
+    fn =
+        j -> begin
+            indices = grid_indices(H.grid, j)
+            center = ev(j)
+            kinetic = 0.0im
+            for a = 1:3
+                left =
+                    indices[a] == 0 ? 0.0 :
+                    ev(grid_index(H.grid, ntuple(b -> indices[b] - (a == b), 3)))
+                right =
+                    indices[a] == n[a] - 1 ? 0.0 :
+                    ev(grid_index(H.grid, ntuple(b -> indices[b] + (a == b), 3)))
+                kinetic += ((center - left) + (center - right)) / (2H.mass * h[a]^2)
+            end
+            kinetic + (v(j) - energy) * center
+        end
+    Q.sampled(fn, R)
+end
 function Q.h_residual(
     H::CartesianHamiltonian,
     psi,
@@ -589,25 +644,13 @@ function Q.h_residual(
 )
     Q.validate_truncation(tol, cap)
     isfinite(energy) || throw(ArgumentError("Nonfinite orbital energy"))
-    ev = Q.evaluate(psi, rec)
-    v = potential === nothing ? H.samples : potential
-    n, h = 1 << H.grid.R, spacing(H.grid)
-    fn =
-        j -> begin
-            indices = grid_indices(H.grid, j)
-            center = ev(j)
-            kinetic = 0.0im
-            for a = 1:3
-                left =
-                    indices[a] == 0 ? 0.0 :
-                    ev(grid_index(H.grid, ntuple(b -> indices[b] - (a == b), 3)))
-                right =
-                    indices[a] == n - 1 ? 0.0 :
-                    ev(grid_index(H.grid, ntuple(b -> indices[b] + (a == b), 3)))
-                kinetic += ((center - left) + (center - right)) / (2H.mass * h[a]^2)
-            end
-            kinetic + (v(j) - energy) * center
-        end
+    fn = Q.hamiltonian_samples(
+        H,
+        Q.evaluate(psi, rec),
+        potential === nothing ? H.samples : potential,
+        nsites(H.grid);
+        energy,
+    )
     Q.cross(
         rec,
         nsites(H.grid),
@@ -622,9 +665,14 @@ function Q.h_project(tangent_basis, psi, H::CartesianHamiltonian; projected_psi 
     result = Q.project(tangent_basis, psi, Q.potential_mpo(H))
     center = projected_psi === nothing ? Q.project(tangent_basis, psi) : projected_psi
     for a = 1:3
-        result +=
-            (center - (Q.project(tangent_basis, psi, H.plus[a]) + Q.project(tangent_basis, psi, H.minus[a])) / 2) /
-            (H.mass * spacing(H.grid)[a]^2)
+        result += Q.kinetic_project(
+            tangent_basis,
+            psi,
+            H.plus[a],
+            H.minus[a],
+            sqrt(H.mass) * spacing(H.grid)[a],
+            center,
+        )
     end
     result
 end
@@ -642,7 +690,14 @@ function Q.h_gram(orbitals, H::CartesianHamiltonian; cfg = (;))
             get!(gradients, (i, a)) do
                 Q.shift_difference(H.plus[a], orbitals[i])
             end
-        faces = ntuple(a -> axis_mpo(Q.diagonal(Q.delta_tt(H.grid.R, (1 << H.grid.R) - 1)), a), 3)
+        faces = ntuple(
+            a -> axis_mpo(
+                Q.diagonal(Q.delta_tt(axis_bits(H.grid)[a], grid_shape(H.grid)[a] - 1)),
+                a,
+                grid_axes(H.grid),
+            ),
+            3,
+        )
         out = zeros(ComplexF64, length(orbitals), length(orbitals))
         for j in eachindex(orbitals), i = 1:j
             value = Q.ITensorMPS.inner(bras[i], potential, kets[j]; make_inds_match = false)
@@ -801,8 +856,7 @@ function total_energy(
     external = dv * real(Q.inner(rho, ops.external))
     # V_H = dV * K*rho, so the Hartree integral carries dV^2.
     hartree_energy =
-        ops.interaction === nothing ? 0.0 :
-        dv^2 / 2 * real(Q.inner_mpo(rho, ops.interaction, rho))
+        ops.interaction === nothing ? 0.0 : dv^2 / 2 * real(Q.inner_mpo(rho, ops.interaction, rho))
     xc_energy = if ops.xc_table === nothing
         0.0
     else

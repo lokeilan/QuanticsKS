@@ -91,9 +91,36 @@ function initial_state(problem, accuracy, rec, guess::InitialGuess)
             throw(ArgumentError("Provide one distinct grid wavevector per orbital"))
         wavevectors = guess.wavevectors
     end
-    orbitals =
-        Q.independent_map(i -> Q.normalize(Q.phase_tt(envelope, wavevectors[i])), Q.QTT, b, cfg)
-    OrbitalState(problem, first(Q.orthogonalize(orbitals, cfg, rec)))
+    scales = Vector{Float64}(undef, b)
+    orbitals = Q.independent_map(Q.QTT, b, cfg) do i
+        psi = Q.phase_tt(envelope, wavevectors[i])
+        scales[i] = 1 / Q.ttnorm(psi)
+        Q.scale(psi, scales[i])
+    end
+    # Every initial orbital has the same envelope. Reconstruct its Fourier sum
+    # directly instead of contracting a separate train for every occupied mode.
+    combination_samples = initial_orbital_samples(envelope, view(wavevectors, 1:b), scales, rec)
+    OrbitalState(problem, first(Q.orthogonalize(orbitals, cfg, rec; combination_samples)))
+end
+
+"Sample normalized Fourier modes of one shared initial envelope."
+function initial_orbital_samples(envelope, wavevectors, scales, rec)
+    R = length(envelope)
+    ngrid = 1 << R
+    b = length(wavevectors)
+    samples = Q.synchronized(Q.memoized_sample(envelope, rec))
+    phases = [cis(2pi * wavevectors[i] * 2^(k - 1) / ngrid) for k = 1:R, i = 1:b]
+    coefficients -> Q.sampled(j -> begin
+        value = 0.0im
+        for i = 1:b
+            phase = 1.0 + 0.0im
+            for k = 1:R
+                isodd(j >> (k - 1)) && (phase *= phases[k, i])
+            end
+            value += coefficients[i] * scales[i] * phase
+        end
+        samples(j) * value
+    end, R)
 end
 
 function initial_state(problem::Problem{<:AbstractModel3D}, accuracy, rec, guess::InitialGuess)
@@ -106,31 +133,45 @@ function initial_state(problem::Problem{<:AbstractModel3D}, accuracy, rec, guess
     grid = problem.grid
     centers = problem.model isa AllElectronLDA3D ? problem.model.positions : [(0.0, 0.0, 0.0)]
     norbitals = length(problem.occupations)
-    mode_limit = ceil(Int, cbrt(norbitals))
+    # Order box modes by their continuum kinetic energy in the actual box.
+    limits = min.(norbitals, grid_shape(grid))
     modes = sort(
-        vec(collect(Iterators.product(1:mode_limit, 1:mode_limit, 1:mode_limit)));
-        by = t -> sum(abs2, t),
+        vec(collect(Iterators.product((1:n for n in limits)...)));
+        by = t -> sum((t[a] / grid.L[a])^2 for a = 1:3),
     )
-    cfg = solver_config(problem, accuracy)
-    orbitals = Q.QTT[]
-    for i = 1:norbitals
-        mode = modes[i]
-        fn = j -> begin
-            r = grid_position(grid, j)
-            envelope = sum(exp(-sqrt(sum(abs2, r .- c))) for c in centers)
-            envelope * prod(sinpi(mode[k] * (r[k] / grid.L[k] + 0.5)) for k = 1:3)
-        end
-        push!(
-            orbitals,
-            Q.normalize(
-                Q.cross(
-                    rec,
-                    nsites(grid),
-                    fn;
-                    tol = accuracy.orthogonalization_tolerance,
-                    cap = accuracy.orbital_cap,
-                    label = "initial_orbital_$i",
+    functions = map(modes[1:norbitals]) do mode
+        r ->
+            sum(exp(-sqrt(sum(abs2, r .- c))) for c in centers) *
+            prod(sinpi(mode[a] * (r[a] / grid.L[a] + 0.5)) for a = 1:3)
+    end
+    pivots = [
+        grid_index(
+            grid,
+            ntuple(
+                a -> clamp(
+                    floor(Int, (r[a] + grid.L[a] / 2) / spacing(grid)[a]),
+                    0,
+                    grid_shape(grid)[a] - 1,
                 ),
+                3,
+            ),
+        ) for r in centers
+    ]
+    cfg = solver_config(
+        problem,
+        accuracy,
+        SCFOptions(parallel_tasks = get(rec.options, :parallel_tasks, 1)),
+    )
+    orbitals = Q.recorded_map(Q.QTT, norbitals, cfg, rec) do i, localrec
+        Q.normalize(
+            Q.cross(
+                localrec,
+                nsites(grid),
+                j -> functions[i](grid_position(grid, j));
+                tol = accuracy.orthogonalization_tolerance,
+                cap = accuracy.orbital_cap,
+                label = "initial_orbital_$i",
+                pivots,
             ),
         )
     end
@@ -164,11 +205,12 @@ function refine_state(
                 psi,
                 target.grid.R;
                 degree = refinement.degree,
-                cachebits = tci.environment_cache_bits,
+                max_bytes = tci.environment_cache_max_bytes,
             );
-            tol = refinement.tolerance,
+            tol = min(refinement.tolerance, cfg.orbital_tolerance),
             cap = accuracy.orbital_cap,
             label = "refine_$i",
+            require_convergence = accuracy.adaptive,
         )
     end
     orbitals = first(Q.orthogonalize(orbitals, cfg, rec))
@@ -190,19 +232,20 @@ function refine_state(
     validate(refinement)
     coarse = state.problem.grid
     g = target.grid
-    0 < g.R - coarse.R <= refinement.max_added_bits ||
+    added = axis_bits(g) .- axis_bits(coarse)
+    all(r -> 0 <= r <= refinement.max_added_bits, added) && any(added .> 0) ||
         throw(ArgumentError("Invalid 3D refinement increment"))
     rec = recorder(nothing, tci; parallel_tasks)
     cfg = solver_config(target, accuracy, SCFOptions(; parallel_tasks))
-    ratio = 1 << (g.R - coarse.R)
-    n = 1 << coarse.R
+    ratio = 1 .<< added
+    n = grid_shape(coarse)
     nodes = collect((-(refinement.degree ÷ 2)):(refinement.degree ÷ 2 + 1))
     orbitals = Q.recorded_map(Q.QTT, length(state.orbitals), cfg, rec) do i, localrec
         ev = Q.evaluate(state.orbitals[i], localrec)
         fn =
             j -> begin
                 q = grid_indices(g, j)
-                u = ntuple(a -> (q[a] + 0.5) / ratio - 0.5, 3)
+                u = ntuple(a -> (q[a] + 0.5) / ratio[a] - 0.5, 3)
                 base = floor.(Int, u)
                 weights = ntuple(
                     a -> [
@@ -213,10 +256,10 @@ function refine_state(
                 value = 0.0im
                 for ks in Iterators.product(eachindex(nodes), eachindex(nodes), eachindex(nodes))
                     index = ntuple(a -> base[a] + nodes[ks[a]], 3)
-                    all(t -> 0 <= t < n, index) || continue
+                    all(a -> 0 <= index[a] < n[a], 1:3) || continue
                     value += prod(weights[a][ks[a]] for a = 1:3) * ev(grid_index(coarse, index))
                 end
-                value / sqrt(ratio^3)
+                value / sqrt(prod(ratio))
             end
         Q.cross(
             localrec,

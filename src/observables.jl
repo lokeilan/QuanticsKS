@@ -116,7 +116,7 @@ function postprocess(
     evaluator = Q.BlockEvaluator(
         final.orbitals;
         cap = tci.orbital_cache_capacity,
-        cachebits = tci.environment_cache_bits,
+        max_bytes = tci.orbital_cache_max_bytes,
     )
     open(joinpath(out, "density.csv"), "w") do io
         println(io, grid isa BoxGrid3D ? "x,y,z,density" : "x,density")

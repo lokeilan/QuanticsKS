@@ -1,5 +1,40 @@
 # Fixed-potential options and results; requested and occupied state counts are separate.
 
+"Solve a fixed Hamiltonian with the same Block LOBPCG iteration used for dense arrays."
+function Q.block_lobpcg(
+    H,
+    state::OrbitalState;
+    accuracy = Accuracy(),
+    tci = TCIOptions(),
+    parallel_tasks = 1,
+    preconditioner = nothing,
+    tolerance = 1e-6,
+    max_iterations = 100,
+    gram_tolerance = 1e-8,
+    callback = identity,
+)
+    validate(accuracy)
+    validate(tci)
+    cfg = solver_config(
+        state.problem,
+        accuracy,
+        SCFOptions(; eigen_tolerance = tolerance, parallel_tasks),
+    )
+    rec = recorder(nothing, tci; parallel_tasks)
+    Q.block_lobpcg(
+        H,
+        state.orbitals,
+        cfg,
+        rec;
+        preconditioner,
+        tolerance,
+        work_tolerance = min(accuracy.work_tolerance, tolerance / 100),
+        max_iterations,
+        gram_tolerance,
+        callback,
+    )
+end
+
 "Fixed-H eigensolver dimensions are independent of the physical occupation count."
 Base.@kwdef struct FixedSpectrumOptions
     states::Int = 56

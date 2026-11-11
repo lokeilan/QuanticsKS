@@ -28,10 +28,11 @@ These examples demonstrate the workflow. Physical accuracy requires grid, box,
 rank, and tolerance convergence. SCF stopping and the final physical audit are
 reported separately.
 
-The calibrated [1D H100 R16 input](inputs/h100-r16.toml) records the current
-tolerance and rank-cap profile for 50 occupied orbitals. Its numerical budgets
-and physical acceptance thresholds are described in the
-[configuration guide](docs/configuration.md#calibrated-1d-r16-profile).
+The [periodic 1D H100 input](inputs/h100-r16.toml) records the recommended
+fixed tolerance profile for 50 occupied orbitals, with orbital, work and Green
+right-hand-side caps of 64. Energy stopping and the subsequent residual audit
+have separate meanings; see the
+[configuration guide](docs/configuration.md#periodic-1d-h100-profile).
 
 ## Use from Julia
 
@@ -59,6 +60,14 @@ orbital and the block recurrence for several orbitals. Both use
 reorthogonalization and explicit restart from the retained Ritz orbitals.
 The Davidson choices use generalized Davidson with a shifted kinetic-inverse
 preconditioner and share KrylovKit's direction orthogonalization.
+
+For a fixed Hermitian Hamiltonian, `block_lobpcg(H, X; tolerance=1e-6)`
+uses LOBPCGEigensolver.jl's standard block iteration. `X` can be a dense orbital
+matrix or an `OrbitalState` with QTT orbitals. The optional
+`preconditioner=apply_inverse` callback acts on a whole residual block;
+omitting it uses the identity. Dense `H` can also be a block-action callback.
+The returned `converged` flag requires freshly evaluated orbital residuals and
+the stored-state Gram tolerance. This fixed-H interface does not run SCF.
 
 ## Documentation
 

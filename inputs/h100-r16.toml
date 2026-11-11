@@ -1,5 +1,5 @@
-# One-dimensional periodic H100 R16 SCF.
-# The measured profile uses Julia --threads=8,1 with one BLAS thread.
+# Periodic 1D H100: fixed recommended tolerances; energy stopping, then residual audit.
+# Use Julia --threads=4,1 and one BLAS thread.
 [run]
 kind = "scf"
 blas_threads = 1
@@ -14,47 +14,54 @@ natoms = 100
 distance = 4.0
 
 [accuracy]
-field_tolerance = 1e-5
-orbital_tolerance = 1e-8
-work_tolerance = 1e-4
-storage_tolerance = 1e-10
-algebra_tolerance = 1e-10
+adaptive = false
+field_tolerance = 5e-07
+orbital_tolerance = 1e-10
 orthogonalization_tolerance = 1e-10
-mixing_tolerance = 1e-8
-green_rhs_tolerance = 1e-7
-density_tolerance = 1e-8
-kernel_tolerance = 1e-9
-external_tolerance = 1e-9
-xc_energy_tolerance = 1e-8
-green_rhs_cap = 128
-orbital_cap = 48
-work_cap = 80
-field_cap = 128
+storage_tolerance = 1e-10
+storage_compression_attempts = 1
+work_tolerance = 0.0001
+algebra_tolerance = 1e-10
+kinetic_action_tolerance = 3e-06
+green_rhs_tolerance = 1e-06
+mixing_tolerance = 1e-06
+density_tolerance = 5e-09
+xc_energy_tolerance = 5e-08
+external_tolerance = 1e-08
+kernel_tolerance = 1e-09
+orbital_cap = 64
+work_cap = 64
+green_rhs_cap = 64
+field_cap = 64
 external_cap = 32
 kernel_cap = 16
 hartree_cap = 64
 effective_potential_cap = 64
-density_cap = 128
-xc_energy_cap = 128
+density_cap = 72
+xc_energy_cap = 72
 
 [scf]
-parallel_tasks = 0
-criterion = "strict"
-energy_tolerance = 1e-6
-max_iterations = 80
+parallel_tasks = 4
+criterion = "energy"
+energy_tolerance = 5e-06
+max_iterations = 60
 mixing = 0.3
-eigen_tolerance = 5e-5
-orbital_residual_tolerance = 3e-4
-density_tolerance = 3e-4
+adaptive_mixing = true
+eigen_tolerance = 0.0005
+orbital_residual_tolerance = 0.0003
+density_tolerance = 0.0003
+metric_relative_cutoff = 0.0001
 seed = 20261030
+green_update_interval = 1
+inner_steps = 1
+coefficient_sweeps = 2
 
 [tci]
-environment_cache_bits = 8
+environment_cache_max_bytes = 8388608
+orbital_cache_max_bytes = 134217728
 
 [physics]
-exchange_quadrature_rtol = 2e-9
+exchange_quadrature_rtol = 2e-09
 
-[refinement]
-degree = 5
-tolerance = 1e-11
-max_added_bits = 8
+[audit]
+rank_multiplier = 1

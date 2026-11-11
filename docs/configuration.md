@@ -1,5 +1,48 @@
 # Configuration
 
+## Fixed-H Block LOBPCG library interface
+
+`block_lobpcg(H, X; preconditioner=nothing, tolerance=1e-6,
+max_iterations=100, gram_tolerance=1e-8, callback=identity)` computes the lowest
+`size(X,2)` eigenpairs for a dense orbital matrix. `H` is a Hermitian matrix or
+a callback that applies it to an orbital block. A preconditioner callback
+returns the inverse action on that block; the default is the identity.
+For dense orbitals, a matrix or factorization is also accepted and applied
+through a linear solve. A matrix is factorized once at entry.
+The standard convergence assumptions require a Hermitian positive-definite
+preconditioner and a fixed Hermitian Hamiltonian.
+
+```julia
+using QuanticsKS, LinearAlgebra, Random
+H = SymTridiagonal(fill(2.0, 64), fill(-1.0, 63))
+X = randn(MersenneTwister(7), 64, 4)
+result = block_lobpcg(H, X;
+    preconditioner = cholesky(H + I), tolerance = 1e-8)
+```
+
+For QTT, use `block_lobpcg(H, state; accuracy, tci, parallel_tasks, ...)` with
+an `OrbitalState` and a fixed project Hamiltonian. The preconditioner receives
+a vector of QTT residuals. The shared low-level interface also accepts
+`block_lobpcg(H, orbitals, cfg, rec; work_tolerance, ...)` when the caller
+already owns the numerical configuration and recorder. QTT fitting, algebra,
+and rank limits retain their existing meanings. The state interface bounds
+the working fit tolerance by `min(accuracy.work_tolerance, tolerance/100)`;
+the final residual audit uses `accuracy.algebra_tolerance`.
+The trial block can contain up to three times the orbital count. Its endpoint
+tables share `tci.orbital_cache_max_bytes`; if they do not cover the whole
+quantics chain, reconstruction uses TT-slice sampling. Rank and cache budgets
+therefore affect the cost of fitting final block combinations.
+The library requires more
+grid degrees of freedom than three times the orbital count.
+
+Results contain `orbitals`, `eigenvalues`, `residual_norms`, `gram_defect`,
+`converged`, `iterations`, `residual_history`, and `elapsed_seconds`.
+`residual_norms` are freshly audited; history contains the iteration's working
+residuals. Callbacks receive the iteration number, eigenvalues, working
+residual norms, and locked count. Convergence requires every returned orbital
+residual to meet `tolerance` and the stored Gram defect to meet
+`gram_tolerance`. An iteration limit does not imply convergence.
+
 Inputs are TOML files. Unknown sections and options raise an error. Start from
 [h4.toml](../inputs/h4.toml), [helium.toml](../inputs/helium.toml), or
 [propagation.toml](../inputs/propagation.toml).
@@ -12,7 +55,8 @@ julia --project=. run.jl solve inputs/helium.toml results/helium
 ## Physical system
 
 `[run].kind` is `scf` or `propagation`. `[grid].dimensions` defaults to `1`;
-set it to `3` for an isolated Cartesian box. `R` is the number of bits per axis.
+set it to `3` for an isolated Cartesian box. In 3D, `R` is either the common
+number of bits per axis or a triple `[Rx, Ry, Rz]`.
 Lengths are in bohr, energies in Hartree, and times in atomic units.
 
 | Dimension | `[system].kind` | Main parameters |
@@ -21,10 +65,10 @@ Lengths are in bohr, energies in Hartree, and times in atomic units.
 | 1D | `soft_coulomb` | `positions`, `charges`, `occupations`, `softening`, `coupling`, `xc` |
 | 1D | `cosine_potential` | `amplitude`, integer `mode`, `phase`, `offset`, `occupations` |
 | 3D | `all_electron` | Cartesian `positions`, `charges`, double `occupations`, `xc` |
-| 3D | `hydrogen_cluster` | Integer `shape`, `distance`, `padding`, `xc`; neutral hydrogen cluster |
 
 `[grid].cell` is the periodic length in 1D, or a scalar or three box lengths in
-3D. A hydrogen cluster can derive its box from nuclear extent and padding.
+3D. Independent axis resolutions are supported for rectangular boxes.
+`plan` reports the axis bits, grid shape, and spacing without starting SCF.
 The 1D cosine potential is `offset + amplitude*cos(2*pi*mode*x/cell + phase)`.
 
 The 1D interacting model accepts `xc="lsda"` or `"none"`; LSDA requires
@@ -48,14 +92,17 @@ helium example is a coarse discretization, not a converged continuum result.
 | `work_tolerance` | `1e-6` | Orbital update tensors |
 | `storage_tolerance` | `1e-10` | Stored orbitals |
 | `algebra_tolerance` | `1e-12` | Tensor algebra and Hartree construction |
-| `orbital_tolerance` | inherits `field_tolerance` | LRRAP orbital reconstruction; initial envelope uses one tenth of this value |
-| `orthogonalization_tolerance` | `1e-11` | Orthogonalization and Ritz reconstruction |
+| `kinetic_action_tolerance` | unset | Absolute 1D FD2 action error budget; adaptive accuracy resolves it from the physical residual target |
+| `orbital_tolerance` | inherits `field_tolerance` | LRRAP update truncation; initial-envelope TCI uses one tenth of this value |
+| `orthogonalization_tolerance` | `1e-11` | TCI reconstruction of orthogonalized and Ritz-rotated orbitals |
 | `green_rhs_tolerance` | `1e-9` | Green right-hand-side fitting |
 | `mixing_tolerance` | inherits `algebra_tolerance` | Reconstruction of mixed density |
 | `storage_gram_tolerance` | `1e-7` | Gram-defect acceptance for stored orbitals |
 | `orbital_cap` | `48` | Orbital rank limit |
 | `work_cap` | `96` | Intermediate rank limit |
 | `field_cap` | `64` | Default field rank limit |
+| `adaptive` | `false` | Tighten fitting and storage budgets during SCF using the grid kinetic scale |
+| `residual_error_fraction` | `0.1` | Fraction of the final orbital residual allocated to representation error |
 
 Optional `external_cap`, `kernel_cap`, `density_cap`, `hartree_cap`,
 `effective_potential_cap`, `xc_energy_cap`, and `drive_cap` override the rank
@@ -74,11 +121,93 @@ Relax numerical budgets using measured errors in the quantity of interest;
 keep SCF stopping, Gram acceptance, and final audit criteria separate. In
 particular, fine-grid kinetic operators can amplify small storage errors.
 
+`[tci].environment_cache_max_bytes` defaults to 8 MiB per tensor evaluator.
+`orbital_cache_max_bytes` defaults to 128 MiB for a shared orbital block.
+Endpoint cuts depend on the actual bond sizes and byte budget. The block budget
+reserves space for samples, contraction caches and consumer rectangles; worker
+tasks share endpoint tables and divide the remaining capacities. The budget
+also reserves rank-dependent vector buffers for the template and worker tasks;
+these reservations grow with the achieved ranks. Scalar consumers reduce small
+orbital rectangles immediately. Contraction batches
+reserve their possible prefix-cache growth before evaluation and split to fit
+the remaining capacity. Partial-grid batches reuse the precomputed endpoint
+tables for requested prefixes without duplicating the complete tables in a
+dictionary. These budgets cover
+evaluation caches and their planned work buffers, not Julia compilation, QTT
+source cores, the TCI factorization, or total process memory.
+
+With `adaptive=true`, the orbital fitting budget is capped by
+`factor * residual_error_fraction * final_residual / kinetic_bound`, where
+`kinetic_bound = 2/m * sum(1/h_axis^2)`. The factor starts at 100 for a cold
+guess and at 1 for a supplied state, then decreases with the density residual.
+Potential fitting is limited by both the orbital residual budget and energy
+tolerance per electron; density and XC
+energy fitting tighten against the requested total-energy tolerance. TCI ranks
+grow as needed within `orbital_cap`; failed orbital
+fits are rejected. Storage checks both Gram error and maximum individual
+orbital representation error. The formula is a budget policy, not a proof
+that a sampled TCI error bounds the physical residual; the final audit remains
+required. Precision transitions reset energy comparisons and Anderson density
+history, so a change of numerical accuracy cannot trigger stopping or reuse
+residual coefficients from the previous accuracy.
+
+Adaptive LRRAP also uses the larger of `metric_relative_cutoff` and
+`eps(Float64)*kinetic_bound/eigen_tolerance` when resolving tangent directions
+orthogonal to each incoming orbital. The old orbital remains available in the
+coefficient solve. A computed cutoff of one or larger raises an error because
+the grid exceeds this Float64 conditioning budget. The effective cutoff is
+recorded as `coefficient_metric_cutoff`.
+
+For the 1D residual action, adaptive precision allocates
+`factor * residual_error_fraction * final_residual / 100` to kinetic-action
+rounding, unless an explicit `kinetic_action_tolerance` is tighter. The two
+core differences receive absolute budgets proportional to `h^2`. Each rounded
+difference is compared with its unrounded amplitude expression; a missed
+budget raises an error. This avoids retaining numerically insignificant ranks
+just because the final residual is small. The audit adds the kinetic-action
+budget to the measured residual norm before comparing it with the unchanged
+physical threshold. Stored orbitals and kinetic-energy contractions are not
+filtered by this policy.
+
+`[scf].initial_spacing` optionally starts from a coarser grid, chosen from the
+cell dimensions rather than a fixed R. `refinement_bits=2` limits each axis's
+increase per stage. Intermediate stages use `coarse_energy_tolerance=1e-3`
+and `coarse_density_tolerance=1e-2`, with a physical audit at their relaxed
+thresholds. Only the final target-grid result uses the requested acceptance
+criteria. Intermediate outputs have a `-grid-N` suffix, where N is the total
+number of QTT sites; `grid-continuation.json` records the stages.
+
+Adaptive LRRAP constructs its trial tangent space from the selected orbital
+rounded to the current working tolerance. The stored occupied orbitals keep
+their finer accuracy and supply the original overlap and Hamiltonian blocks.
+This separates the search-space cost from the precision required to store a
+fine-grid state. Internal 1D residual norms contract the kinetic core action
+with a fitted smooth potential term; the final audit independently interpolates
+the complete unfiltered residual.
+
+The tangent-base tolerance is also limited by `green_rhs_tolerance`, so the
+trial space retains the accuracy of the Green search source.
+`[scf].adaptive_mixing=false` preserves fixed mixing by default. When enabled,
+a density-residual increase above 1.5 times the lowest residual since the last
+mixing response halves the mixing parameter
+and clears Anderson history. A decrease below half the previous residual
+allows a 20% increase. The parameter stays between the configured `mixing/16`
+and `mixing`; physical stopping thresholds remain unchanged. Iteration logs
+record the applied parameter and each adjustment.
+
 Storage orthogonality uses `storage_gram_tolerance` and
 `storage_compression_attempts`. Optional Green updates use
 `green_update_interval` and `green_update_residual_threshold`. TOML inputs,
 Julia constructors, solver controls, and generated records use these names.
 Unknown option names are rejected.
+
+`[audit].residual_fit_tolerance=1e-4` is a relative interpolation tolerance
+for the unfiltered physical residual, not its acceptance threshold in Ha.
+It is separate from `algebra_tolerance`: fitting a residual to machine-relative
+precision can resolve fine XC-table structure that has no effect on the
+requested residual norm. An audited residual within 10% of its acceptance
+threshold is recomputed with a tenfold tighter fit. The requested physical
+residual, density, charge and Gram thresholds remain unchanged.
 
 `green_update_interval=5` schedules updates in every fifth SCF iteration;
 zero disables that schedule. An orbital residual below
@@ -95,32 +224,41 @@ For the 3D Green solve, `[physics].green_relative_tolerance` defaults to `1e-8`
 and `green_max_iterations` to `300`. Failure to meet the stored-state residual
 budget raises an error.
 
-## Calibrated 1D R16 profile
+## Periodic 1D H100 profile
 
-[h100-r16.toml](../inputs/h100-r16.toml) specifies a periodic 1D soft-Coulomb
-chain with 100 hydrogen atoms and 50 doubly occupied orbitals on an R16 grid.
-These budgets are input-specific; the constructor defaults are listed above.
+[h100-r16.toml](../inputs/h100-r16.toml) selects the periodic 1D soft-Coulomb
+chain with 100 hydrogen atoms and 50 doubly occupied orbitals. The cell is
+400 bohr with 4 bohr nuclear spacing. Change `[grid].R` for another resolution.
+Each run starts directly on its target grid; adaptive accuracy is disabled.
 
-The profile uses `field_tolerance=1e-5`, `work_tolerance=1e-4`, and
-`mixing_tolerance=1e-8`, with `work_cap=80`. Explicit field caps are 32 for the
-external potential, 16 for the interaction kernel, 64 for Hartree and the
-effective potential, and 128 for density and XC energy density. Orbital
-reconstruction uses `orbital_tolerance=1e-8` and `orbital_cap=48`; stored
-orbitals use `storage_tolerance=1e-10`.
+The orbital, orthogonalization, storage and algebra tolerances are `1e-10`.
+The work tolerance is `1e-4`, the absolute kinetic-action budget is `3e-6 Ha`,
+and the Green RHS tolerance is `1e-6`. Field, mixing, density, XC-energy,
+external and kernel tolerances are `5e-7`, `1e-6`, `5e-9`, `5e-8`, `1e-8`
+and `1e-9`, respectively. One inner update uses two coefficient sweeps with
+relative metric cutoff `1e-4`. A Green update is enabled every SCF step.
 
-Strict stopping uses `energy_tolerance=1e-6 Ha` and final orbital and density
-thresholds of `3e-4 Ha` and `3e-4`, respectively. The inner eigensolver target
-remains `eigen_tolerance=5e-5 Ha`. Passing these configured final thresholds
-does not establish the tighter `5e-5` orbital or density target.
+Orbital, work and Green RHS approximation caps are 64. Field, Hartree and
+effective-potential caps are 64; density and XC-energy caps are 72; external
+and kernel caps are 32 and 16. Exact temporary sums and shifts can have larger
+structural bonds before approximation. Stored bonds and approximation caps
+are recorded separately.
+
+The input uses energy stopping at consecutive total-energy change below
+`5e-6 Ha`, followed by a separate final-state audit. The inner eigensolver
+target is `5e-4 Ha`. The reference orbital and density thresholds remain
+`3e-4 Ha` and `3e-4`. An energy-stopped result can therefore have
+`converged=true` with `audit.passed=false`; it must not be described as
+passing all physical residual requirements. A separate independent energy
+comparison can establish energy agreement, not continuum accuracy.
 
 ```sh
-julia --threads=8,1 --project=. run.jl plan inputs/h100-r16.toml
-julia --threads=8,1 --project=. run.jl solve inputs/h100-r16.toml results/h100-r16
+julia --threads=4,1 --project=. run.jl plan inputs/h100-r16.toml
+julia --threads=4,1 --project=. run.jl solve inputs/h100-r16.toml results/h100-r16
 ```
 
-The input selects available orbital workers with `parallel_tasks=0` and one
-BLAS thread. The full configuration is in the input file. Logs, checkpoints,
-and calibration reports remain local calculation outputs.
+The input uses four orbital workers and one BLAS thread. Logs, diagnostic
+scripts, full research inputs and calibration reports stay in local outputs.
 
 ## SCF, propagation, and threads
 
@@ -179,7 +317,10 @@ Use `[run].blas_threads=1` when parallelizing independent orbitals.
 `[run].checkpoint` is resolved relative to the input file. It imports orbitals
 as a warm start; SCF mixing history starts again. A compatible `cross-state.jls`
 beside the checkpoint can supply cached pivots. `[refinement]` controls
-interpolation when the target grid is finer. Refinement adjusts volume weights
+interpolation when the target grid is finer. In 3D, each axis may retain its
+resolution or gain up to `max_added_bits`; at least one axis must become finer,
+and no axis may become coarser. Scalar and equal-triple resolutions describe the
+same grid. Refinement adjusts volume weights
 and restores orbital orthogonality; it does not establish convergence.
 
 Output paths are relative to the launch directory. The command-line output path
@@ -204,6 +345,9 @@ configured steps.
 Logged ranks distinguish inner-update output from stored orbitals. Parallel
 subtask times may overlap; their sum is not wall time. Tensor storage, cumulative
 allocation, and peak process memory are separate quantities.
+`stages.jsonl` separates initial operator construction, Green-operator setup,
+and initial orbitals, with wall time, compilation time, cumulative allocation,
+and process memory observations. These stages exclude Julia process startup.
 
 For a zero-sample fallback, `tci_calls.jsonl` records inclusive `seconds` and
 separates any potential-construction time in `nested_tci_seconds`. Aggregate
