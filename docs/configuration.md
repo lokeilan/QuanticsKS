@@ -68,10 +68,20 @@ declared exchange-even inversion sector (`inversion_parity=1` or `-1`).
 A reduced initialization box must
 pass the actual full-grid residual. Coherent preparations must fix the
 relative eigenstate phase before propagation. `compress_state` compresses a supplied
-dense amplitude into grouped electron-coordinate bits. Both representations
+dense amplitude into grouped electron-coordinate bits; its defaults are
+`tolerance=1e-9` and `cap=64`. Both representations
 share kinetic and phase operations, `TimeOptions`, and observable definitions.
 The native trajectory computes marginals from endpoint contractions and
-energy expectations from weighted amplitudes without an N-by-N state array.
+nuclear energy from those marginals. Interaction energy fits the pair-weighted
+amplitude, with representative pivots from both coordinate halves using the
+existing endpoint tables. Potential fits use `work_cap`; a fit exceeding
+`orbital_cap` is then compressed to the state cap. Kinetic propagation uses
+`naive` MPO-MPS contraction and SVD truncation to `orbital_cap`.
+The default non-strict TCI policy retains reported errors and rank-limit flags
+without making a missed pivot tolerance alone a propagation failure. Physical drift limits and independent
+dense comparisons remain separate requirements. Do not copy an ITensor squared
+weight cutoff directly into the amplitude-tolerance fields: MPO application
+squares those tolerances before passing them to ITensor.
 `save_correlated_checkpoint` and
 `load_correlated_checkpoint` preserve the grid, Hamiltonian and representation.
 

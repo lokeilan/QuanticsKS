@@ -44,10 +44,23 @@ is constructed. The vector conversion checks its full-grid L2 error against
 the requested budget, allowing floating-point roundoff.
 Boundary correction tables use O(N*m) storage with a fixed finite-difference
 boundary size `m`; this alone does not establish large-grid runtime scaling.
-Identical kinetic substeps reuse their operators. Potential actions reconstruct
-the evolving QTT by TCI, without an additional unconditional rounding sweep.
+Identical kinetic substeps reuse their operators. Time propagation uses
+ITensorMPS `naive` MPO-MPS contraction followed by controlled SVD truncation;
+rank-limited `zipup` can discard relevant directions before the complete action.
+Potential actions reconstruct the evolving QTT by TCI up to `work_cap`.
+Only a result exceeding `orbital_cap` receives an additional SVD compression.
+Localized correlated states seed both halves of each binary coordinate to
+cover support across coordinate midpoints. Subsequent fits reuse their pivots.
 KS feedback uses physical-grid arrays. Correlated marginals contract endpoint
-tables; energy uses kinetic MPO contractions and fitted weighted amplitudes.
+tables. Nuclear energy uses those marginals; interaction energy fits only the
+pair-weighted amplitude with informative nonzero pivots. With the default
+non-strict TCI policy, an unmet sampled tolerance is recorded without ending
+propagation. Exchange defect
+uses thin QR factors of the antisymmetric difference, avoiding cancellation
+between nearly equal norms. Norm drift and independent physical comparisons
+remain the acceptance requirements. ITensor SVD cutoff is a discarded squared
+weight; this project's amplitude tolerance is squared when passed to ITensor.
+Neither quantity is the sampled relative pivot error reported by TCI.
 Autonomous Yoshida composition uses three signed Strang substeps and rejects
 time-dependent drives or absorption. CAP damping surrounds each source step;
 no propagated state is renormalized. State and density errors remain necessary

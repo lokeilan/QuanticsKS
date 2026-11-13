@@ -46,10 +46,17 @@ function correlated_marginals(state::CorrelatedState{Q.QTT})
     left_gram, right_gram = left' * left, right * right'
     marginal_first = max.(0.0, real.(vec(sum((left * right_gram) .* conj.(left); dims = 2))))
     marginal_second = max.(0.0, real.(vec(sum(conj.(right) .* (left_gram * right); dims = 1))))
-    (; left, right, left_gram, right_gram, marginal = marginal_first + marginal_second)
+    (; left, right, marginal_first, marginal = marginal_first + marginal_second)
 end
 
-function correlated_weighted_expectation(amplitude, potential, accuracy, rec, label)
+"Evaluate the antisymmetric norm through thin QR factors, avoiding norm cancellation."
+function correlated_exchange_defect(factors)
+    left = hcat(factors.left, transpose(factors.right))
+    right = vcat(factors.right, -transpose(factors.left))
+    norm(qr(left).R * qr(right').R')
+end
+
+function correlated_weighted_expectation(amplitude, potential, accuracy, rec, label; pivots)
     evaluator = Q.Evaluator(amplitude)
     weighted = Q.cross(
         rec,
@@ -58,7 +65,7 @@ function correlated_weighted_expectation(amplitude, potential, accuracy, rec, la
         tol = accuracy.field_tolerance,
         cap = accuracy.work_cap,
         label,
-        require_convergence = true,
+        pivots,
     )
     real(Q.inner(amplitude, weighted))
 end
@@ -82,21 +89,15 @@ function correlated_observe(
                 term.weight * real(Q.inner_mpo(amplitude, term.operator, amplitude)) for
                 term in operators.kinetic_terms
             )
-        electronic_energy =
-            kinetic + correlated_weighted_expectation(
-                amplitude,
-                operators.potential,
-                accuracy,
-                rec,
-                "potential_energy",
-            )
         interaction = correlated_weighted_expectation(
             amplitude,
             operators.interaction,
             accuracy,
             rec,
-            "interaction_energy",
+            "interaction_energy";
+            pivots = correlated_pivots(factors),
         )
+        electronic_energy = kinetic + dot(operators.nuclear, factors.marginal) + interaction
         function probability(first, second)
             left = factors.left[first, :]
             right = factors.right[:, second]
@@ -106,8 +107,7 @@ function correlated_observe(
         interior = abs.(operators.coordinates) .<= edge_fraction * grid.L / 2
         bound_probability = probability(bound, bound)
         double_probability = probability(.!bound, .!bound)
-        exchange_overlap = factors.left' * transpose(factors.right)
-        exchange_defect = sqrt(max(0.0, 2norm2 - 2real(sum(exchange_overlap .* exchange_overlap'))))
+        exchange_defect = correlated_exchange_defect(factors)
         (;
             time = state.time,
             norm2,

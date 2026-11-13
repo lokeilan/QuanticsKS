@@ -177,7 +177,7 @@ function qtt_kinetic_propagator(grid, dt, time, accuracy, rec; mass = 1.0)
             tol = accuracy.kinetic_propagator_tolerance,
             cap = accuracy.kinetic_propagator_cap,
             label = "kinetic_exponential_$dt",
-            require_convergence = true,
+            pivots = [findmax(abs2, kernel)[2] - 1],
         )
         [Q.circulant(train)]
     else
@@ -207,6 +207,8 @@ function apply_kinetic_step(propagator::NamedTuple, psi, accuracy)
             psi;
             tol = propagation_orbital_tolerance(accuracy),
             cap = accuracy.orbital_cap,
+            # Rank-limited zip-up loses directions before the complete kinetic action.
+            algorithm = :naive,
         )
         psi =
             propagator.cayley ?
@@ -228,14 +230,19 @@ function apply_potential_phase(
     rec;
     label,
     support = 1 << length(psi),
+    pivots = Int[],
 )
     evaluator = Q.Evaluator(psi)
-    Q.cross(
+    updated = Q.cross(
         rec,
         length(psi),
         index -> index < support ? exp(-im * dt * potential(index)) * evaluator(index) : 0.0;
         tol = propagation_orbital_tolerance(accuracy),
-        cap = accuracy.orbital_cap,
+        cap = accuracy.work_cap,
         label,
+        pivots,
     )
+    # Cross ranks need not be minimal; impose the consumer's state cap only when exceeded.
+    Q.rank(updated) <= accuracy.orbital_cap && return updated
+    Q.rounded(updated; tol = propagation_orbital_tolerance(accuracy), cap = accuracy.orbital_cap)
 end

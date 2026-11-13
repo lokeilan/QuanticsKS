@@ -68,11 +68,36 @@ function problem_descriptor(problem::CorrelatedProblem)
     )
 end
 
+"Seed both sides of each coordinate's binary midpoint, even for localized states."
+function correlated_pivots(amplitude::AbstractMatrix)
+    n = size(amplitude, 1)
+    halves = (1:div(n, 2), (div(n, 2) + 1):n)
+    map(Iterators.product(halves, halves)) do (rows, columns)
+        index = findmax(abs2, view(amplitude, rows, columns))[2]
+        first(rows) + index[1] - 2 + n * (first(columns) + index[2] - 2)
+    end |> vec
+end
+
+function correlated_pivots(factors::NamedTuple)
+    n = size(factors.left, 1)
+    halves = (1:div(n, 2), (div(n, 2) + 1):n)
+    pivots = Int[]
+    for rows in halves
+        row_index = first(rows) + argmax(view(factors.marginal_first, rows)) - 1
+        row = vec(transpose(view(factors.left, row_index, :)) * factors.right)
+        for columns in halves
+            column_index = first(columns) + findmax(abs2, view(row, columns))[2] - 1
+            push!(pivots, row_index - 1 + n * (column_index - 1))
+        end
+    end
+    pivots
+end
+
 "Compress a supplied configuration-space amplitude without changing its normalization."
 function compress_state(
     state::CorrelatedState{<:AbstractMatrix};
-    tolerance = 1e-12,
-    cap = 128,
+    tolerance = 1e-9,
+    cap = 64,
     tci = TCIOptions(),
 )
     grid = state.problem.grid
@@ -87,6 +112,7 @@ function compress_state(
             tol = tolerance,
             cap,
             label = "supplied_correlated_amplitude",
+            pivots = correlated_pivots(state.amplitude),
         )
         CorrelatedState(state.problem, amplitude; time = state.time)
     finally
@@ -294,6 +320,12 @@ function correlated_propagate(
         end
     end
     phase_actions = Dict{Float64,Any}()
+    phase_pivots = if representation_kind == :qtt
+        # Seed cold fits on both sides of each binary coordinate midpoint.
+        correlated_pivots(correlated_marginals(initial))
+    else
+        Int[]
+    end
     function phase_step(amplitude, dt, label)
         if representation_kind == :dense
             phase = get!(phase_actions, dt) do
@@ -301,7 +333,15 @@ function correlated_propagate(
             end
             return phase .* amplitude
         end
-        apply_potential_phase(amplitude, operators.potential, dt, accuracy, rec; label)
+        apply_potential_phase(
+            amplitude,
+            operators.potential,
+            dt,
+            accuracy,
+            rec;
+            label,
+            pivots = phase_pivots,
+        )
     end
     coefficients = split_step_coefficients(time)
     amplitude =
@@ -322,8 +362,9 @@ function correlated_propagate(
                 state = CorrelatedState(problem, amplitude; time = initial.time + step * time.dt)
             end
             norm2 = representation_kind == :dense ? sum(abs2, amplitude) : Q.ttnorm(amplitude)^2
-            abs(norm2 - initial_norm) <= time.norm_drift_limit ||
-                error("Correlated norm drift exceeded at step $step")
+            abs(norm2 - initial_norm) <= time.norm_drift_limit || error(
+                "Correlated norm drift $(abs(norm2 - initial_norm)) exceeds $(time.norm_drift_limit) at step $step",
+            )
             if step % time.observe_every == 0 || step == time.steps || step in time.snapshot_steps
                 measured = Q.recorded_diagnostic(rec) do diagnostic_rec
                     correlated_observe(state, operators; accuracy, rec = diagnostic_rec)
@@ -377,6 +418,7 @@ function correlated_propagate(
         end
         TimeResult(state, rows, completed, elapsed)
     catch exception
+        dir === nothing || save_correlated_checkpoint(joinpath(dir, "failed-state.jls"), state)
         fail_run(dir, exception)
         rethrow()
     finally

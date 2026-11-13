@@ -58,6 +58,7 @@ function correlated_operators(problem::CorrelatedProblem, ::Val{:qtt})
         potential,
         interaction,
         coordinates,
+        nuclear,
     )
 end
 
