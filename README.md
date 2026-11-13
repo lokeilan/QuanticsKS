@@ -2,8 +2,10 @@
 
 QuanticsKS solves Kohn-Sham ground states with quantized tensor trains (QTT) and
 tensor cross interpolation (TCI). It supports periodic one-dimensional
-soft-Coulomb systems and isolated three-dimensional all-electron systems. The 1D
-solver also supports fixed-potential spectra and real-time propagation.
+soft-Coulomb systems and isolated three-dimensional all-electron systems. Explicit
+1D grids also support isolated and historical periodic small systems, spin
+sectors, and dense/QTT propagation. Interacting two-electron configuration-space
+states have a separate workflow from Kohn-Sham orbitals.
 
 ## Run an example
 
@@ -26,6 +28,12 @@ constructing orbitals. `solve` requires a new output directory.
 
 These examples demonstrate the workflow. Physical accuracy requires grid, box,
 rank, and tolerance convergence. A saved SCF state is accepted only when its independent physical checks pass.
+
+The default branch retains the reviewed periodic 1D H100 baseline algorithm.
+The preserved [baseline](https://github.com/lokeilan/QuanticsKS/tree/h100-baseline-20261113)
+and [Green-source optimization](https://github.com/lokeilan/QuanticsKS/tree/h100-optimization-20261113)
+are separate versions. The optimization improves measured R20/R22 runtime but
+increases RSS and changes individual-orbital errors; it is not the default.
 
 The [periodic 1D H100 input](inputs/h100-r16.toml) defines the current baseline
 at R16; change `[grid].R` for another resolution. It uses 50 occupied orbitals
@@ -78,7 +86,10 @@ updates, occupation selection, and final physical audit. Dense directions use
 the full grid space; QTT directions use the current TT tangent space. The
 dense path uses SparseArrays, FFTW, and LinearAlgebra without TCI fits. Set
 `representation = "dense"` in `[run]` to select it from TOML. Dense support is
-limited to LRRAP ground-state SCF in 1D and 3D.
+available for LRRAP ground-state SCF in 1D and 3D, and for propagation on
+`LineGrid1D`. The explicit-grid QTT propagators use TCI potential actions and
+compressed kinetic MPOs, with full-grid feedback fields and observations.
+These small-system interfaces do not establish large-grid QTT scaling.
 
 ## Documentation
 

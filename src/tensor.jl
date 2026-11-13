@@ -4,6 +4,70 @@
 struct QTT
     c::Vector{Array{ComplexF64,3}}
 end
+
+full_values(x::QTT) = vec(TCI.fulltensor(tensortrain(x)))
+
+function identity_mpo(R)
+    [reshape(ComplexF64[1 0; 0 1], 1, 2, 2, 1) for _ = 1:R]
+end
+
+"Add binary operators with SVD compression and recovery from the original cores."
+function add_mpo(left, right; a = 1, b = 1, tol, cap)
+    validate_truncation(tol, cap)
+    length(left) == length(right) || throw(DimensionMismatch("MPO addition lengths"))
+    length(left) == 1 && return [a .* only(left) .+ b .* only(right)]
+    failure = try
+        result = TCI.add(
+            TCI.TensorTrain(left),
+            TCI.TensorTrain(right);
+            factorlhs = a,
+            factorrhs = b,
+            tolerance = Float64(tol),
+            maxbonddim = cap,
+        )
+        all(core -> all(isfinite, core), result.sitetensors) && return result.sitetensors
+        "TCI MPO addition returned nonfinite cores"
+    catch exception
+        retryable_svd_error(exception) || rethrow()
+        sprint(showerror, exception)
+    end
+    event = save_svd_event(
+        first(left),
+        "mpo_addition_failed";
+        details = (; left, right, a, b, tolerance = tol, rank_cap = cap, failure),
+    )
+    try
+        result = with_sampling_seed(0) do
+            sites = [ITensors.Index(2, "mpo=$k") for k = 1:length(left)]
+            operator_sites = [[s', s] for s in sites]
+            x = ITensorMPS.MPO(TCI.TensorTrain(left); sites = operator_sites)
+            y = ITensorMPS.MPO(TCI.TensorTrain(right); sites = operator_sites)
+            summed = ITensorMPS.add(a * x, b * y; alg = "directsum")
+            ITensorMPS.truncate!(summed; cutoff = tol^2, maxdim = cap)
+            map(1:length(summed)) do k
+                indices = vcat(
+                    k == 1 ? [] : [ITensorMPS.linkind(summed, k - 1)],
+                    operator_sites[k],
+                    k == length(summed) ? [] : [ITensorMPS.linkind(summed, k)],
+                )
+                reshape(
+                    Array(summed[k], indices...),
+                    k == 1 ? 1 : ITensors.dim(first(indices)),
+                    2,
+                    2,
+                    k == length(summed) ? 1 : ITensors.dim(last(indices)),
+                )
+            end
+        end
+        all(core -> all(isfinite, core), result) ||
+            error("MPO addition recovery returned nonfinite cores")
+        finish_svd_event(event, "recovered_with_itensormps")
+        result
+    catch exception
+        finish_svd_event(event, "recovery_failed"; error = sprint(showerror, exception))
+        rethrow()
+    end
+end
 QTT(c::Vector{<:Array}) = QTT([ComplexF64.(g) for g in c])
 Base.length(x::QTT) = length(x.c)
 tensortrain(x::QTT) = TCI.TensorTrain(x.c)
@@ -596,21 +660,22 @@ function diagonal(x::QTT)
     ]
 end
 
-"Unit shift with LSB-first carry states; periodic overflow wraps around."
+"Integer shift with LSB-first carry states; open boundaries discard overflow."
 function shift_mpo(R::Int, step::Int = 1; boundary = :periodic)
     1 <= R <= 60 || throw(ArgumentError("Shift needs 1:60 binary sites"))
-    abs(step) == 1 || throw(ArgumentError("Only unit shifts are supported"))
+    abs(step) < (1 << R) || throw(ArgumentError("Shift must be smaller than the binary grid"))
+    iszero(step) && return identity_mpo(R)
     boundary in (:periodic, :open) || throw(ArgumentError("Unknown shift boundary"))
     cores = Array{ComplexF64,4}[]
     for k = 1:R
         w = zeros(ComplexF64, k == 1 ? 1 : 2, 2, 2, k == R ? 1 : 2)
-        for carry in (k == 1 ? (1:1) : (0:1)), input = 0:1
-            total = input + carry
+        for carry in (k == 1 ? (0:0) : (0:1)), input = 0:1
+            total = input + ((abs(step) >> (k - 1)) & 1) + carry
             output, next = mod(total, 2), total ÷ 2
             k == R && boundary == :open && next != 0 && continue
             w[k == 1 ? 1 : carry + 1, output + 1, input + 1, k == R ? 1 : next + 1] = 1
         end
-        push!(cores, step == 1 ? w : permutedims(w, (1, 3, 2, 4)))
+        push!(cores, step > 0 ? w : permutedims(w, (1, 3, 2, 4)))
     end
     cores
 end

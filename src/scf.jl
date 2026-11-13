@@ -26,6 +26,9 @@ function ground_state(
     output = nothing,
 )
     scf = solver == scf.solver ? scf : SCFOptions(; merge(option_tuple(scf), (; solver))...)
+    problem.grid isa LineGrid1D &&
+        representation != :dense &&
+        throw(ArgumentError("LineGrid1D ground states currently require representation=:dense"))
     representation in (:qtt, :dense) ||
         throw(ArgumentError("Unknown orbital representation: $representation"))
     representation == :dense &&

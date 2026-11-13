@@ -17,6 +17,94 @@ spacing(g::PeriodicGrid1D) = g.L / length(g)
 Base.:(==)(a::PeriodicGrid1D, b::PeriodicGrid1D) = a.R == b.R && a.L == b.L
 
 abstract type AbstractModel1D <: AbstractModel end
+
+"Uniform physical 1D nodes, with explicit FD order and kinetic boundary."
+struct LineGrid1D <: AbstractGrid
+    R::Int
+    L::Float64
+    n::Int
+    h::Float64
+    origin::Float64
+    boundary::Symbol
+    fd_order::Int
+    function LineGrid1D(
+        n::Integer,
+        h::Real;
+        origin = -n * h / 2,
+        boundary = :open,
+        fd_order = 8,
+        cell = n * h,
+    )
+        n >= 9 && isfinite(h) && h > 0 && isfinite(origin) && isfinite(cell) && cell > 0 ||
+            throw(ArgumentError("Invalid 1D physical grid"))
+        boundary in (:open, :periodic) || throw(ArgumentError("Invalid kinetic boundary"))
+        fd_order in (2, 8) || throw(ArgumentError("Use FD2 or FD8"))
+        new(ceil(Int, log2(n)), cell, n, h, origin, boundary, fd_order)
+    end
+end
+Base.length(g::LineGrid1D) = g.n
+spacing(g::LineGrid1D) = g.h
+nsites(g::LineGrid1D) = g.R
+cell_volume(g::LineGrid1D) = g.L
+volume_element(g::LineGrid1D) = g.h
+grid_position(g::LineGrid1D, j) = g.origin + j * g.h
+Base.:(==)(a::LineGrid1D, b::LineGrid1D) =
+    all(getfield(a, k) == getfield(b, k) for k in fieldnames(LineGrid1D))
+
+"Soft-Coulomb KS model with declared interaction and collinear spin occupations."
+struct SoftCoulomb1D <: AbstractModel1D
+    positions::Vector{Float64}
+    charges::Vector{Float64}
+    interaction::Symbol
+    xc::Symbol
+    spin::Symbol
+    nuclear_constant::Float64
+    function SoftCoulomb1D(
+        positions,
+        charges = ones(length(positions));
+        interaction = :direct,
+        xc = :libxc_1d_lda,
+        spin = :unpolarized,
+        nuclear_constant = 0.0,
+    )
+        !isempty(positions) &&
+            length(positions) == length(charges) &&
+            all(isfinite, positions) &&
+            all(z -> isfinite(z) && z > 0, charges) || throw(ArgumentError("Invalid nuclei"))
+        interaction in (:direct, :minimum_image) ||
+            throw(ArgumentError("Invalid Hartree convention"))
+        xc in (
+            :libxc_1d_lda,
+            :libxc_1d_x,
+            :restricted_exx,
+            :restricted_exx_helbig_correlation,
+            :helbig_1d_lsda,
+            :none,
+        ) || throw(ArgumentError("Invalid 1D XC"))
+        spin in (:unpolarized, :up, :down) || throw(ArgumentError("Invalid spin sector"))
+        isfinite(nuclear_constant) || throw(ArgumentError("Invalid nuclear constant"))
+        new(Float64.(positions), Float64.(charges), interaction, xc, spin, nuclear_constant)
+    end
+end
+function validate_model_grid(g::LineGrid1D, m::SoftCoulomb1D, w, mass)
+    mass == 1 || throw(ArgumentError("The selected 1D functionals assume mass=1"))
+    all(==(m.spin == :unpolarized ? 2.0 : 1.0), w) || throw(
+        ArgumentError("Use double spatial occupations or one occupation per polarized orbital"),
+    )
+    m.xc in (:restricted_exx, :restricted_exx_helbig_correlation) &&
+        !(m.spin == :unpolarized && length(w) == 1) &&
+        throw(ArgumentError("Restricted EXX requires one doubly occupied spatial orbital"))
+    nothing
+end
+model_descriptor(m::SoftCoulomb1D) = Dict(
+    "kind" => "soft_coulomb_1d",
+    "positions" => m.positions,
+    "charges" => m.charges,
+    "interaction" => string(m.interaction),
+    "xc" => string(m.xc),
+    "spin" => string(m.spin),
+    "nuclear_constant" => m.nuclear_constant,
+)
 "Periodic a=1 soft Coulomb and unpolarized 1D LSDA; fixed nuclei."
 struct SoftCoulombLSDA1D <: AbstractModel1D
     positions::Vector{Float64}
@@ -295,6 +383,8 @@ Base.@kwdef struct Accuracy
     storage_tolerance::Float64 = 1e-10
     algebra_tolerance::Float64 = 1e-12
     kinetic_action_tolerance::Union{Nothing,Float64} = nothing
+    kinetic_propagator_tolerance::Float64 = 1e-13
+    kinetic_propagator_cap::Int = 256
     # Optional SCF sampling budgets; nothing retains the algebra/work defaults.
     mixing_tolerance::Union{Nothing,Float64} = nothing
     # Unset orbital tolerance inherits the field tolerance.
@@ -443,6 +533,7 @@ function validate(a::Accuracy)
             a.orthogonalization_tolerance,
             a.green_rhs_tolerance,
             a.storage_gram_tolerance,
+            a.kinetic_propagator_tolerance,
         ),
     ) || throw(ArgumentError("Tolerances must be positive and finite"))
     for tol in (a.mixing_tolerance, a.orbital_tolerance, a.kinetic_action_tolerance)
@@ -455,8 +546,13 @@ function validate(a::Accuracy)
         throw(ArgumentError("Green RHS rank cap must be positive"))
     isfinite(a.storage_tolerance) && a.storage_tolerance >= 0 ||
         throw(ArgumentError("Invalid storage tolerance"))
-    min(a.orbital_cap, a.field_cap, a.work_cap, a.storage_compression_attempts) > 0 ||
-        throw(ArgumentError("Bond caps and attempts must be positive"))
+    min(
+        a.orbital_cap,
+        a.field_cap,
+        a.work_cap,
+        a.kinetic_propagator_cap,
+        a.storage_compression_attempts,
+    ) > 0 || throw(ArgumentError("Bond caps and attempts must be positive"))
     for (name, cap) in pairs(field_caps(a))
         cap > 0 || throw(ArgumentError("$name must be positive"))
     end
@@ -534,38 +630,69 @@ function solver_config(problem, accuracy, scf = SCFOptions())
     )
 end
 
+kinetic_bound(p::Problem{<:SoftCoulomb1D,<:LineGrid1D}) =
+    (p.grid.fd_order == 2 ? 2.0 : 1024 / 315) / (p.mass * spacing(p.grid)^2)
+function problem_descriptor(p::Problem{<:SoftCoulomb1D,<:LineGrid1D})
+    g = p.grid
+    Dict(
+        "dimensions" => 1,
+        "R" => g.R,
+        "cell" => g.L,
+        "n" => g.n,
+        "spacing" => g.h,
+        "origin" => g.origin,
+        "fd_order" => g.fd_order,
+        "boundary" => string(g.boundary),
+        "units" => "atomic",
+        "occupations" => p.occupations,
+        "mass" => p.mass,
+        "model" => model_descriptor(p.model),
+    )
+end
+function compatible_problem(
+    a::Problem{<:SoftCoulomb1D,<:LineGrid1D},
+    b::Problem{<:SoftCoulomb1D,<:LineGrid1D};
+    refinement = false,
+)
+    !refinement &&
+        a.grid == b.grid &&
+        a.mass == b.mass &&
+        a.occupations == b.occupations &&
+        model_descriptor(a.model) == model_descriptor(b.model)
+end
+
+"Time composition and observation controls shared by all 1D propagation routes."
 Base.@kwdef struct TimeOptions
     parallel_tasks::Int = 1
     dt::Float64 = 0.01
     steps::Int = 100
-    snapshot_every::Int = 10
+    method::Symbol = :vtv
+    kinetic_exponential::Symbol = :cayley
     observe_every::Int = 1
-    phase_tolerance::Float64 = 1e-10
-    phase_cap::Int = 48
-    kinetic_tolerance::Float64 = 1e-12
-    kinetic_cap::Int = 96
-    output_tolerance::Float64 = 1e-12
-    output_cap::Int = 48
-    norm_drift_limit::Float64 = 1e-5
-    gram_drift_limit::Float64 = 1e-5
-    seed::Int = 20261031
+    snapshot_steps::Vector{Int} = Int[]
+    exponential_tolerance::Float64 = 1e-12
+    krylov_dimension::Int = 40
+    norm_drift_limit::Float64 = 1e-6
+    gram_drift_limit::Float64 = 1e-6
+    seed::Int = 20261113
 end
-function validate(t::TimeOptions)
-    t.parallel_tasks >= 0 || throw(ArgumentError("parallel_tasks must be nonnegative"))
-    all(
-        x -> isfinite(x) && x > 0,
-        (
-            t.dt,
-            t.phase_tolerance,
-            t.kinetic_tolerance,
-            t.output_tolerance,
-            t.norm_drift_limit,
-            t.gram_drift_limit,
-        ),
-    ) || throw(ArgumentError("Invalid propagation tolerances/time step"))
-    min(t.steps, t.snapshot_every, t.observe_every, t.phase_cap, t.kinetic_cap, t.output_cap) > 0 ||
-        throw(ArgumentError("Invalid propagation counts/caps"))
-    t
+function validate(time::TimeOptions)
+    time.parallel_tasks >= 0 &&
+        isfinite(time.dt) &&
+        time.dt > 0 &&
+        time.steps >= 0 &&
+        time.observe_every > 0 &&
+        time.method in (:vtv, :tvt, :midpoint, :yoshida4) &&
+        time.kinetic_exponential in (:cayley, :pade4, :fft) &&
+        0 < time.exponential_tolerance < 1 &&
+        time.krylov_dimension >= 4 &&
+        isfinite(time.norm_drift_limit) &&
+        time.norm_drift_limit > 0 &&
+        isfinite(time.gram_drift_limit) &&
+        time.gram_drift_limit > 0 &&
+        all(step -> 0 <= step <= time.steps, time.snapshot_steps) ||
+        throw(ArgumentError("Invalid time controls"))
+    time
 end
 
 # Time-dependent local scalar potentials and their validation.

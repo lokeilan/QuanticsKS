@@ -3,7 +3,7 @@
 build_operators(problem, accuracy, rec, physics, ::Val{:qtt}) =
     build_operators(problem, accuracy, rec, physics)
 
-"Full-grid fields with sparse FD2 kinetics and FFT convolution."
+"Full-grid fields with sparse finite-difference kinetics and FFT convolution."
 struct DenseOperators{K,T,O}
     external::Vector{Float64}
     kinetic::SparseMatrixCSC{Float64,Int}
@@ -13,9 +13,203 @@ struct DenseOperators{K,T,O}
     nuclear::Float64
 end
 
+function correlated_operators(problem::CorrelatedProblem, ::Val{:dense})
+    grid = problem.grid
+    coordinates = [grid_position(grid, index) for index = 0:(grid.n - 1)]
+    nuclear = [
+        -sum(
+            charge / sqrt(1 + (coordinate - position)^2) for
+            (position, charge) in zip(problem.positions, problem.charges)
+        ) for coordinate in coordinates
+    ]
+    interaction = [inv(sqrt(1 + (left - right)^2)) for left in coordinates, right in coordinates]
+    potential = nuclear .+ transpose(nuclear) .+ interaction
+    (; kinetic = dense_kinetic(grid), potential, interaction, coordinates)
+end
+
+function correlated_operators(problem::CorrelatedProblem, ::Val{:qtt})
+    grid = problem.grid
+    coordinates = [grid_position(grid, index) for index = 0:(grid.n - 1)]
+    nuclear = [
+        -sum(
+            charge / sqrt(1 + (coordinate - position)^2) for
+            (position, charge) in zip(problem.positions, problem.charges)
+        ) for coordinate in coordinates
+    ]
+    interaction(index) =
+        inv(sqrt(1 + (coordinates[mod(index, grid.n) + 1] - coordinates[div(index, grid.n) + 1])^2))
+    potential(index) =
+        nuclear[mod(index, grid.n) + 1] + nuclear[div(index, grid.n) + 1] + interaction(index)
+    coefficients = Q.finite_difference_coefficients(grid.fd_order)
+    axes = vcat(fill(1, grid.R), fill(2, grid.R))
+    kinetic_terms = [
+        (
+            weight = -coefficients[offset + 1] / (2grid.h^2),
+            operator = axis_mpo(
+                Q.shift_mpo(grid.R, direction * offset; boundary = grid.boundary),
+                axis,
+                axes,
+            ),
+        ) for offset = 1:(length(coefficients) - 1) for direction in (-1, 1) for axis in (1, 2)
+    ]
+    (;
+        kinetic_diagonal = -coefficients[1] / grid.h^2,
+        kinetic_terms,
+        potential,
+        interaction,
+        coordinates,
+    )
+end
+
+function correlated_action(operators, amplitude::AbstractMatrix)
+    operators.kinetic * amplitude +
+    permutedims(operators.kinetic * permutedims(amplitude)) +
+    operators.potential .* amplitude
+end
+
 struct DenseHamiltonian
     kinetic::SparseMatrixCSC{Float64,Int}
     potential::Vector{Float64}
+end
+
+"Zero-exterior or wrapping FD2/FD8, using the same coefficients on boundary rows."
+function dense_kinetic(grid::LineGrid1D, mass = 1.0)
+    coefficients = Q.finite_difference_coefficients(grid.fd_order)
+    rows, columns, values = Int[], Int[], Float64[]
+    for i = 1:(grid.n), offset = (1 - length(coefficients)):(length(coefficients) - 1)
+        j = i + offset
+        grid.boundary == :periodic && (j = mod1(j, grid.n))
+        1 <= j <= grid.n || continue
+        push!(rows, i)
+        push!(columns, j)
+        push!(values, -coefficients[abs(offset) + 1] / (2mass * grid.h^2))
+    end
+    sparse(rows, columns, values, grid.n, grid.n)
+end
+
+function build_operators(
+    problem::Problem{<:SoftCoulomb1D,<:LineGrid1D},
+    accuracy,
+    rec,
+    physics,
+    ::Val{:dense},
+)
+    grid, model = problem.grid, problem.model
+    coordinates = [grid_position(grid, j) for j = 0:(grid.n - 1)]
+    external = [
+        -sum(
+            charge / sqrt(1 + (coordinate - position)^2) for
+            (position, charge) in zip(model.positions, model.charges)
+        ) for coordinate in coordinates
+    ]
+    fft_size = model.interaction == :direct ? nextpow(2, 2grid.n - 1) : grid.n
+    kernel = [inv(sqrt(1 + (min(j, fft_size - j) * grid.h)^2)) for j = 0:(fft_size - 1)]
+    DenseOperators(
+        external,
+        dense_kinetic(grid, problem.mass),
+        fft(kernel),
+        SpinXC1D(model),
+        nothing,
+        model.nuclear_constant,
+    )
+end
+
+build_operators(
+    problem::Problem{<:SoftCoulomb1D,<:LineGrid1D},
+    accuracy,
+    rec,
+    physics,
+    ::Val{:qtt},
+) = build_operators(problem, accuracy, rec, physics, Val(:dense))
+
+function dense_hartree(rho, problem::Problem{<:SoftCoulomb1D,<:LineGrid1D}, ops::DenseOperators)
+    nfft = length(ops.interaction)
+    padded = zeros(nfft)
+    padded[1:length(rho)] .= rho
+    spacing(problem.grid) .* real.(ifft(ops.interaction .* fft(padded)))[1:length(rho)]
+end
+
+function effective_hamiltonian(
+    problem::Problem{<:SoftCoulomb1D,<:LineGrid1D},
+    rho,
+    ops::DenseOperators,
+    accuracy,
+    rec;
+    fit_potential = true,
+    time = 0.0,
+    drive = NoDrive(),
+)
+    hartree = dense_hartree(rho, problem, ops)
+    _, xc = evaluate_spin_xc(ops.xc_table, rho)
+    factor = problem.model.xc in (:restricted_exx, :restricted_exx_helbig_correlation) ? 0.5 : 1.0
+    potential = ops.external + factor .* hartree + xc
+    drive isa NoDrive || (
+        potential .+= [
+            drive_value(drive, grid_position(problem.grid, j), time, problem.grid.L) for
+            j = 0:(length(problem.grid) - 1)
+        ]
+    )
+    DenseHamiltonian(ops.kinetic, potential)
+end
+
+function total_energy(
+    problem::Problem{<:SoftCoulomb1D,<:LineGrid1D},
+    orbitals,
+    rho,
+    ops::DenseOperators,
+    accuracy,
+    rec;
+    time = 0.0,
+    drive = NoDrive(),
+)
+    kinetic = sum(
+        f * real(
+            dot(
+                line_orbital_values(psi, problem.grid),
+                ops.kinetic * line_orbital_values(psi, problem.grid),
+            ),
+        ) for (psi, f) in zip(orbitals, problem.occupations)
+    )
+    external = spacing(problem.grid) * dot(rho, ops.external)
+    hartree = spacing(problem.grid) * dot(rho, dense_hartree(rho, problem, ops)) / 2
+    ex =
+        problem.model.xc in (:restricted_exx, :restricted_exx_helbig_correlation) ? -hartree / 2 :
+        0.0
+    xc = ex + spacing(problem.grid) * sum(first(evaluate_spin_xc(ops.xc_table, rho)))
+    field =
+        drive isa NoDrive ? 0.0 :
+        spacing(problem.grid) * sum(
+            rho[j + 1] * drive_value(drive, grid_position(problem.grid, j), time, problem.grid.L)
+            for j = 0:(length(problem.grid) - 1)
+        )
+    nuclear = ops.nuclear
+    (;
+        total = kinetic + external + hartree + xc + nuclear + field,
+        kinetic,
+        external,
+        hartree,
+        xc,
+        nuclear,
+        drive = field,
+    )
+end
+
+line_orbital_values(psi::AbstractVector, g::LineGrid1D) = psi
+line_orbital_values(psi::Q.QTT, g::LineGrid1D) = Q.full_values(psi)[1:(g.n)]
+function density(
+    problem::Problem{<:SoftCoulomb1D,<:LineGrid1D},
+    orbitals::Vector{Q.QTT},
+    accuracy,
+    rec;
+    renormalize = false,
+    label = "density",
+)
+    rho = zeros(length(problem.grid))
+    for (psi, f) in zip(orbitals, problem.occupations)
+        rho .+= f .* abs2.(line_orbital_values(psi, problem.grid)) ./ spacing(problem.grid)
+    end
+    renormalize && (rho .*= sum(problem.occupations) / (spacing(problem.grid) * sum(rho)))
+    rho
 end
 
 function dense_kinetic(grid::PeriodicGrid1D, mass)

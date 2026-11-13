@@ -1,7 +1,68 @@
 # Algorithm
 
-All calculations use atomic units. Orbitals and fields are represented as QTTs;
-the solver does not assemble a dense spatial Hamiltonian.
+## Explicit small-system Hamiltonians
+
+`LineGrid1D` separates sampling, kinetic boundaries and Hartree convention.
+Open FD8 uses second-derivative coefficients
+`(-205/72, 8/5, -1/5, 8/315, -1/560)` with zero exterior values, including
+boundary rows. Periodic differences wrap. Direct Hartree evaluates
+`h*sum_j rho[j]/sqrt(1+(x[i]-x[j])^2)` by zero-padded FFT; historical
+minimum-image Hartree uses a separate circular kernel. Nuclear energy
+constants remain explicit.
+
+The declared spin sector determines channel densities and occupations.
+Libxc evaluates energy and spin derivatives with unit softening. Historical
+correlation uses Helbig et al.'s two parameter rows and quadratic spin
+interpolation, differentiated at fixed opposite-spin density. Restricted
+one-orbital EXX subtracts half the Hartree potential and energy. See
+[Libxc](https://libxc.gitlab.io/functionals/) and
+[Helbig et al.](https://doi.org/10.1103/PhysRevA.83.032503).
+
+The independent two-electron Hamiltonian is
+`H_e=T(x1)+T(x2)+v_en(x1)+v_en(x2)+1/sqrt(1+(x1-x2)^2)`.
+The exchange-even amplitude stores `A[i,j]=h*Psi(x[i],x[j])`; summing both
+coordinate marginals gives the physical density. Electronic dipoles include
+the negative charge. Energy with a nuclear constant is
+`<A|H_e|A>+E_NN*norm(A)^2`, retaining the raw norm.
+
+Dense and QTT explicit-grid propagation share VTV/TVT Strang composition.
+Kinetic `pade4` is the `[2/2]` rational exponential, factored into sparse
+solves. Cayley uses one such factor. The native QTT resolvent constructs
+`B^-1=C^-1-C^-1*P*(I+delta*G)^-1*delta*P'*C^-1`, where `B=I+sigma*T`,
+`C` is its periodic binary-grid counterpart, `P` selects boundary sites,
+`delta` is the boundary correction and `G=P'*C^-1*P`. The periodic inverse
+comes from its Fourier kernel; periodic FD2 reuses the analytic Green MPO
+when its shift is admissible. Otherwise, already sampled one-dimensional
+kernels and boundary vectors use library MPS factorization. The circulant
+automaton preserves translation structure, and explicit outer-product MPOs
+represent the boundary correction; `TCI.add` combines these with SVD truncation.
+A failed operator sum is retried from its original cores using ITensorMPS
+direct-sum addition and SVD truncation, with the failure and recovery recorded.
+The inverse is not fitted as a generic interleaved matrix: its small sampled
+pivot error can miss localized matrix structure. No full propagator matrix
+is constructed. The vector conversion checks its full-grid L2 error against
+the requested budget, allowing floating-point roundoff.
+Boundary correction tables use O(N*m) storage with a fixed finite-difference
+boundary size `m`; this alone does not establish large-grid runtime scaling.
+Identical kinetic substeps reuse their operators. Potential actions reconstruct
+the evolving QTT by TCI, without an additional unconditional rounding sweep.
+KS feedback uses physical-grid arrays. Correlated marginals contract endpoint
+tables; energy uses kinetic MPO contractions and fitted weighted amplitudes.
+Autonomous Yoshida composition uses three signed Strang substeps and rejects
+time-dependent drives or absorption. CAP damping surrounds each source step;
+no propagated state is renormalized. State and density errors remain necessary
+in addition to norm and Gram diagnostics.
+
+Correlated eigenstate preparation minimizes the Rayleigh quotient in a declared
+exchange-even inversion sector. The shared numerical solver uses the amplitude,
+kinetic-preconditioned residual and preceding direction as a small Ritz space,
+with fresh Hamiltonian actions. Canonical orthogonalization removes dependent
+directions. A localized initialization must satisfy the requested residual under
+the full physical-grid Hamiltonian before propagation.
+
+All calculations use atomic units. The QTT route represents orbitals and fields
+as tensor trains without assembling a dense spatial Hamiltonian. The dense
+LRRAP route uses full-grid vectors in the shared SCF workflow.
 
 ## Grid and orbital normalization
 
@@ -347,6 +408,19 @@ this repair does not alter the retained Lanczos basis.
 
 ## Tensor construction and rank control
 
+The default periodic 1D Green source samples the original expression
+`(shift + orbital_energy - potential) * psi` and reconstructs it by TCI.
+LRRAP directions keep the existing nested scalar field caches. Complete Green
+updates use the same sampled source followed by the zipup Green inverse and
+normalization. Independent residuals use the original potential expression.
+
+The preserved `h100-optimization-20261113` version removes nested scalar caches
+for Green directions and uses a larger outer source cache. Its complete Green
+updates can instead apply an existing fitted diagonal potential through two
+two-site ITensor fit sweeps. That version remains separate: the measured runtime
+benefit depends on the cache regime, peak RSS increases, and canonical-orbital
+errors are not uniformly lower. The default branch retains the baseline path.
+
 TCI constructs tensors with adaptive prrLU sampling. By default, its result is
 kept without a subsequent SVD. A positive `post_rounding_factor` explicitly
 requests rounding at `tolerance * post_rounding_factor`.
@@ -431,11 +505,12 @@ evaluation retains two bounded-memory passes so small residuals are evaluated
 directly after the Rayleigh energies are known. Use `solver=:block_davidson` to
 select a method and `scf=SCFOptions(...)` to supply numerical controls.
 
-The 1D `propagate` interface applies a potential half step, an FD2 Cayley kinetic
-step, and a second potential half step. Each potential step uses the density of
-its input orbitals; the external drive is evaluated at the time midpoint.
-Orbital norms and Gram drift are recorded. The 3D implementation currently
-supports ground-state SCF only.
+The 1D `propagate` interface defaults to VTV Strang splitting and a Cayley
+kinetic step. The explicit-grid options, FD2/FD8 boundaries, Pade and FFT
+kinetics, and autonomous Yoshida composition are described above. Each
+potential step uses the density of its input orbitals; the external drive is
+evaluated at the time midpoint. Orbital norms and Gram drift are recorded.
+The 3D implementation currently supports ground-state SCF only.
 
 ## Terminology and notation
 

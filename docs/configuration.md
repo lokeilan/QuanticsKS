@@ -1,5 +1,80 @@
 # Configuration
 
+## Explicit physical 1D grids
+
+`system.kind="soft_coulomb_1d"` selects `LineGrid1D`. Set `grid.n`, `spacing`,
+`origin`, `cell`, `boundary="open"` or `"periodic"`, and `fd_order=2` or `8`.
+The node count is physical; QTT storage pads to the next binary dimension.
+This route preserves the original periodic model's distinct defaults.
+
+The system accepts `positions`, `charges`, `occupations`, `interaction`, `xc`,
+`spin`, and `nuclear_constant`. `interaction="direct"` uses the nonperiodic
+soft-Coulomb sum; `"minimum_image"` uses circular convolution. Pair softenings
+and mass are one. The external nuclear potential uses direct distances.
+`spin="unpolarized"` divides double spatial occupations equally between spin
+channels. `"up"` or `"down"` uses unit occupations in a fully polarized
+sector. General unequal partial spin populations are not implemented here.
+
+`xc` is `libxc_1d_lda`, `libxc_1d_x`, `restricted_exx`,
+`restricted_exx_helbig_correlation`, `helbig_1d_lsda`, or `none`.
+Set `QUANTICSKS_LIBXC` to the required shared
+library for the Libxc exchange/CSC modes and historical LSD exchange. The
+backend records its actual version. Historical correlation uses the explicit
+Helbig spin interpolation. Restricted EXX and EXX plus correlation require
+one doubly occupied orbital and apply `v_x=-v_H/2`.
+
+Line-grid ground states require `representation="dense"` and use the shared
+LRRAP SCF and saved-state acceptance. `compress_orbitals` compresses a declared dense
+initial state; it does not independently solve its ground state.
+
+All 1D propagation uses `TimeOptions` or TOML `[time]`. `method` is `vtv`,
+`tvt`, `midpoint`, or `yoshida4`; midpoint is dense only. The implemented
+Yoshida composition rejects time-dependent drives and nonzero CAPs.
+`kinetic_exponential` is `cayley` (default), `pade4`, or periodic-only `fft`.
+Physical times use `dt`, `steps`, `observe_every`, and `snapshot_steps`.
+`norm_drift_limit` and `gram_drift_limit` bound unitary propagation drift;
+CAP calculations retain physical norm loss. `exponential_tolerance` and
+`krylov_dimension` control the dense midpoint Hamiltonian exponential.
+`seed` and `parallel_tasks` control reconstruction scheduling.
+
+QTT controls belong to `Accuracy`: `orbital_tolerance`, `orbital_cap`,
+`algebra_tolerance`, `work_cap`, and `field_tolerance` keep their existing
+meanings. `kinetic_propagator_tolerance=1e-13` and
+`kinetic_propagator_cap=256` control the kinetic inverse construction or exponential fit.
+The QTT inverse preserves a periodic circulant kernel and adds explicit
+low-rank boundary terms; already sampled kinetic vectors use MPS factorization
+with a checked L2 budget, and operator sums use `TCI.add` SVD truncation.
+The periodic FFT exponential uses a one-dimensional TCI kernel fit;
+it does not construct a full propagator matrix. KS feedback fields and
+explicit-grid orbital observations use physical-grid arrays.
+
+The Julia `absorber` argument supplies a nonnegative CAP vector. Two half
+damping operations surround each physical source timestep. Propagation keeps
+the raw norm; Yoshida negative substeps reject a nonzero CAP. Observations
+include physical support, padding probability, Gram defect, electronic dipole
+and mean-square position.
+
+## Correlated two-electron interface
+
+Use `CorrelatedProblem`, `correlated_eigenstate`, `CorrelatedState`, `kick`,
+and `correlated_propagate` through Julia. The amplitude is `h*Psi(x1,x2)` and
+has norm one; its physical marginal density integrates to two. The singlet
+configuration-space TDSE has both nuclear terms and the electron-electron
+pair term, with no KS Hartree/XC. Choose open FD8, open FD2 or periodic FD2
+to match the experiment.
+
+The eigenstate solver uses preconditioned Rayleigh-Ritz minimization in a
+declared exchange-even inversion sector (`inversion_parity=1` or `-1`).
+A reduced initialization box must
+pass the actual full-grid residual. Coherent preparations must fix the
+relative eigenstate phase before propagation. `compress_state` compresses a supplied
+dense amplitude into grouped electron-coordinate bits. Both representations
+share kinetic and phase operations, `TimeOptions`, and observable definitions.
+The native trajectory computes marginals from endpoint contractions and
+energy expectations from weighted amplitudes without an N-by-N state array.
+`save_correlated_checkpoint` and
+`load_correlated_checkpoint` preserve the grid, Hamiltonian and representation.
+
 Inputs are TOML files. Unknown sections and options raise an error. Start from
 [h4.toml](../inputs/h4.toml), [helium.toml](../inputs/helium.toml), or
 [propagation.toml](../inputs/propagation.toml).
@@ -14,8 +89,9 @@ julia --project=. run.jl solve inputs/helium.toml results/helium
 `[run].representation` is `"qtt"` by default. Use `"dense"` with
 `[run].kind="scf"` and `[scf].solver="lrrap"` for the full-grid counterpart.
 The Julia interface is `ground_state(problem; representation=:dense)`.
-Dense Block Lanczos, Block Davidson, fixed spectra, and propagation are not
-implemented. Unsupported representation/solver combinations fail at entry.
+Dense Block Lanczos, Block Davidson and fixed spectra are not implemented.
+Dense propagation is available on the explicit line-grid route above.
+Unsupported representation/solver combinations fail at entry.
 
 The two LRRAP paths use the same SCF settings: mixing and Anderson history,
 inner steps, coefficient sweeps, shifted kinetic inverse, Green update policy,
@@ -288,7 +364,7 @@ scripts, full research inputs and calibration reports stay in local outputs.
 | `scf.orbital_residual_tolerance` | Final stored-orbital residual threshold; unset inherits `eigen_tolerance` |
 | `scf.density_tolerance` | Density self-consistency threshold |
 | `time.dt`, `time.steps` | Time step and number of propagation steps |
-| `time.observe_every`, `time.snapshot_every` | Observation and saved-state intervals |
+| `time.observe_every`, `time.snapshot_steps` | Observation interval and explicit saved-state steps |
 
 At the final accuracy budgets, energy stability and the iteration density
 residual schedule a canonical candidate check. This check recomputes density,

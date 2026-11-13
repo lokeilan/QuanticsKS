@@ -18,4 +18,4 @@ parallel_tasks = 0
 dt = 0.01
 steps = 4
 observe_every = 1
-snapshot_every = 2
+snapshot_steps = [0, 2, 4]

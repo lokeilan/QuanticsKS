@@ -8,17 +8,14 @@ struct XCTable
     log_density_derivative::Vector{Float64}
     quadrature_rtol::Float64
 end
-function correlation(rho)
-    # Helbig et al., Eq. (5) and Table 1: unpolarized 1D gas, unit softening.
-    # A, C, D, E, alpha, beta, and m retain the parametrization's symbols.
+const HELBIG_CORRELATION_UNPOLARIZED = (18.40, 7.501, 0.10185, 0.012827, 1.511, 0.258, 4.424)
+const HELBIG_CORRELATION_POLARIZED = (5.24, 1.568, 0.1286, 0.00320, 0.0538, 1.56e-5, 2.958)
+
+"Helbig et al., unit-softening correlation energy per particle and its r_s derivative."
+function helbig_correlation_terms(rho, parameters = HELBIG_CORRELATION_UNPOLARIZED)
+    # A, C, D, E, alpha, beta and m are the published fit parameters.
+    A, C, D, E, alpha, beta, m = parameters
     rs = 1 / (2rho)
-    A = 18.40
-    C = 7.501
-    D = 0.10185
-    E = 0.012827
-    alpha = 1.511
-    beta = 0.258
-    m = 4.424
     num = rs + E * rs^2
     den = A + C * rs^2 + D * rs^3
     q = alpha * rs + beta * rs^m
@@ -26,7 +23,46 @@ function correlation(rho)
     fp = ((1 + 2E * rs) * den - num * (2C * rs + 3D * rs^2)) / den^2
     epsilon_c = -0.5 * f * log1p(q)
     derivative_rs = -0.5 * (fp * log1p(q) + f * (alpha + beta * m * rs^(m - 1)) / (1 + q))
-    rho * epsilon_c, epsilon_c - rs * derivative_rs
+    (; rs, epsilon_c, derivative_rs)
+end
+function correlation(rho)
+    terms = helbig_correlation_terms(rho)
+    rho * terms.epsilon_c, terms.epsilon_c - terms.rs * terms.derivative_rs
+end
+
+"Spin derivatives of n*epsilon_c(r_s,zeta), with quadratic Helbig polarization interpolation."
+function helbig_spin_correlation(rho_up, rho_down; density_floor = 1e-14)
+    rho = rho_up + rho_down
+    rho <= density_floor && return (0.0, 0.0, 0.0)
+    unpolarized = helbig_correlation_terms(rho)
+    polarized = helbig_correlation_terms(rho, HELBIG_CORRELATION_POLARIZED)
+    zeta = (rho_up - rho_down) / rho
+    delta_epsilon = polarized.epsilon_c - unpolarized.epsilon_c
+    epsilon_c = unpolarized.epsilon_c + zeta^2 * delta_epsilon
+    derivative_rs =
+        unpolarized.derivative_rs + zeta^2 * (polarized.derivative_rs - unpolarized.derivative_rs)
+    potential = epsilon_c - unpolarized.rs * derivative_rs
+    derivative_zeta = 2zeta * delta_epsilon
+    rho * epsilon_c,
+    potential + (1 - zeta) * derivative_zeta,
+    potential - (1 + zeta) * derivative_zeta
+end
+
+"Central second-derivative coefficients, ordered from the center to positive neighbors."
+function finite_difference_coefficients(order::Integer)
+    order == 2 && return (-2.0, 1.0)
+    order == 8 && return (-205 / 72, 8 / 5, -1 / 5, 8 / 315, -1 / 560)
+    throw(ArgumentError("Supported finite-difference orders are 2 and 8"))
+end
+
+function kinetic_eigenvalues(n::Integer, h::Real, order::Integer; mass = 1.0)
+    coefficients = finite_difference_coefficients(order)
+    [
+        -(
+            coefficients[1] +
+            2sum(coefficients[k + 1] * cospi(2k * j / n) for k = 1:(length(coefficients) - 1))
+        ) / (2mass * h^2) for j = 0:(n - 1)
+    ]
 end
 function xc_exact(rho; rtol = 2e-11)
     rho = max(rho, 1e-12)

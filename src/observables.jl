@@ -1,13 +1,145 @@
 # Observe states and postprocess saved results, sampling orbitals on the requested output grid.
 
+function correlated_observe(
+    state::CorrelatedState{<:AbstractMatrix},
+    operators = correlated_operators(state.problem, Val(:dense));
+    accuracy = Accuracy(),
+    rec = nothing,
+    channel_radius = 8.0,
+    edge_fraction = 0.8,
+)
+    grid, amplitude = state.problem.grid, state.amplitude
+    probability = abs2.(amplitude)
+    marginal = vec(sum(probability; dims = 2)) + vec(sum(probability; dims = 1))
+    norm2 = sum(probability)
+    kinetic =
+        real(dot(amplitude, operators.kinetic * amplitude)) +
+        real(dot(permutedims(amplitude), operators.kinetic * permutedims(amplitude)))
+    electronic_energy = kinetic + sum(operators.potential .* probability)
+    bound = abs.(operators.coordinates) .<= channel_radius
+    interior = abs.(operators.coordinates) .<= edge_fraction * grid.L / 2
+    bound_probability = sum(probability[bound, bound])
+    double_probability = sum(probability[.!bound, .!bound])
+    (;
+        time = state.time,
+        norm2,
+        electron_number = 2norm2,
+        electronic_dipole = -dot(operators.coordinates, marginal),
+        mean_square_position = dot(operators.coordinates .^ 2, marginal) / 2,
+        electronic_energy,
+        energy = electronic_energy + state.problem.nuclear_constant * norm2,
+        interaction = sum(operators.interaction .* probability),
+        exchange_defect = norm(amplitude - transpose(amplitude)),
+        edge = max(0.0, norm2 - sum(probability[interior, interior])),
+        bound_probability,
+        single_probability = norm2 - bound_probability - double_probability,
+        double_probability,
+        rho = marginal / grid.h,
+    )
+end
+
+"Contract both one-coordinate marginals from the existing endpoint tables, without an N^2 array."
+function correlated_marginals(state::CorrelatedState{Q.QTT})
+    grid, amplitude = state.problem.grid, state.amplitude
+    left = transpose(Q.endpoint_table(amplitude, grid.R, true))
+    right = Q.endpoint_table(amplitude, grid.R, false)
+    left_gram, right_gram = left' * left, right * right'
+    marginal_first = max.(0.0, real.(vec(sum((left * right_gram) .* conj.(left); dims = 2))))
+    marginal_second = max.(0.0, real.(vec(sum(conj.(right) .* (left_gram * right); dims = 1))))
+    (; left, right, left_gram, right_gram, marginal = marginal_first + marginal_second)
+end
+
+function correlated_weighted_expectation(amplitude, potential, accuracy, rec, label)
+    evaluator = Q.Evaluator(amplitude)
+    weighted = Q.cross(
+        rec,
+        length(amplitude),
+        index -> potential(index) * evaluator(index);
+        tol = accuracy.field_tolerance,
+        cap = accuracy.work_cap,
+        label,
+        require_convergence = true,
+    )
+    real(Q.inner(amplitude, weighted))
+end
+
+function correlated_observe(
+    state::CorrelatedState{Q.QTT},
+    operators = correlated_operators(state.problem, Val(:qtt));
+    accuracy = Accuracy(),
+    rec = nothing,
+    channel_radius = 8.0,
+    edge_fraction = 0.8,
+)
+    own_recorder = rec === nothing
+    own_recorder && (rec = recorder(nothing, TCIOptions()))
+    try
+        grid, amplitude = state.problem.grid, state.amplitude
+        factors = correlated_marginals(state)
+        norm2 = real(Q.inner(amplitude, amplitude))
+        kinetic =
+            operators.kinetic_diagonal * norm2 + sum(
+                term.weight * real(Q.inner_mpo(amplitude, term.operator, amplitude)) for
+                term in operators.kinetic_terms
+            )
+        electronic_energy =
+            kinetic + correlated_weighted_expectation(
+                amplitude,
+                operators.potential,
+                accuracy,
+                rec,
+                "potential_energy",
+            )
+        interaction = correlated_weighted_expectation(
+            amplitude,
+            operators.interaction,
+            accuracy,
+            rec,
+            "interaction_energy",
+        )
+        function probability(first, second)
+            left = factors.left[first, :]
+            right = factors.right[:, second]
+            real(tr((left' * left) * (right * right')))
+        end
+        bound = abs.(operators.coordinates) .<= channel_radius
+        interior = abs.(operators.coordinates) .<= edge_fraction * grid.L / 2
+        bound_probability = probability(bound, bound)
+        double_probability = probability(.!bound, .!bound)
+        exchange_overlap = factors.left' * transpose(factors.right)
+        exchange_defect = sqrt(max(0.0, 2norm2 - 2real(sum(exchange_overlap .* exchange_overlap'))))
+        (;
+            time = state.time,
+            norm2,
+            electron_number = 2norm2,
+            electronic_dipole = -dot(operators.coordinates, factors.marginal),
+            mean_square_position = dot(operators.coordinates .^ 2, factors.marginal) / 2,
+            electronic_energy,
+            energy = electronic_energy + state.problem.nuclear_constant * norm2,
+            interaction,
+            exchange_defect,
+            edge = max(0.0, norm2 - probability(interior, interior)),
+            bound_probability,
+            single_probability = norm2 - bound_probability - double_probability,
+            double_probability,
+            rho = factors.marginal / grid.h,
+        )
+    finally
+        own_recorder && close(rec)
+    end
+end
+
 function observe_state(state, ops, accuracy, rec; drive = NoDrive(), overlap = nothing)
     problem = state.problem
     orbitals = state.orbitals
     grid = problem.grid
     S = overlap === nothing ? Q.gram(orbitals; cfg = rec.options) : overlap
     norms = real.(diag(S))
-    rho = density(problem, orbitals, accuracy, rec)
-    energy = total_energy(problem, orbitals, rho, ops, accuracy, rec; time = state.time, drive)
+    physical_orbitals =
+        grid isa LineGrid1D ? [line_orbital_values(psi, grid) for psi in orbitals] : orbitals
+    rho = density(problem, physical_orbitals, accuracy, rec)
+    energy =
+        total_energy(problem, physical_orbitals, rho, ops, accuracy, rec; time = state.time, drive)
     charge = sum(problem.occupations .* norms)
     observables = (;
         time = state.time,
@@ -18,6 +150,18 @@ function observe_state(state, ops, accuracy, rec; drive = NoDrive(), overlap = n
         max_bond_dimension = Q.orbital_max_rank(orbitals),
         orbital_bytes = sum(Q.storage, orbitals),
     )
+    if grid isa LineGrid1D
+        x = [grid_position(grid, j) for j = 0:(grid.n - 1)]
+        return merge(
+            observables,
+            (;
+                electronic_dipole = -grid.h * dot(x, rho),
+                mean_square_position = grid.h * dot(x .^ 2, rho) / sum(problem.occupations),
+                physical_electron_number = grid.h * sum(rho),
+                padding_electron_number = charge - grid.h * sum(rho),
+            ),
+        )
+    end
     grid isa PeriodicGrid1D || return observables
     moment = if representation(state) == :dense
         spacing(grid) * dot(cis.(-2pi .* (0:(length(grid) - 1)) ./ length(grid)), rho) /
@@ -117,14 +261,7 @@ function postprocess(
             println(io, "$coordinates,$(sum(problem.occupations.*abs2.(evaluator(j)))/dx)")
         end
     end
-    cap =
-        orbital_cap === nothing ?
-        Int(
-            config["options"][config["kind"] == "propagation" ? "time" : "accuracy"][config["kind"] ==
-                                                                                     "propagation" ?
-                                                                                     "phase_cap" :
-                                                                                     "orbital_cap"],
-        ) : orbital_cap
+    cap = orbital_cap === nothing ? Int(config["options"]["accuracy"]["orbital_cap"]) : orbital_cap
     profiles = bond_profiles(final)
     open(joinpath(out, "bond_profiles.csv"), "w") do io
         println(io, "orbital,bond_index,bond_dimension,algebraic_cap,code_cap")

@@ -1531,6 +1531,57 @@ function canonical_orthogonalizer(overlap, relative_cutoff, absolute_cutoff)
     metric.vectors[:, independent] * Diagonal(inv.(sqrt.(metric.values[independent])))
 end
 
+"Minimize a Rayleigh quotient in the span of a state, a preconditioned residual and its previous direction."
+function preconditioned_eigenstate(
+    action,
+    precondition,
+    initial;
+    tolerance,
+    max_iterations,
+    metric_relative_cutoff = 1e-12,
+    metric_absolute_cutoff = 1e-14,
+    callback = nothing,
+)
+    amplitude = initial / norm(initial)
+    direction = nothing
+    residual_norm = Inf
+    for iteration = 1:max_iterations
+        H_amplitude = action(amplitude)
+        energy = real(dot(amplitude, H_amplitude))
+        residual = H_amplitude - energy .* amplitude
+        residual_norm = norm(residual)
+        callback === nothing || callback(iteration, energy, residual_norm)
+        residual_norm <= tolerance &&
+            return (; amplitude, energy, residual = residual_norm, iterations = iteration)
+        preconditioned_residual = precondition(residual)
+        basis =
+            direction === nothing ? (amplitude, preconditioned_residual) :
+            (amplitude, preconditioned_residual, direction)
+        # Normalize directions before the relative metric cutoff is applied.
+        basis_norms = norm.(basis)
+        basis = map(/, basis, basis_norms)
+        overlap = [dot(left, right) for left in basis, right in basis]
+        orthogonalizer =
+            canonical_orthogonalizer(overlap, metric_relative_cutoff, metric_absolute_cutoff)
+        size(orthogonalizer, 2) >= 2 ||
+            error("Eigenstate search space lost independence at residual $residual_norm")
+        # Reuse the fresh state action; recompute actions only for search directions.
+        H_basis = (H_amplitude / first(basis_norms), map(action, Base.tail(basis))...)
+        projected = [dot(left, right) for left in basis, right in H_basis]
+        reduced_H = orthogonalizer' * projected * orthogonalizer
+        ritz_coefficients =
+            orthogonalizer * eigen(Hermitian((reduced_H + reduced_H') / 2)).vectors[:, 1]
+        updated =
+            sum(coefficient .* vector for (coefficient, vector) in zip(ritz_coefficients, basis))
+        updated ./= norm(updated)
+        direction = updated - dot(amplitude, updated) .* amplitude
+        direction .-= dot(updated, direction) .* updated
+        norm(direction) > 1e-14 || (direction = nothing)
+        amplitude = updated
+    end
+    error("Preconditioned eigenstate residual $residual_norm after $max_iterations iterations")
+end
+
 "Fit final orbitals with shared endpoint tables and bounded contraction caches."
 function combine_orbitals(basis, coefficients, cfg, rec; tol, cap, label)
     evaluators = orbital_evaluators(basis, size(coefficients, 2), cfg, rec)

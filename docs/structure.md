@@ -28,7 +28,10 @@ src/
     hamiltonian.jl
     scf.jl
     spectrum.jl
+    propagation_operators.jl
     dynamics.jl
+    correlated.jl
+    xc.jl
     observables.jl
     tensor.jl
     tci.jl
@@ -51,7 +54,10 @@ methods supply the grid, fields, kinetic operator, and Green operation.
 | [hamiltonian.jl](../src/hamiltonian.jl) | 1D and 3D fields, Hamiltonian operators, Green solves, and total energy |
 | [scf.jl](../src/scf.jl) | Shared SCF loop, output Ritz rotation, and physical audit |
 | [spectrum.jl](../src/spectrum.jl) | Fixed-potential eigensolvers and residual diagnostics for 1D |
-| [dynamics.jl](../src/dynamics.jl) | Split-step time propagation for 1D |
+| [xc.jl](../src/xc.jl) | Spin-resolved Libxc conversion, physical parameters and native-handle lifetime |
+| [propagation_operators.jl](../src/propagation_operators.jl) | Shared kinetic resolvents, boundary corrections and potential-phase reconstruction |
+| [dynamics.jl](../src/dynamics.jl) | One KS orbital propagation workflow for supported 1D grids and representations |
+| [correlated.jl](../src/correlated.jl) | Interacting singlet states, eigenstate preparation, propagation flow and checkpoints |
 | [observables.jl](../src/observables.jl) | State observables and saved-run postprocessing |
 
 ## Shared numerical functions
@@ -63,7 +69,7 @@ operations used by every model. Its files are loaded by `QuanticsKS.jl`.
 |---|---|
 | [tensor.jl](../src/tensor.jl) | QTT algebra, MPO operations, linear expressions, and compression recovery |
 | [tci.jl](../src/tci.jl) | Sample caches, TCI fitting, pivot reuse, fit records, and task scheduling |
-| [physics.jl](../src/physics.jl) | Periodic soft-Coulomb kernel and scalar 1D XC formulas |
+| [physics.jl](../src/physics.jl) | Soft-Coulomb kernels, shared finite-difference coefficients and Helbig correlation formulas |
 | [solvers.jl](../src/solvers.jl) | LRRAP, Lanczos and Davidson updates, shared orbital algebra, mixing, and storage |
 
 TensorCrossInterpolation supplies fitting, tensor addition, compression, and

@@ -2,7 +2,7 @@
 
 julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "ea6b5e9910b39037982b4ddc5b36767c5af19586"
+project_hash = "45bc3c56c35bcf81c2648c149790dd38d3787b2f"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -477,6 +477,12 @@ version = "1.11.3+1"
 uuid = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
 version = "1.11.0"
 
+[[deps.Libxc_jll]]
+deps = ["Artifacts", "CompilerSupportLibraries_jll", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "94f7feffa99688628909494a890581fe3b6148dd"
+uuid = "a56a6d9d-ad03-58af-ab61-878bf78270d6"
+version = "7.0.0+2"
+
 [[deps.LinearAlgebra]]
 deps = ["Libdl", "OpenBLAS_jll", "libblastrampoline_jll"]
 uuid = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
@@ -664,7 +670,7 @@ version = "2.11.3"
     Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
 
 [[deps.QuanticsKS]]
-deps = ["Dates", "ITensorMPS", "ITensors", "JSON3", "KrylovKit", "LinearAlgebra", "Printf", "QuadGK", "Random", "SHA", "Serialization", "SpecialFunctions", "TOML", "TensorCrossInterpolation", "TensorOperations", "VectorInterface"]
+deps = ["Dates", "FFTW", "ITensorMPS", "ITensors", "JSON3", "KrylovKit", "Libxc_jll", "LinearAlgebra", "Printf", "QuadGK", "Random", "Serialization", "SparseArrays", "SpecialFunctions", "TOML", "TensorCrossInterpolation", "TensorOperations", "VectorInterface"]
 path = "."
 uuid = "dfe65309-75e7-4472-9af8-9c8258f64e76"
 version = "0.1.0"

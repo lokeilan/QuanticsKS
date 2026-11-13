@@ -4,6 +4,8 @@ module QuanticsKS
 
 using LinearAlgebra, Random, Serialization, JSON3, Dates, Printf, TOML
 using SparseArrays, FFTW
+import Libdl
+import KrylovKit
 
 module Numerics
 using LinearAlgebra, Random, Serialization, Dates, JSON3, TensorOperations
@@ -20,9 +22,12 @@ end
 const Q = Numerics
 
 include("models.jl")
+include("correlated.jl")
+include("xc.jl")
 include("states.jl")
 include("hamiltonian.jl")
 include("scf.jl")
+include("propagation_operators.jl")
 include("dynamics.jl")
 include("observables.jl")
 include("spectrum.jl")
@@ -39,5 +44,9 @@ export NoDrive, CosinePulse, FunctionDrive
 export FixedSpectrumOptions, FixedSpectrumResult, fixed_spectrum
 export BoxGrid3D, AllElectronLDA3D, LocalPotential3D
 export grid_index, grid_indices, grid_position, nsites, volume_element
+export LineGrid1D, SoftCoulomb1D, CorrelatedProblem, CorrelatedState
+export correlated_eigenstate, correlated_observe, correlated_propagate, kick
+export compress_orbitals, compress_state
+export save_correlated_checkpoint, load_correlated_checkpoint
 
 end

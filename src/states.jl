@@ -42,6 +42,32 @@ struct OrbitalState{P<:Problem,V}
 end
 representation(::OrbitalState{<:Problem,Q.QTT}) = :qtt
 representation(::OrbitalState{<:Problem,<:AbstractVector}) = :dense
+
+"Compress a supplied full-grid state; this conversion is not an independent ground-state solve."
+function compress_orbitals(
+    state::OrbitalState{<:Problem,<:AbstractVector};
+    tolerance = 1e-12,
+    cap = 128,
+    tci = TCIOptions(),
+)
+    grid = state.problem.grid
+    rec = recorder(nothing, tci)
+    try
+        orbitals = [
+            Q.cross(
+                rec,
+                nsites(grid),
+                j -> j < length(grid) ? psi[j + 1] : 0.0;
+                tol = tolerance,
+                cap,
+                label = "supplied_orbital_$i",
+            ) for (i, psi) in enumerate(state.orbitals)
+        ]
+        OrbitalState(state.problem, orbitals; time = state.time)
+    finally
+        close(rec)
+    end
+end
 function state_from_functions(
     problem::Problem,
     functions;
@@ -92,6 +118,38 @@ initial_state(problem, accuracy, rec, guess::InitialGuess) =
 
 initial_orbitals(problem, accuracy, rec, guess, ::Val{:qtt}; kwargs...) =
     initial_orbitals(problem, accuracy, rec, guess; kwargs...)
+
+function initial_orbitals(
+    problem::Problem{<:SoftCoulomb1D,<:LineGrid1D},
+    accuracy,
+    rec,
+    guess,
+    ::Val{:dense};
+    count = length(problem.occupations),
+)
+    g, m = problem.grid, problem.model
+    potential = [
+        -sum(z / sqrt(1 + (grid_position(g, j) - a)^2) for (a, z) in zip(m.positions, m.charges)) for j = 0:(g.n - 1)
+    ]
+    H = dense_kinetic(g, problem.mass) + spdiagm(0 => potential)
+    factor = cholesky(Hermitian(H + (sum(m.charges) + 1) * I))
+    _, vectors, info = KrylovKit.eigsolve(
+        x -> factor \ x,
+        normalize(
+            ComplexF64.([
+                (1 + 0.1grid_position(g, j)) * exp(-grid_position(g, j)^2 / 8) for j = 0:(g.n - 1)
+            ]),
+        ),
+        count,
+        :LM;
+        ishermitian = true,
+        tol = 1e-12,
+        krylovdim = max(30, 2count + 4),
+        maxiter = 200,
+    )
+    info.converged >= count || error("Initial 1D eigensolve did not converge")
+    Vector{ComplexF64}.(vectors[1:count])
+end
 
 "One periodic envelope and mode order for dense and QTT initialization."
 function periodic_initial_samples(problem, guess, count)
@@ -402,6 +460,7 @@ function save_checkpoint(path, state::OrbitalState; metadata = Dict())
     path
 end
 function restore_problem(d; model = nothing)
+    get(d["model"], "kind", "") == "soft_coulomb_1d" && return restore_line_problem(d; model)
     get(d, "dimensions", 1) == 3 && return restore_problem3d(d; model)
     d["boundary"] == "periodic" && d["units"] == "atomic" ||
         throw(ArgumentError("Unsupported checkpoint conventions"))
@@ -427,6 +486,31 @@ function restore_problem(d; model = nothing)
         throw(ArgumentError("Unknown model kind"))
     end
     Problem(PeriodicGrid1D(d["R"], d["cell"]), m, d["occupations"]; mass = d["mass"])
+end
+
+function restore_line_problem(d; model = nothing)
+    d["units"] == "atomic" || throw(ArgumentError("Unsupported units"))
+    md = d["model"]
+    m = SoftCoulomb1D(
+        md["positions"],
+        md["charges"];
+        interaction = Symbol(md["interaction"]),
+        xc = Symbol(md["xc"]),
+        spin = Symbol(md["spin"]),
+        nuclear_constant = md["nuclear_constant"],
+    )
+    model === nothing ||
+        model_descriptor(model) == model_descriptor(m) ||
+        throw(ArgumentError("Model mismatch"))
+    g = LineGrid1D(
+        d["n"],
+        d["spacing"];
+        origin = d["origin"],
+        boundary = Symbol(d["boundary"]),
+        fd_order = d["fd_order"],
+        cell = d["cell"],
+    )
+    Problem(g, m, d["occupations"]; mass = d["mass"])
 end
 function restore_problem3d(d; model = nothing)
     d["boundary"] == "isolated_zero_exterior" &&

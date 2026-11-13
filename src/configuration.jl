@@ -181,14 +181,44 @@ function require_keys(d, allowed, section)
 end
 function problem_from_config(d)
     gd = get(d, "grid", Dict())
-    require_keys(gd, ["R", "cell", "dimensions"], "grid")
     sd = get(d, "system", Dict())
     kind = get(sd, "kind", "hydrogen_chain")
+    require_keys(
+        gd,
+        kind == "soft_coulomb_1d" ?
+        ["n", "spacing", "origin", "boundary", "fd_order", "cell", "dimensions"] :
+        ["R", "cell", "dimensions"],
+        "grid",
+    )
     dimensions = get(gd, "dimensions", 1)
     dimensions == 3 && return problem_from_config3d(gd, sd)
     dimensions == 1 || throw(ArgumentError("Grid dimensions must be 1 or 3"))
     common = ["kind", "mass", "occupations"]
-    if kind == "hydrogen_chain"
+    if kind == "soft_coulomb_1d"
+        require_keys(
+            sd,
+            vcat(common, ["positions", "charges", "interaction", "xc", "spin", "nuclear_constant"]),
+            "system",
+        )
+        n, h = gd["n"], gd["spacing"]
+        grid = LineGrid1D(
+            n,
+            h;
+            origin = get(gd, "origin", -n * h / 2),
+            boundary = Symbol(get(gd, "boundary", "open")),
+            fd_order = get(gd, "fd_order", 8),
+            cell = get(gd, "cell", n * h),
+        )
+        model = SoftCoulomb1D(
+            sd["positions"],
+            sd["charges"];
+            interaction = Symbol(get(sd, "interaction", "direct")),
+            xc = Symbol(get(sd, "xc", "libxc_1d_lda")),
+            spin = Symbol(get(sd, "spin", "unpolarized")),
+            nuclear_constant = get(sd, "nuclear_constant", 0.0),
+        )
+        return Problem(grid, model, sd["occupations"]; mass = get(sd, "mass", 1.0))
+    elseif kind == "hydrogen_chain"
         require_keys(
             sd,
             vcat(common, ["natoms", "distance", "offset", "softening", "coupling", "xc"]),
@@ -295,12 +325,13 @@ function configured_options(settings::AbstractDict)
     representation = Symbol(get(run, "representation", "qtt"))
     representation in (:qtt, :dense) ||
         throw(ArgumentError("Unknown orbital representation: $representation"))
-    representation == :dense &&
-        kind != "scf" &&
-        throw(ArgumentError("Dense orbitals currently support SCF only"))
     threads = get(run, "blas_threads", 1)
     threads isa Integer && threads >= 1 || throw(ArgumentError("Invalid BLAS thread count"))
     problem = problem_from_config(settings)
+    representation == :dense &&
+        kind != "scf" &&
+        !(problem.grid isa LineGrid1D) &&
+        throw(ArgumentError("Dense propagation requires the explicit LineGrid1D model"))
     problem.grid isa BoxGrid3D &&
         kind != "scf" &&
         throw(ArgumentError("3D configuration currently supports ground-state SCF"))
@@ -385,6 +416,12 @@ function configuration_plan(path)
         plan["axis_bits"] = collect(axis_bits(problem.grid))
         plan["grid_shape"] = collect(grid_shape(problem.grid))
         plan["grid_spacing"] = collect(spacing(problem.grid))
+    elseif problem.grid isa LineGrid1D
+        plan["grid_spacing"] = spacing(problem.grid)
+        plan["grid_origin"] = problem.grid.origin
+        plan["kinetic_boundary"] = string(problem.grid.boundary)
+        plan["finite_difference_order"] = problem.grid.fd_order
+        plan["hartree_boundary"] = string(problem.model.interaction)
     end
     plan
 end
@@ -455,11 +492,15 @@ function run_config(settings::AbstractDict, path; output = nothing, checkpoint =
             )
         else
             initial === nothing && (
-                initial = initial_state(
+                initial = OrbitalState(
                     problem,
-                    accuracy,
-                    recorder(nothing, tci; parallel_tasks = time_options.parallel_tasks),
-                    guess,
+                    initial_orbitals(
+                        problem,
+                        accuracy,
+                        recorder(nothing, tci; parallel_tasks = time_options.parallel_tasks),
+                        guess,
+                        Val(options.representation),
+                    ),
                 )
             )
             propagate(
