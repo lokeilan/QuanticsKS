@@ -23,7 +23,6 @@ work_tolerance = 1e-9
 storage_tolerance = 1e-11
 
 [scf]
-criterion = "strict"
 max_iterations = 50
 energy_tolerance = 1e-8
 eigen_tolerance = 1e-6

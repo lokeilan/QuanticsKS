@@ -1,48 +1,5 @@
 # Configuration
 
-## Fixed-H Block LOBPCG library interface
-
-`block_lobpcg(H, X; preconditioner=nothing, tolerance=1e-6,
-max_iterations=100, gram_tolerance=1e-8, callback=identity)` computes the lowest
-`size(X,2)` eigenpairs for a dense orbital matrix. `H` is a Hermitian matrix or
-a callback that applies it to an orbital block. A preconditioner callback
-returns the inverse action on that block; the default is the identity.
-For dense orbitals, a matrix or factorization is also accepted and applied
-through a linear solve. A matrix is factorized once at entry.
-The standard convergence assumptions require a Hermitian positive-definite
-preconditioner and a fixed Hermitian Hamiltonian.
-
-```julia
-using QuanticsKS, LinearAlgebra, Random
-H = SymTridiagonal(fill(2.0, 64), fill(-1.0, 63))
-X = randn(MersenneTwister(7), 64, 4)
-result = block_lobpcg(H, X;
-    preconditioner = cholesky(H + I), tolerance = 1e-8)
-```
-
-For QTT, use `block_lobpcg(H, state; accuracy, tci, parallel_tasks, ...)` with
-an `OrbitalState` and a fixed project Hamiltonian. The preconditioner receives
-a vector of QTT residuals. The shared low-level interface also accepts
-`block_lobpcg(H, orbitals, cfg, rec; work_tolerance, ...)` when the caller
-already owns the numerical configuration and recorder. QTT fitting, algebra,
-and rank limits retain their existing meanings. The state interface bounds
-the working fit tolerance by `min(accuracy.work_tolerance, tolerance/100)`;
-the final residual audit uses `accuracy.algebra_tolerance`.
-The trial block can contain up to three times the orbital count. Its endpoint
-tables share `tci.orbital_cache_max_bytes`; if they do not cover the whole
-quantics chain, reconstruction uses TT-slice sampling. Rank and cache budgets
-therefore affect the cost of fitting final block combinations.
-The library requires more
-grid degrees of freedom than three times the orbital count.
-
-Results contain `orbitals`, `eigenvalues`, `residual_norms`, `gram_defect`,
-`converged`, `iterations`, `residual_history`, and `elapsed_seconds`.
-`residual_norms` are freshly audited; history contains the iteration's working
-residuals. Callbacks receive the iteration number, eigenvalues, working
-residual norms, and locked count. Convergence requires every returned orbital
-residual to meet `tolerance` and the stored Gram defect to meet
-`gram_tolerance`. An iteration limit does not imply convergence.
-
 Inputs are TOML files. Unknown sections and options raise an error. Start from
 [h4.toml](../inputs/h4.toml), [helium.toml](../inputs/helium.toml), or
 [propagation.toml](../inputs/propagation.toml).
@@ -51,6 +8,31 @@ Inputs are TOML files. Unknown sections and options raise an error. Start from
 julia --project=. run.jl plan inputs/helium.toml
 julia --project=. run.jl solve inputs/helium.toml results/helium
 ```
+
+## Orbital representation
+
+`[run].representation` is `"qtt"` by default. Use `"dense"` with
+`[run].kind="scf"` and `[scf].solver="lrrap"` for the full-grid counterpart.
+The Julia interface is `ground_state(problem; representation=:dense)`.
+Dense Block Lanczos, Block Davidson, fixed spectra, and propagation are not
+implemented. Unsupported representation/solver combinations fail at entry.
+
+The two LRRAP paths use the same SCF settings: mixing and Anderson history,
+inner steps, coefficient sweeps, shifted kinetic inverse, Green update policy,
+extra orbitals, occupied-space selection, stopping gates, and independent audit.
+Dense fields and orbitals have no fitting or rank truncation; rank and TCI
+settings do not compress them. Projected-space cutoffs, orthogonality thresholds,
+and physical acceptance tolerances still apply. Rank fields in dense results
+are `null`; `orbital_bytes` measures the retained full-grid arrays.
+
+An `OrbitalState` accepts a vector of dense orbital vectors, each of length
+`length(problem.grid)`, storing `sqrt(dV)*psi`. `state_from_functions` also
+accepts `representation=:dense`. A supplied initial state determines the
+default representation; an explicitly different representation is rejected.
+Checkpoint files record the representation and store only occupied orbitals.
+Existing QTT checkpoints without the representation field remain QTT states.
+Dense initialization, grid refinement, observations, and postprocessing use
+full-grid arrays. In 3D these arrays retain the interleaved grid ordering.
 
 ## Physical system
 
@@ -89,7 +71,7 @@ helium example is a coarse discretization, not a converged continuum result.
 | `kernel_tolerance` | `1e-12` | Interaction kernel |
 | `density_tolerance` | `1e-10` | Density fitting |
 | `xc_energy_tolerance` | `1e-10` | XC energy-density fitting |
-| `work_tolerance` | `1e-6` | Orbital update tensors |
+| `work_tolerance` | `1e-6` | Working actions and trial tangent bases, including inner Ritz projections |
 | `storage_tolerance` | `1e-10` | Stored orbitals |
 | `algebra_tolerance` | `1e-12` | Tensor algebra and Hartree construction |
 | `kinetic_action_tolerance` | unset | Absolute 1D FD2 action error budget; adaptive accuracy resolves it from the physical residual target |
@@ -224,19 +206,41 @@ For the 3D Green solve, `[physics].green_relative_tolerance` defaults to `1e-8`
 and `green_max_iterations` to `300`. Failure to meet the stored-state residual
 budget raises an error.
 
+`[scf].dielectric_susceptibility=0` disables density preconditioning by default.
+A positive value selects the constant susceptibility model `(I+s*K_H)^(-1)`
+for periodic 1D soft Coulomb. Its units are density per Hartree, and its value
+requires model-specific calibration. Other physical models reject an enabled
+preconditioner. `dielectric_tolerance=1e-4` controls the relative residual of
+this linear solve, and `dielectric_max_iterations=40` limits its QTT conjugate
+gradient iterations. The existing `hartree_cap` bounds Hartree actions and
+`density_cap` bounds density corrections. A failed solve raises an error.
+These controls do not replace the physical density or orbital thresholds.
+
 ## Periodic 1D H100 profile
 
 [h100-r16.toml](../inputs/h100-r16.toml) selects the periodic 1D soft-Coulomb
-chain with 100 hydrogen atoms and 50 doubly occupied orbitals. The cell is
+chain with 100 hydrogen atoms and 50 doubly occupied orbitals. This is the
+current H100 baseline, with its model-specific accuracy settings kept explicit
+in the input. General `Accuracy()` defaults and unset-option inheritance remain
+as listed above. The profile
+sets `scf.extra_orbitals=6` for an inner block of 56 states;
+density, energy and physical checkpoints still
+contain only the 50 occupied orbitals. Extra states require a separate
+convergence assessment with the chosen occupation policy. The cell is
 400 bohr with 4 bohr nuclear spacing. Change `[grid].R` for another resolution.
 Each run starts directly on its target grid; adaptive accuracy is disabled.
 
-The orbital, orthogonalization, storage and algebra tolerances are `1e-10`.
-The work tolerance is `1e-4`, the absolute kinetic-action budget is `3e-6 Ha`,
-and the Green RHS tolerance is `1e-6`. Field, mixing, density, XC-energy,
-external and kernel tolerances are `5e-7`, `1e-6`, `5e-9`, `5e-8`, `1e-8`
+The orbital, orthogonalization, storage and algebra tolerances are `1e-12`.
+Keeping these output budgets equally tight limits the fine-grid kinetic
+residual introduced by orbital reconstruction and storage.
+The work tolerance is `1e-6`, the absolute kinetic-action budget is `3e-8 Ha`,
+and the Green RHS tolerance is `1e-8`. Field, mixing, density, XC-energy,
+external and kernel tolerances are `5e-9`, `1e-8`, `5e-9`, `5e-8`, `1e-8`
 and `1e-9`, respectively. One inner update uses two coefficient sweeps with
-relative metric cutoff `1e-4`. A Green update is enabled every SCF step.
+relative metric cutoff `1e-8`. A Green update is enabled every SCF step.
+The base density-mixing step is `0.7`, with dielectric susceptibility `2.0`,
+relative dielectric solve tolerance `1e-4` and at most 40 linear iterations.
+Adaptive mixing can reduce the step further. The initial orbital envelope is unchanged.
 
 Orbital, work and Green RHS approximation caps are 64. Field, Hartree and
 effective-potential caps are 64; density and XC-energy caps are 72; external
@@ -244,13 +248,21 @@ and kernel caps are 32 and 16. Exact temporary sums and shifts can have larger
 structural bonds before approximation. Stored bonds and approximation caps
 are recorded separately.
 
-The input uses energy stopping at consecutive total-energy change below
-`5e-6 Ha`, followed by a separate final-state audit. The inner eigensolver
-target is `5e-4 Ha`. The reference orbital and density thresholds remain
-`3e-4 Ha` and `3e-4`. An energy-stopped result can therefore have
-`converged=true` with `audit.passed=false`; it must not be described as
-passing all physical residual requirements. A separate independent energy
-comparison can establish energy agreement, not continuum accuracy.
+The input allows at most 60 SCF iterations. Consecutive energy change below
+`5e-6 Ha` schedules a final check once the iteration density residual is at most
+`1e-6`. The saved occupied orbitals receive a Rayleigh–Ritz rotation and an
+independent audit. Acceptance uses only the following final-state conditions:
+
+| Quantity | H100 threshold |
+|---|---|
+| Maximum normalized orbital residual plus kinetic-action error budget | `< 3e-4 Ha`, including a `3e-8 Ha` action budget |
+| Relative output/input density residual | `<= 1e-6` |
+| Gram defect `norm(Psi'Psi - I)` | `< 1e-6` |
+| Absolute electron-number error | `< 1e-6` |
+| Independent energy minus reported candidate energy, absolute value | `< 5e-6 Ha` |
+
+The inner eigensolver target remains `5e-4 Ha`. Dense-reference energy and
+orbital comparisons are separate diagnostics; none establishes continuum accuracy.
 
 ```sh
 julia --threads=4,1 --project=. run.jl plan inputs/h100-r16.toml
@@ -264,11 +276,12 @@ scripts, full research inputs and calibration reports stay in local outputs.
 
 | Setting | Meaning |
 |---|---|
-| `scf.criterion` | `energy` (default) or `strict` |
-| `scf.energy_tolerance` | Total-energy change threshold; default `1e-6 Ha` |
+| `scf.energy_tolerance` | Energy-stability trigger and independent final energy agreement tolerance; default `1e-6 Ha` |
 | `scf.max_iterations` | SCF iteration limit |
 | `scf.inner_steps` | Orbital updates at a fixed input density |
-| `scf.solver` | `"lrrap"` (default), `"lanczos"`, `"block_lanczos"`, `"davidson"`, or `"block_davidson"` |
+| `scf.extra_orbitals` | Extra unoccupied states in the SCF eigensolver block; default `0` |
+| `scf.degeneracy_tolerance` | Minimum energy resolution for occupation-boundary continuity; combined with the inner residual resolution as described in the algorithm guide; default `1e-6 Ha` |
+| `scf.solver` | `"lrrap"` (default), `"block_lanczos"`, or `"block_davidson"` |
 | `scf.mixing` | Density mixing weight |
 | `scf.anderson` | Enable Anderson mixing |
 | `scf.eigen_tolerance` | Inner eigensolver residual target and Ritz rotation threshold |
@@ -277,27 +290,42 @@ scripts, full research inputs and calibration reports stay in local outputs.
 | `time.dt`, `time.steps` | Time step and number of propagation steps |
 | `time.observe_every`, `time.snapshot_every` | Observation and saved-state intervals |
 
-`strict` first checks energy change, density consistency, and stored Gram defect.
-Only a candidate that meets these inexpensive gates receives an output-density
-Ritz rotation and independent physical audit. The candidate replaces the stored
-iteration state only if its energy, density, Gram, and audit checks all pass.
-Rejected candidates leave the orbital and search-direction state unchanged;
-their sampling work can still update recorder pivot caches. A final audit at an
-iteration limit checks the actual returned state. Set
-`orbital_residual_tolerance` explicitly to change physical acceptance without
-changing the inner eigensolver decisions.
+At the final accuracy budgets, energy stability and the iteration density
+residual schedule a canonical candidate check. This check recomputes density,
+Hamiltonian, orbital residuals, Gram, charge, and energy with independent audit
+budgets. `accepted` is the conjunction of the final-state conditions above,
+using the configured thresholds for the current problem. There is no separate
+energy-only or density-refinement acceptance mode.
 
-`"block_lanczos"` explicitly selects the block three-term recurrence, including
-for one orbital. `"lanczos"` uses a scalar three-term recurrence for one orbital and block
-Lanczos for several orbitals. Each `inner_steps` update advances one recurrence
+A rejected candidate leaves the working orbitals, search directions, mixing
+history, sampling RNG, and reusable solver pivots unchanged. Its measurements
+remain in the logs. At an iteration limit or requested stop, the actual returned
+and saved state is canonicalized and checked once, even if energy has not settled.
+An exhausted budget alone never implies acceptance. `first_energy_iteration`
+records an energy-stability milestone, without saving an additional checkpoint.
+Checkpoint metadata retains the mixed input density for independent comparisons.
+
+The solver's `scf.gram_tolerance` controls inner orbital updates. Final Gram and
+charge thresholds belong to `audit.gram_tolerance` and `audit.charge_tolerance`.
+Compression tolerances, TCI pivot errors, and dielectric linear-solve tolerances
+are numerical controls owned by those operations, not additional physical gates.
+
+Extra states use the same orbital rank and tolerance controls as occupied
+states. Custom `guess.wavevectors` must cover the full computed block. For a
+warm start, initial modes are projected away from the supplied occupied space
+to generate the extra states. A checkpoint retains only physical occupied
+orbitals; restarting rebuilds the extra states and resets mixing history.
+
+`"block_lanczos"` uses the block three-term recurrence, including for one
+orbital. Each `inner_steps` update advances one recurrence
 step, with an explicit restart when the trial space reaches its size limit.
 SCF reconstructs Ritz orbitals at a restart and at the final inner step;
 fixed-potential spectra reconstruct them for each physical diagnostic.
 The shared working tolerance and rank cap also control its QTT vector algebra.
-`"davidson"` and `"block_davidson"` select generalized Davidson with the
-shifted kinetic inverse, controlled by `scf.green_shift`. The first expands
-with one residual correction; the second uses every unconverged requested
-orbital. `scf.eigen_tolerance` determines which residuals need corrections.
+`"block_davidson"` selects block generalized Davidson with the shifted kinetic
+inverse, controlled by `scf.green_shift`. It expands with corrections for every
+unconverged requested orbital. `scf.eigen_tolerance` determines which residuals
+need corrections.
 Independent physical acceptance still uses the reconstructed orbitals.
 
 `[audit]` sets independent final-state numerical budgets. `rank_multiplier`
@@ -329,22 +357,44 @@ overrides `[run].output`, and existing output directories are rejected.
 | Output | Contents |
 |---|---|
 | `input.toml`, `config.json` | Input and resolved model/options |
-| `status.json` | Completion state, SCF stopping, and physical audit |
+| `status.json` | One `accepted` decision, stop reason, and final measurements |
 | `checkpoint.jls`, `snapshots/` | Stored orbitals and problem metadata |
 | `cross-state.jls` | Reusable TCI pivot geometry |
 | `scf.jsonl`, `lrrap.jsonl` or `eigensolver.jsonl` | Outer iterations and the selected orbital solver's inner updates |
 | `workflow.json` | Configured-run elapsed time and restart information |
 | `source/` | Runnable source and dependency snapshot |
 
-`status.json.converged` means the selected stopping condition was reached;
-`status.json.audit.passed` records physical acceptance. SCF exits with code `0`
-when its stopping condition is met, `2` at an unconverged iteration limit, and
-`1` on input or execution errors. Propagation returns `0` after completing its
-configured steps.
+`SCFResult.accepted` and `status.json.accepted` report the same final decision.
+The audit contains the underlying measurements without a second pass/fail flag.
+SCF exits with code `0` for an accepted state, `2` for a completed but unaccepted
+state, and `1` on input or execution errors. Propagation returns `0` after its
+configured workflow finishes.
 
-Logged ranks distinguish inner-update output from stored orbitals. Parallel
+SCF rows retain the occupied/computed state counts, working-block Gram defect,
+stored occupied Gram defect, energy change, and density residual. The final row
+also records the density change caused by canonicalization. Detailed coefficient
+matrices are written to `coefficient-failure.jls` only if that solve fails;
+ordinary iterations retain scalar measurements and timings.
+
+Fixed-potential spectra use `FixedSpectrumResult.accepted` and require the maximum
+residual of all requested orbitals and the Gram defect to meet `scf.eigen_tolerance`
+and `scf.gram_tolerance`. Band-energy changes remain progress measurements. Use
+`solver` for a method symbol and `scf` for numerical controls. Spectrum checkpoint
+schema 2 keeps the supplied samples in `potential.jls`; restart compares those
+values directly. Older spectrum checkpoints require their frozen source. Ordinary
+orbital checkpoints retain their existing schema and QTT core layout.
+
+Logged ranks distinguish inner-update output from stored orbitals. Lanczos
+reports a null trial rank when basis expressions have not needed reconstruction;
+logging alone never triggers a tensor fit. Parallel
 subtask times may overlap; their sum is not wall time. Tensor storage, cumulative
 allocation, and peak process memory are separate quantities.
+LRRAP records every incoming working-orbital Rayleigh energy and residual norm,
+with an explicit `residual_scope`. These include auxiliary empty states and use
+the fixed input-density Hamiltonian. The final audit separately measures the
+canonical stored occupied states with their output-density Hamiltonian.
+Green right-hand-side fitting and the normalized MPO action have separate
+substage timings; their parallel durations can overlap.
 `stages.jsonl` separates initial operator construction, Green-operator setup,
 and initial orbitals, with wall time, compilation time, cumulative allocation,
 and process memory observations. These stages exclude Julia process startup.

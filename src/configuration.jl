@@ -1,5 +1,6 @@
 # Validate options and manage run logs; collect source snapshots from this src directory.
 
+option_dict(x::Symbol) = string(x)
 option_dict(x) = Dict(string(k) => getfield(x, k) for k in fieldnames(typeof(x)))
 option_tuple(x) = (; (k => getfield(x, k) for k in fieldnames(typeof(x)))...)
 function validate(t::TCIOptions)
@@ -71,16 +72,19 @@ end
 function validate(s::SCFOptions)
     s.solver in (:lrrap, SUBSPACE_SOLVERS...) || throw(
         ArgumentError(
-            "Unknown SCF solver $(s.solver); choose :lrrap, :lanczos, :block_lanczos, :davidson or :block_davidson",
+            "Unknown SCF solver $(s.solver); choose :lrrap, :block_lanczos or :block_davidson",
         ),
     )
     s.parallel_tasks >= 0 || throw(ArgumentError("parallel_tasks must be nonnegative"))
+    s.extra_orbitals >= 0 || throw(ArgumentError("extra_orbitals must be nonnegative"))
+    isfinite(s.dielectric_susceptibility) && s.dielectric_susceptibility >= 0 ||
+        throw(ArgumentError("dielectric_susceptibility must be finite and nonnegative"))
+    0 < s.dielectric_tolerance < 1 && s.dielectric_max_iterations > 0 ||
+        throw(ArgumentError("Invalid dielectric solve controls"))
     s.refinement_bits > 0 || throw(ArgumentError("Refinement bits must be positive"))
     s.initial_spacing === nothing ||
         (isfinite(s.initial_spacing) && s.initial_spacing > 0) ||
         throw(ArgumentError("Initial spacing must be positive"))
-    s.criterion in (:energy, :strict) ||
-        throw(ArgumentError("SCF criterion must be :energy or :strict"))
     min(s.max_iterations, s.inner_steps, s.coefficient_sweeps, s.anderson_history) > 0 &&
         0 < s.mixing <= 1 || throw(ArgumentError("Invalid SCF iteration/mixing settings"))
     s.green_update_interval >= 0 || throw(ArgumentError("Negative Green update interval"))
@@ -89,6 +93,7 @@ function validate(s::SCFOptions)
         :coarse_energy_tolerance,
         :coarse_density_tolerance,
         :eigen_tolerance,
+        :degeneracy_tolerance,
         :density_tolerance,
         :green_shift,
         :anderson_regularization,
@@ -284,9 +289,15 @@ function configured_options(settings::AbstractDict)
         "top-level",
     )
     run = get(settings, "run", Dict())
-    require_keys(run, ["kind", "output", "checkpoint", "blas_threads"], "run")
+    require_keys(run, ["kind", "output", "checkpoint", "blas_threads", "representation"], "run")
     kind = get(run, "kind", "scf")
     kind in ("scf", "propagation") || throw(ArgumentError("Unknown run kind: $kind"))
+    representation = Symbol(get(run, "representation", "qtt"))
+    representation in (:qtt, :dense) ||
+        throw(ArgumentError("Unknown orbital representation: $representation"))
+    representation == :dense &&
+        kind != "scf" &&
+        throw(ArgumentError("Dense orbitals currently support SCF only"))
     threads = get(run, "blas_threads", 1)
     threads isa Integer && threads >= 1 || throw(ArgumentError("Invalid BLAS thread count"))
     problem = problem_from_config(settings)
@@ -298,6 +309,9 @@ function configured_options(settings::AbstractDict)
     guess = options_from_dict(InitialGuess, get(settings, "guess", Dict()))
     physics = options_from_dict(PhysicsNumerics, get(settings, "physics", Dict()))
     scf = options_from_dict(SCFOptions, get(settings, "scf", Dict()))
+    representation == :dense &&
+        scf.solver != :lrrap &&
+        throw(ArgumentError("Dense SCF currently supports solver=:lrrap only"))
     audit = options_from_dict(AuditOptions, get(settings, "audit", Dict()))
     refinement = options_from_dict(RefinementOptions, get(settings, "refinement", Dict()))
     time_options = options_from_dict(TimeOptions, get(settings, "time", Dict()))
@@ -327,6 +341,7 @@ function configured_options(settings::AbstractDict)
         time = time_options,
         drive,
         kind,
+        representation,
         blas_threads = threads,
     )
 end
@@ -339,6 +354,7 @@ function configuration_plan(path)
     tasks = options.kind == "scf" ? options.scf.parallel_tasks : options.time.parallel_tasks
     plan = Dict(
         "kind" => options.kind,
+        "representation" => string(options.representation),
         "system" => get(get(settings, "system", Dict()), "kind", "hydrogen_chain"),
         "grid_points" => length(problem.grid),
         "occupied_orbitals" => length(problem.occupations),
@@ -357,7 +373,14 @@ function configuration_plan(path)
             big(sizeof(ComplexF64)) * length(problem.grid) * length(problem.occupations),
         "note" => "Dense storage comparison only; not an estimate of peak memory.",
     )
-    options.kind == "scf" && (plan["solver"] = string(options.scf.solver))
+    if options.kind == "scf"
+        orbital_count = length(problem.occupations) + options.scf.extra_orbitals
+        orbital_count <= length(problem.grid) ||
+            throw(ArgumentError("Orbital block exceeds grid dimension"))
+        plan["solver"] = string(options.scf.solver)
+        plan["extra_orbitals"] = options.scf.extra_orbitals
+        plan["computed_orbitals"] = orbital_count
+    end
     if problem.grid isa BoxGrid3D
         plan["axis_bits"] = collect(axis_bits(problem.grid))
         plan["grid_shape"] = collect(grid_shape(problem.grid))
@@ -412,10 +435,13 @@ function run_config(settings::AbstractDict, path; output = nothing, checkpoint =
                 checkpoint_path === nothing ? nothing :
                 joinpath(dirname(checkpoint_path), "cross-state.jls")
             pivot_state =
-                tci.reuse_pivots && pivot_file !== nothing && isfile(pivot_file) ? pivot_file :
-                nothing
+                options.representation == :qtt &&
+                tci.reuse_pivots &&
+                pivot_file !== nothing &&
+                isfile(pivot_file) ? pivot_file : nothing
             ground_state(
                 problem;
+                representation = options.representation,
                 initial,
                 pivot_state,
                 accuracy = accuracy,
@@ -485,9 +511,9 @@ function main(args = ARGS; io = stdout, err = stderr)
             result = run_config(args[2]; output = args[3])
             println(io, "Output: ", abspath(args[3]))
             if result isa SCFResult
-                println(io, "Energy/iteration stopping reached: ", result.converged)
-                println(io, "Independent physical audit passed: ", result.audit.passed)
-                return result.converged ? 0 : 2
+                println(io, "Final state accepted: ", result.accepted)
+                println(io, "Stop reason: ", result.stop_reason)
+                return result.accepted ? 0 : 2
             end
             println(io, "Propagation steps completed: ", result.completed_steps)
             return 0

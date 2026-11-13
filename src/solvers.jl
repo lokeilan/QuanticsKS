@@ -1,547 +1,3 @@
-# Standard Block LOBPCG uses the same library iteration for both representations.
-
-struct BlockHamiltonian{F}
-    apply::F
-end
-function LinearAlgebra.mul!(result::AbstractMatrix, H::BlockHamiltonian, orbitals::AbstractMatrix)
-    copyto!(result, H.apply(orbitals))
-end
-
-"An optional callback applies the inverse preconditioner to a whole block."
-struct BlockPreconditioner{F}
-    apply::F
-end
-function LinearAlgebra.ldiv!(preconditioner::BlockPreconditioner, residuals::AbstractMatrix)
-    copyto!(residuals, preconditioner.apply(residuals))
-end
-
-"""
-    block_lobpcg(H, orbitals; preconditioner=nothing, tolerance=1e-6,
-                 max_iterations=100, gram_tolerance=1e-8, callback=identity)
-
-Find the lowest Hermitian eigenpairs using LOBPCGEigensolver's block iteration.
-`H` is a matrix or a block-action callback. A preconditioner callback applies
-an inverse to a whole residual block; dense matrices and factorizations are
-applied through a linear solve. Omission uses the identity.
-The final residuals are recomputed from the returned orbitals independently
-of the library's cached Hamiltonian actions. `H` must remain fixed throughout.
-"""
-function block_lobpcg(
-    H,
-    orbitals::AbstractMatrix;
-    preconditioner = nothing,
-    tolerance = 1e-6,
-    max_iterations = 100,
-    gram_tolerance = 1e-8,
-    callback = identity,
-)
-    isfinite(tolerance) && tolerance > 0 || throw(ArgumentError("Invalid residual tolerance"))
-    isfinite(gram_tolerance) && gram_tolerance > 0 || throw(ArgumentError("Invalid Gram tolerance"))
-    max_iterations >= 0 || throw(ArgumentError("Invalid iteration limit"))
-    size(orbitals, 2) > 0 || throw(ArgumentError("An initial orbital block is required"))
-    operator = H isa Union{AbstractMatrix,BlockHamiltonian} ? H : BlockHamiltonian(H)
-    inverse =
-        preconditioner === nothing ? I :
-        preconditioner isa AbstractMatrix ? factorize(preconditioner) :
-        preconditioner isa Union{Factorization,UniformScaling,BlockPreconditioner} ?
-        preconditioner : BlockPreconditioner(preconditioner)
-    started = time_ns()
-    residual_history = Vector{Vector{Float64}}()
-    residual_norms = fill(Inf, size(orbitals, 2))
-    eigenvalues = zeros(size(orbitals, 2))
-    locked = 0
-    monitor =
-        info -> begin
-            active = (locked + 1):length(residual_norms)
-            residual_norms[active] = info.resid_history[active, info.n_iter + 1]
-            eigenvalues[active] = info.λs
-            push!(residual_history, copy(residual_norms))
-            locked = info.n_locked
-            callback((;
-                iteration = info.n_iter,
-                eigenvalues = copy(eigenvalues),
-                residual_norms = copy(residual_norms),
-                locked,
-            ))
-        end
-    result = LOBPCGEigensolver.lobpcg(
-        operator,
-        orbitals,
-        I,
-        inverse,
-        tolerance,
-        max_iterations;
-        miniter = 0,
-        callback = monitor,
-    )
-    stored_orbitals, residual_norms, gram_defect = lobpcg_audit(operator, result.X, result.λ)
-    (;
-        orbitals = stored_orbitals,
-        eigenvalues = result.λ,
-        residual_norms,
-        gram_defect,
-        converged = maximum(residual_norms) <= tolerance && gram_defect <= gram_tolerance,
-        iterations = length(residual_history) - 1,
-        residual_history = reduce(hcat, residual_history),
-        elapsed_seconds = (time_ns() - started) / 1e9,
-    )
-end
-
-function lobpcg_audit(H, orbitals::AbstractMatrix, energies)
-    action = similar(orbitals)
-    mul!(action, H, orbitals)
-    residuals = action - orbitals * Diagonal(energies)
-    norms = sqrt.(vec(sum(abs2, orbitals; dims = 1)))
-    residual_norms = sqrt.(vec(sum(abs2, residuals; dims = 1))) ./ norms
-    orbitals, residual_norms, norm(orbitals' * orbitals - I)
-end
-
-# Block algebra for the library LOBPCG loop. Scalar grid access is deliberately absent.
-
-mutable struct QTTBlockWorkspace{C,R,H,P}
-    accuracy::C
-    recorder::R
-    H::H
-    potential::P
-    actions::IdDict{Any,QTT}
-    overlap_basis::Vector{QTT}
-    overlap_positions::IdDict{Any,Int}
-    overlap_metric::Matrix{ComplexF64}
-end
-
-"A block of deferred orbital expressions, or their symbolic Hamiltonian actions."
-struct QTTBlock{V<:AbstractVector{QTTExpression},W} <: AbstractMatrix{ComplexF64}
-    columns::V
-    workspace::W
-    action::Base.RefValue{Bool}
-end
-
-"Cache exact core overlaps within one iteration; transforms use only small matrices."
-function block_core_gram(workspace, basis)
-    missing = [psi for psi in basis if !haskey(workspace.overlap_positions, psi.c)]
-    if !isempty(missing)
-        old = workspace.overlap_basis
-        cross_metric = gram(old, missing; cfg = workspace.accuracy)
-        new_metric = gram(missing; cfg = workspace.accuracy)
-        workspace.overlap_metric = [workspace.overlap_metric cross_metric; cross_metric' new_metric]
-        for psi in missing
-            push!(old, psi)
-            workspace.overlap_positions[psi.c] = length(old)
-        end
-    end
-    indices = [workspace.overlap_positions[psi.c] for psi in basis]
-    workspace.overlap_metric[indices, indices]
-end
-
-function block_metric(x::QTTBlock)
-    basis, coefficients = expression_components(x.columns)
-    isempty(basis) && return zeros(ComplexF64, size(x, 2), size(x, 2))
-    metric = block_core_gram(x.workspace, basis)
-    result = coefficients' * metric * coefficients
-    scales = real.(diag(abs.(coefficients)' * abs.(metric) * abs.(coefficients)))
-    # A cancelled direction needs amplitudes. Do not build a global high-rank QR sum.
-    if any(real.(diag(result)) .< sqrt(eps(Float64)) .* scales) &&
-       any(e -> length(e.terms) > 1, x.columns)
-        orbitals = reconstruct_orbitals!(x; label = "lobpcg_cancelled_direction")
-        return block_core_gram(x.workspace, orbitals)
-    end
-    (result + result') / 2
-end
-
-QTTBlock(columns, workspace; action = false) = QTTBlock(columns, workspace, Ref(action))
-Base.size(x::QTTBlock) = (1 << x.workspace.accuracy.R, length(x.columns))
-Base.copy(x::QTTBlock) = QTTBlock(copy(x.columns), x.workspace; action = x.action[])
-Base.view(x::QTTBlock, ::Colon, columns) = QTTBlock(view(x.columns, columns), x.workspace, x.action)
-Base.getindex(x::QTTBlock, ::Colon, columns::AbstractVector) = copy(view(x, :, columns))
-Base.getindex(x::QTTBlock, i::Int, j::Int) =
-    error("Scalar grid traversal is not part of QTT block algebra; use evaluate explicitly")
-function Base.similar(x::QTTBlock, ::Type{T}, dims::Dims) where {T}
-    length(dims) == 2 && dims[1] == size(x, 1) && T == ComplexF64 || return Array{T}(undef, dims)
-    zero_expression = QTTExpression(QTT[], ComplexF64[], x.workspace.accuracy.R)
-    QTTBlock(fill(zero_expression, dims[2]), x.workspace)
-end
-Base.similar(x::QTTBlock) = similar(x, ComplexF64, size(x))
-Base.similar(x::QTTBlock, ::Type{T}) where {T} = similar(x, T, size(x))
-Base.similar(x::QTTBlock, dims::Int...) = similar(x, ComplexF64, dims)
-Base.similar(x::QTTBlock, ::Type{T}, dims::Int...) where {T} = similar(x, T, dims)
-Base.zero(x::QTTBlock) = similar(x)
-function Base.copyto!(destination::QTTBlock, source::QTTBlock)
-    size(destination) == size(source) || throw(DimensionMismatch("QTT block copy"))
-    copyto!(destination.columns, source.columns)
-    destination.action[] = source.action[]
-    destination
-end
-Base.any(::typeof(isnan), x::QTTBlock) =
-    any(x.columns) do expression
-        any(isnan, expression.coefficients) ||
-            any(t -> any(g -> any(isnan, g), t.c), expression.terms)
-    end
-
-"Materialize only when a consumer needs independent QTT cores."
-function reconstruct_orbitals!(x::QTTBlock; label = "lobpcg_orbitals")
-    x.action[] && error("Reconstruct the source orbitals of a Hamiltonian action")
-    isempty(x.columns) && return QTT[]
-    accuracy, rec = x.workspace.accuracy, x.workspace.recorder
-    if all(e -> length(e.terms) == 1 && only(e.coefficients) == 1, x.columns)
-        return [only(e.terms) for e in x.columns]
-    end
-    basis, coefficients = expression_components(x.columns)
-    orbitals =
-        isempty(basis) ? [constant_tt(accuracy.R, 0) for _ in x.columns] :
-        combine_orbitals(
-            basis,
-            coefficients,
-            accuracy,
-            rec;
-            tol = accuracy.orthogonalization_tolerance,
-            cap = accuracy.orbital_cap,
-            label,
-        )
-    x.columns .= [linear_expression((psi,), (1,)) for psi in orbitals]
-    orbitals
-end
-
-function block_actions(x::QTTBlock)
-    workspace = x.workspace
-    accuracy = workspace.accuracy
-    stored = [
-        length(e.terms) == 1 && only(e.coefficients) == 1 ? only(e.terms) : nothing for
-        e in x.columns
-    ]
-    missing = findall(
-        i -> stored[i] === nothing || !haskey(workspace.actions, stored[i].c),
-        eachindex(stored),
-    )
-    basis, coefficients = expression_components(x.columns)
-    evaluators =
-        any(isnothing, stored) ?
-        orbital_evaluators(basis, length(missing), accuracy, workspace.recorder) : nothing
-    computed = recorded_map(QTT, length(missing), accuracy, workspace.recorder) do k, rec
-        i = missing[k]
-        if stored[i] !== nothing
-            return h_action(
-                workspace.H,
-                stored[i],
-                accuracy,
-                rec;
-                work_tol = accuracy.work_tolerance,
-                potential = workspace.potential,
-                label = "lobpcg_$i",
-            )
-        end
-        # Fit the complete action. Combining independently fitted H terms amplifies cancellation error.
-        orbital = LinearSamples(orbital_evaluator(evaluators), coefficients[:, i])
-        samples = hamiltonian_samples(workspace.H, orbital, workspace.potential, accuracy.R)
-        cross(
-            rec,
-            accuracy.R,
-            samples;
-            tol = accuracy.work_tolerance,
-            cap = accuracy.work_cap,
-            label = "Hpsi_work_lobpcg_$i",
-            initial_zero_fallback = () -> begin
-                psi = reconstruct_expression(
-                    x.columns[i];
-                    tol = accuracy.orthogonalization_tolerance,
-                    cap = accuracy.orbital_cap,
-                )
-                h_core_fallback(
-                    workspace.H,
-                    psi,
-                    0.0;
-                    tol = accuracy.work_tolerance,
-                    cap = accuracy.work_cap,
-                    rec,
-                )
-            end,
-        )
-    end
-    actions = Vector{QTT}(undef, length(stored))
-    for (i, action) in zip(missing, computed)
-        actions[i] = action
-        stored[i] === nothing || (workspace.actions[stored[i].c] = action)
-    end
-    for i in eachindex(stored)
-        stored[i] === nothing || (actions[i] = workspace.actions[stored[i].c])
-    end
-    actions
-end
-
-function block_overlap(x::QTTBlock, y::QTTBlock)
-    x.action[] && error("Hamiltonian action is only supported on the right of an overlap")
-    if y.action[]
-        actions = block_actions(y)
-        basis, coefficients = expression_components(x.columns)
-        return coefficients' * gram(basis, actions; cfg = x.workspace.accuracy)
-    end
-    x === y && return block_metric(x)
-    nx = size(x, 2)
-    basis, coefficients = expression_components(vcat(x.columns, y.columns))
-    isempty(basis) && return zeros(ComplexF64, nx, size(y, 2))
-    metric = block_core_gram(x.workspace, basis)
-    coefficients[:, 1:nx]' * metric * coefficients[:, (nx + 1):end]
-end
-Base.:*(x::Adjoint{ComplexF64,<:QTTBlock}, y::QTTBlock) = block_overlap(parent(x), y)
-function LOBPCGEigensolver.mul_hermi(x::Adjoint{ComplexF64,<:QTTBlock}, y::QTTBlock)
-    metric = parent(x) === y && !y.action[] ? block_metric(y) : block_overlap(parent(x), y)
-    Hermitian((metric + metric') / 2)
-end
-LOBPCGEigensolver.columnwise_norms(x::QTTBlock) = sqrt.(max.(0, real.(diag(block_metric(x)))))
-LOBPCGEigensolver.columnwise_dots(x::QTTBlock, y::QTTBlock) = diag(block_overlap(x, y))
-LOBPCGEigensolver.compute_λ(x::QTTBlock, hx::QTTBlock, bx::QTTBlock) =
-    real.(diag(block_overlap(x, hx)) ./ diag(block_overlap(x, bx)))
-
-function LinearAlgebra.mul!(
-    destination::QTTBlock,
-    source::QTTBlock,
-    coefficients::AbstractMatrix,
-    a::Number = true,
-    b::Number = false,
-)
-    columns = [
-        linear_expression(source.columns, a .* view(coefficients, :, j)) for
-        j in axes(coefficients, 2)
-    ]
-    if !iszero(b)
-        source.action[] == destination.action[] || error("Incompatible symbolic actions")
-        columns = [
-            linear_expression((columns[j], destination.columns[j]), (1, b)) for
-            j in eachindex(columns)
-        ]
-    end
-    copyto!(destination.columns, columns)
-    destination.action[] = source.action[]
-    destination
-end
-LinearAlgebra.rmul!(x::QTTBlock, coefficients::AbstractMatrix) = mul!(x, copy(x), coefficients)
-LinearAlgebra.rmul!(
-    x::QTTBlock,
-    coefficients::Union{UpperTriangular,LowerTriangular,UnitUpperTriangular,UnitLowerTriangular},
-) = mul!(x, copy(x), Matrix(coefficients))
-function LinearAlgebra.mul!(destination::QTTBlock, H::BlockHamiltonian, source::QTTBlock)
-    # H times a deferred search block is needed only through its projected matrix.
-    copyto!(destination, source)
-    destination.action[] = true
-    destination
-end
-function LinearAlgebra.ldiv!(preconditioner::BlockPreconditioner, residuals::QTTBlock)
-    orbitals = reconstruct_orbitals!(residuals; label = "lobpcg_residual")
-    updated = preconditioner.apply(orbitals)
-    length(updated) == length(orbitals) || throw(DimensionMismatch("Preconditioned block size"))
-    residuals.columns .= [linear_expression((psi,), (1,)) for psi in updated]
-    residuals
-end
-
-const QTTLazyBlock = LOBPCGEigensolver.LazyHcat{ComplexF64,<:Tuple{Vararg{QTTBlock}}}
-function collect_block(x::QTTLazyBlock)
-    QTTBlock(
-        reduce(vcat, [block.columns for block in x.blocks]),
-        first(x.blocks).workspace;
-        action = first(x.blocks).action[],
-    )
-end
-Base.:*(x::Adjoint{ComplexF64,<:QTTLazyBlock}, y::QTTBlock) =
-    block_overlap(collect_block(parent(x)), y)
-Base.:*(x::Adjoint{ComplexF64,<:QTTLazyBlock}, y::QTTLazyBlock) =
-    block_overlap(collect_block(parent(x)), collect_block(y))
-function LinearAlgebra.mul!(
-    destination::QTTBlock,
-    source::QTTLazyBlock,
-    coefficients::AbstractMatrix,
-    a::Number,
-    b::Number,
-)
-    mul!(destination, collect_block(source), coefficients, a, b)
-end
-function LinearAlgebra.mul!(
-    destination::QTTBlock,
-    source::QTTLazyBlock,
-    coefficients::AbstractMatrix,
-)
-    mul!(destination, source, coefficients, true, false)
-    destination.action[] || reconstruct_orbitals!(destination; label = "lobpcg_update")
-    destination
-end
-function Base.:*(source::QTTLazyBlock, coefficients::AbstractMatrix)
-    destination = similar(first(source.blocks), size(source, 1), size(coefficients, 2))
-    mul!(destination, source, coefficients)
-end
-
-"Ritz coefficients carry the search metric needed by the history update."
-struct QTTBlockCoefficients <: AbstractMatrix{ComplexF64}
-    values::Matrix{ComplexF64}
-    metric::Matrix{ComplexF64}
-end
-Base.size(c::QTTBlockCoefficients) = size(c.values)
-Base.getindex(c::QTTBlockCoefficients, i::Int, j::Int) = c.values[i, j]
-function LOBPCGEigensolver.get_new_P_duersch(
-    c::QTTBlockCoefficients,
-    complement,
-    active;
-    tol,
-    timer,
-)
-    overlap = -(complement' * c.metric[:, active])
-    complement * LOBPCGEigensolver.ortho!(overlap; tol).X
-end
-
-"Use the actual search Gram after QTT reconstruction, not an assumed identity."
-function LOBPCGEigensolver.rayleigh_ritz(x::QTTLazyBlock, hx::QTTLazyBlock, keep)
-    # Refresh symbolic sources and release expressions from earlier iterations.
-    for (source, action) in zip(x.blocks, hx.blocks)
-        copyto!(action.columns, source.columns)
-    end
-    source, action = collect_block(x), collect_block(hx)
-    projected = block_overlap(source, action)
-    metric = block_metric(source)
-    factor = eigen(Hermitian((projected + projected') / 2), Hermitian(metric))
-    (;
-        vectors = QTTBlockCoefficients(factor.vectors[:, 1:keep], metric),
-        values = factor.values[1:keep],
-        vectors_ortho = factor.vectors[:, (keep + 1):end],
-    )
-end
-
-struct QTTBlockStyle <: Base.Broadcast.AbstractArrayStyle{2} end
-Base.BroadcastStyle(::Type{<:QTTBlock}) = QTTBlockStyle()
-Base.BroadcastStyle(::QTTBlockStyle, ::Base.Broadcast.DefaultArrayStyle{N}) where {N} =
-    QTTBlockStyle()
-Base.BroadcastStyle(::Base.Broadcast.DefaultArrayStyle{N}, ::QTTBlockStyle) where {N} =
-    QTTBlockStyle()
-block_argument(x::Base.Broadcast.Extruded) = x.x
-block_argument(x) = x
-block_column(x::QTTBlock, j) = x.columns[j]
-block_column(x::Number, j) = x
-block_column(x::AbstractMatrix, j) = x[1, j]
-block_column(x::Base.Broadcast.Extruded, j) = block_column(x.x, j)
-function block_column(x::Base.Broadcast.Broadcasted, j)
-    arguments = map(a -> block_column(a, j), x.args)
-    x.f === identity && return only(arguments)
-    if x.f === (*) || x.f === (/)
-        left, right = arguments
-        return left isa Number ? scale(right, left) : scale(left, x.f === (/) ? inv(right) : right)
-    elseif x.f === (+) || x.f === (-)
-        return linear_expression(arguments, (1, x.f === (-) ? -1 : 1))
-    end
-    error("Unsupported QTT block broadcast: $(x.f)")
-end
-function Base.copyto!(destination::QTTBlock, expression::Base.Broadcast.Broadcasted)
-    arguments = map(block_argument, expression.args)
-    if expression.f === identity && only(arguments) isa QTTBlock
-        return copyto!(destination, only(arguments))
-    end
-    # Refresh physical residuals from stored orbitals, never from cached H combinations.
-    if expression.f === (-) && first(arguments) isa QTTBlock && first(arguments).action[]
-        scaled = last(arguments)
-        source = block_argument(first(scaled.args))
-        energies = block_argument(last(scaled.args))
-        orbitals = reconstruct_orbitals!(source; label = "lobpcg_ritz")
-        workspace = destination.workspace
-        residuals =
-            recorded_map(QTT, length(orbitals), workspace.accuracy, workspace.recorder) do i, rec
-                h_residual(
-                    workspace.H,
-                    orbitals[i],
-                    real(energies[i]),
-                    workspace.accuracy,
-                    rec;
-                    tol = workspace.accuracy.work_tolerance,
-                    cap = workspace.accuracy.work_cap,
-                    potential = workspace.potential,
-                    label = "lobpcg_residual_$i",
-                )
-            end
-        destination.columns .= [linear_expression((psi,), (1,)) for psi in residuals]
-        destination.action[] = false
-        return destination
-    end
-    destination.columns .= [block_column(expression, j) for j in axes(destination, 2)]
-    destination
-end
-
-function Random.randn!(rng::AbstractRNG, x::QTTBlock)
-    accuracy = x.workspace.accuracy
-    bonds = [min(4, 1 << min(k, accuracy.R - k)) for k = 0:(accuracy.R)]
-    x.columns .= [
-        linear_expression(
-            (
-                normalize(
-                    QTT([
-                        randn(rng, ComplexF64, bonds[k], 2, bonds[k + 1]) for k = 1:(accuracy.R)
-                    ]),
-                ),
-            ),
-            (1,),
-        ) for _ in x.columns
-    ]
-    x
-end
-
-function lobpcg_audit(H, block::QTTBlock, energies)
-    orbitals = reconstruct_orbitals!(block; label = "lobpcg_final")
-    workspace = block.workspace
-    accuracy, rec = workspace.accuracy, workspace.recorder
-    residuals = recorded_map(Float64, length(orbitals), accuracy, rec) do i, localrec
-        h_residual_norm(
-            workspace.H,
-            orbitals[i],
-            energies[i],
-            accuracy,
-            localrec;
-            tol = accuracy.algebra_tolerance,
-            cap = max(accuracy.work_cap, accuracy.orbital_cap),
-            potential = workspace.potential,
-            label = "lobpcg_audit_$i",
-        ) / ttnorm(orbitals[i])
-    end
-    orbitals, residuals, norm(gram(orbitals; cfg = accuracy) - I)
-end
-
-"Run the library's unchanged LOBPCG iteration on QTT block algebra."
-function block_lobpcg(
-    H,
-    orbitals::AbstractVector{QTT},
-    accuracy,
-    rec;
-    preconditioner = nothing,
-    tolerance = accuracy.eigen_tolerance,
-    work_tolerance = accuracy.algebra_tolerance,
-    max_iterations = 100,
-    gram_tolerance = accuracy.gram_tolerance,
-    callback = identity,
-)
-    isempty(orbitals) && throw(ArgumentError("An initial orbital block is required"))
-    validate_truncation(work_tolerance, accuracy.work_cap)
-    accuracy = merge(accuracy, (; work_tolerance))
-    workspace = QTTBlockWorkspace(
-        accuracy,
-        rec,
-        H,
-        synchronized(potential_samples(H, rec)),
-        IdDict{Any,QTT}(),
-        QTT[],
-        IdDict{Any,Int}(),
-        zeros(ComplexF64, 0, 0),
-    )
-    block = QTTBlock([linear_expression((psi,), (1,)) for psi in orbitals], workspace)
-    monitor = info -> begin
-        empty!(workspace.actions)
-        empty!(workspace.overlap_basis)
-        empty!(workspace.overlap_positions)
-        workspace.overlap_metric = zeros(ComplexF64, 0, 0)
-        callback(info)
-    end
-    block_lobpcg(
-        BlockHamiltonian(H),
-        block;
-        preconditioner,
-        tolerance,
-        max_iterations,
-        gram_tolerance,
-        callback = monitor,
-    )
-end
-
 # TT tangent-space projection and reconstruction; see Rakhuba et al., Sec. 3.
 # https://arxiv.org/abs/1811.11049
 # left/right hold orthogonal cores U/V; variations satisfy the left gauge condition.
@@ -590,7 +46,7 @@ function project(tangent_basis::TangentSpace, x::QTT, w = nothing)
     end
     right = Vector{Array{ComplexF64,3}}(undef, d + 1)
     right[d + 1] = ones(ComplexF64, 1, 1, 1)
-    for k = d:-1:1
+    for k = d:-1:2
         v = tangent_basis.right[k]
         a = w[k]
         z = x.c[k]
@@ -677,16 +133,6 @@ struct Hamiltonian{S,D}
     samples::S
 end
 Hamiltonian(v, d, plus, minus, h) = Hamiltonian(v, d, plus, minus, Float64(h), nothing)
-
-"Evaluate a complete periodic FD2 action before fitting its QTT representation."
-function hamiltonian_samples(H::Hamiltonian, orbital, potential, R; energy = 0.0)
-    n = 1 << R
-    sampled(R) do j
-        center = orbital(j)
-        kinetic = ((center - orbital(mod(j - 1, n))) + (center - orbital(mod(j + 1, n)))) / (2H.h^2)
-        kinetic + (potential(j) - energy) * center
-    end
-end
 
 "Share the fixed local field across all sampled actions of one Hamiltonian."
 potential_samples(H::Hamiltonian, rec) =
@@ -831,10 +277,11 @@ function kinetic_project(tangent_basis, psi, plus, minus, h, center)
     numerator / h^2
 end
 
-"Project H on gauge-constrained tangent coordinates, such as L4's projected/SVD columns."
+"Project H on the represented tangent, including its contracted FD2 center."
 function h_project_tangent(tangent_basis, z, H)
     tangent = tangent_vector(tangent_basis, z)
-    h_project(tangent_basis, tangent, H; projected_psi = z)
+    # Normalized near-null SVD columns can lose the coordinate gauge identities.
+    h_project(tangent_basis, tangent, H)
 end
 function h_expectation(H, psi)
     # All coefficient-Hamiltonian blocks must use the same MPO contraction.
@@ -888,13 +335,12 @@ function h_gram(orbitals, H; cfg = (;))
         b = length(orbitals)
         bras, kets, (potential, plus, minus) =
             mpo_basis(orbitals, (potential_mpo(H), H.plus, H.minus))
-        overlaps = gram(orbitals; cfg)
         A = zeros(ComplexF64, b, b)
         fallback = fill(false, b, b)
         foreach_independent(b, cfg) do j
             for i = 1:j
                 terms = (
-                    overlaps[i, j],
+                    ITensorMPS.inner(kets[i], kets[j]; make_inds_match = false),
                     -ITensorMPS.inner(bras[i], plus, kets[j]; make_inds_match = false) / 2,
                     -ITensorMPS.inner(bras[i], minus, kets[j]; make_inds_match = false) / 2,
                 )
@@ -929,12 +375,87 @@ end
 
 # Keep consecutive orbital transforms in coefficient space until cores are needed.
 
-mutable struct OrbitalTransform
-    basis::Vector{QTT}
+mutable struct OrbitalTransform{V}
+    basis::Vector{V}
     coefficients::Matrix{ComplexF64}
     metric::Matrix{ComplexF64}
     transforms::Int
     rotated::Bool
+end
+
+# Dense LRRAP uses the full orbital space: there is no TT tangent projection.
+lrrap_space(psi::AbstractVector{<:Number}, cfg; work_tol) = (nothing, nothing)
+lrrap_dimension(::Nothing, orbitals) = length(first(orbitals))
+project(::Nothing, psi::AbstractVector{<:Number}) = psi
+project(::Nothing, psi::AbstractVector{<:Number}, green) = green \ psi
+
+function reconstruct_lrrap(::Nothing, orbitals, c, correction, history, cfg, rec; kwargs...)
+    updated = reduce(hcat, orbitals) .* transpose(c) + correction
+    updated ./= sqrt.(sum(abs2, updated; dims = 1))
+    directions = history === nothing ? nothing : collect.(eachcol(history))
+    collect.(eachcol(updated)), directions
+end
+
+function reconstruct_orbitals(x::OrbitalTransform{<:AbstractVector}, cfg, rec; kwargs...)
+    updated = reduce(hcat, x.basis) * x.coefficients
+    x.rotated && (updated ./= sqrt.(sum(abs2, updated; dims = 1)))
+    collect.(eachcol(updated)), (;)
+end
+
+function reconstruct_density(rho::AbstractVector{<:Number}, cfg, rec)
+    charge = cfg.volume_element * real(sum(rho))
+    isfinite(charge) && charge > 0 || error("Invalid charge in mixed density: $charge")
+    rho * (cfg.electrons / charge)
+end
+
+function compress_orbitals(
+    orbitals::AbstractVector{<:AbstractVector{<:Number}},
+    cfg;
+    tol = cfg.orbital_tolerance,
+    input_gram_defect = nothing,
+    occupied_count = length(orbitals),
+)
+    metric = gram(orbitals)
+    orbitals,
+    (
+        orbital_storage_tolerance = 0.0,
+        orbital_rank_before_compression = nothing,
+        compressed_max_rank = nothing,
+        orbital_bytes_before_compression = sum(storage, orbitals),
+        orbital_compression_attempts = 0,
+        stored_gram_defect = norm(metric - I),
+        stored_occupied_gram_defect = norm(view(metric, 1:occupied_count, 1:occupied_count) - I),
+    )
+end
+
+function extend_subspace(
+    basis::AbstractVector{<:AbstractVector{<:Number}},
+    directions,
+    room,
+    cfg,
+    rec;
+    tol,
+    metric = gram(basis),
+)
+    appended = Vector{ComplexF64}[]
+    room == 0 && return appended
+    X = reduce(hcat, basis)
+    inverse_metric = pinv(
+        Hermitian(metric);
+        rtol = cfg.metric_relative_cutoff,
+        atol = cfg.metric_absolute_cutoff,
+    )
+    orth = KrylovKit.ModifiedGramSchmidt2()
+    vectors = KrylovKit.OrthonormalBasis{Vector{ComplexF64}}()
+    for psi in directions
+        residual = psi - X * (inverse_metric * (X' * psi))
+        residual, _ = KrylovKit.orthogonalize!!(residual, vectors, orth)
+        n = norm(residual)
+        n > max(tol, sqrt(cfg.metric_absolute_cutoff), sqrt(cfg.metric_relative_cutoff)) || continue
+        push!(vectors, residual / n)
+        length(vectors) == room && break
+    end
+    collect(vectors)
 end
 function OrbitalTransform(orbitals; cfg = (;), metric = gram(orbitals; cfg))
     OrbitalTransform(
@@ -976,6 +497,85 @@ function ritz_projection(orbitals, H, cfg, rec; work_tol = 0.0, potential = noth
         (A + A') / 2
     end
 end
+
+"Continue the occupied space within an unresolved boundary cluster."
+function align_occupation_boundary!(
+    coefficients,
+    energies,
+    occupied_overlap,
+    cfg;
+    residual_scale = 0.0,
+    rec = nothing,
+)
+    get(cfg, :extra_orbitals, 0) == 0 && return false
+    occupied_count = cfg.occupied_count
+    occupied_count < length(energies) || return false
+    # A gap below the inner residual resolution cannot determine an occupied direction.
+    # This cluster policy does not change the SCF or independent acceptance tolerances.
+    resolution = max(get(cfg, :eigen_tolerance, 0.0), residual_scale)
+    tolerance = max(cfg.degeneracy_tolerance, 2resolution)
+    gap = energies[occupied_count + 1] - energies[occupied_count]
+    if gap > tolerance
+        rec === nothing || event!(
+            rec.stage_io,
+            (;
+                scf = rec.scf,
+                inner = rec.inner,
+                stage = "occupation_boundary",
+                event = "occupation_boundary",
+                aligned = false,
+                gap,
+                tolerance,
+                residual_scale,
+            ),
+        )
+        return false
+    end
+    first_index, last_index = occupied_count, occupied_count + 1
+    while first_index > 1 && energies[last_index] - energies[first_index - 1] <= tolerance
+        first_index -= 1
+    end
+    while last_index < length(energies) &&
+        energies[last_index + 1] - energies[first_index] <= tolerance
+        last_index += 1
+    end
+    cluster = first_index:last_index
+    # Principal vectors maximize overlap with the occupied space before the orbital update.
+    overlap = view(coefficients, :, cluster)' * occupied_overlap()
+    rotation = svd(overlap; full = true).U
+    cluster_occupied = occupied_count - first_index + 1
+    overlap_before = sum(abs2, view(overlap, 1:cluster_occupied, :))
+    overlap_after = sum(abs2, view(rotation, :, 1:cluster_occupied)' * overlap)
+    # Canonicalize the occupied and empty parts separately, preserving their projectors.
+    cluster_hamiltonian = Diagonal(energies[cluster])
+    for indices in (1:cluster_occupied, (cluster_occupied + 1):length(cluster))
+        vectors = rotation[:, indices]
+        spectrum = eigen(Hermitian(vectors' * cluster_hamiltonian * vectors))
+        rotation[:, indices] = vectors * spectrum.vectors
+        energies[first_index .- 1 .+ indices] = spectrum.values
+    end
+    coefficients[:, cluster] = view(coefficients, :, cluster) * rotation
+    rec === nothing || event!(
+        rec.stage_io,
+        (;
+            scf = rec.scf,
+            inner = rec.inner,
+            stage = "occupation_boundary",
+            event = "occupation_boundary",
+            aligned = true,
+            gap,
+            tolerance,
+            residual_scale,
+            first_index,
+            last_index,
+            cluster_occupied,
+            overlap_before,
+            overlap_after,
+        ),
+    )
+    true
+end
+
 function ritz_coefficients!(
     x::OrbitalTransform,
     H,
@@ -984,6 +584,8 @@ function ritz_coefficients!(
     force = false,
     work_tol = 0.0,
     potential = nothing,
+    reference_orbitals = nothing,
+    residual_scale = 0.0,
 )
     projected = ritz_projection(x.basis, H, cfg, rec; work_tol, potential)
     A = x.coefficients' * projected * x.coefficients
@@ -991,7 +593,20 @@ function ritz_coefficients!(
     require_finite(A, "nonfinite_orbital_transform_hamiltonian")
     offdiag = norm(A - Diagonal(diag(A)))
     !force && offdiag < cfg.eigen_tolerance / 10 && return offdiag
-    x.coefficients = x.coefficients * eigen(Hermitian(A)).vectors
+    spectrum = eigen(Hermitian(A))
+    coefficients = x.coefficients * spectrum.vectors
+    align_occupation_boundary!(
+        coefficients,
+        spectrum.values,
+        () ->
+            reference_orbitals === nothing ?
+            x.metric * view(x.coefficients, :, 1:(cfg.occupied_count)) :
+            gram(x.basis, view(reference_orbitals, 1:(cfg.occupied_count)); cfg),
+        cfg;
+        residual_scale,
+        rec,
+    )
+    x.coefficients = coefficients
     squared_norms = real.(diag(transform_gram(x)))
     all(n -> isfinite(n) && n > 0, squared_norms) || error("Invalid rotated orbital norm")
     x.coefficients ./= transpose(sqrt.(squared_norms))
@@ -1039,7 +654,7 @@ function finish_orbital_transform(
     defect = norm(metric - I)
     repaired = false
     # Compression is nonlinear: a coefficient-space identity does not certify
-    # the fitted cores. Retain the original one-pass post-Ritz repair if needed.
+    # the fitted cores. Repair their orthogonality only when needed.
     if x.rotated && defect >= cfg.orthogonalize_threshold
         updated_orbitals, defect = orthogonalize(updated_orbitals, cfg, rec; metric)
         repaired = true
@@ -1085,18 +700,42 @@ end
 function ritz_rotate(orbitals, H, cfg, rec; work_tol = 0.0, force = false)
     isfinite(work_tol) && work_tol >= 0 || throw(ArgumentError("Invalid Ritz work tolerance"))
     transform = OrbitalTransform(orbitals; cfg)
+    # Solve the projected generalized eigenproblem before reconstructing any QTT.
+    orthogonalize_coefficients!(transform, cfg; force)
     offdiag = ritz_coefficients!(transform, H, cfg, rec; force, work_tol)
     transform.rotated && orthogonalize_coefficients!(transform, cfg)
-    updated_orbitals, _ = finish_orbital_transform(transform, orbitals, cfg, rec)
-    updated_orbitals, offdiag
+    updated_orbitals, defect = finish_orbital_transform(transform, orbitals, cfg, rec)
+    updated_orbitals, offdiag, defect
 end
 
-"Orthogonalize, optionally rotate, and rebuild only the final occupied columns."
-function orthogonalize_ritz(orbitals, H, cfg, rec; ritz = true, work_tol = 0.0, potential = nothing)
+"Orthogonalize, optionally rotate, and rebuild the final working columns."
+function orthogonalize_ritz(
+    orbitals,
+    H,
+    cfg,
+    rec;
+    ritz = true,
+    work_tol = 0.0,
+    potential = nothing,
+    reference_orbitals = nothing,
+    residual_scale = 0.0,
+)
     isfinite(work_tol) && work_tol >= 0 || throw(ArgumentError("Invalid Ritz work tolerance"))
     transform = OrbitalTransform(orbitals; cfg)
     orthogonalize_coefficients!(transform, cfg)
-    offdiag = ritz ? ritz_coefficients!(transform, H, cfg, rec; work_tol, potential) : 0.0
+    offdiag =
+        ritz ?
+        ritz_coefficients!(
+            transform,
+            H,
+            cfg,
+            rec;
+            force = get(cfg, :extra_orbitals, 0) > 0,
+            work_tol,
+            potential,
+            reference_orbitals,
+            residual_scale,
+        ) : 0.0
     transform.rotated && orthogonalize_coefficients!(transform, cfg)
     updated_orbitals, defect = finish_orbital_transform(transform, orbitals, cfg, rec)
     updated_orbitals, defect, offdiag
@@ -1131,8 +770,7 @@ function coefficients(
     orthogonalizers = Vector{Matrix{ComplexF64}}(undef, b)
     hamiltonians = Vector{Matrix{ComplexF64}}(undef, b)
     foreach_independent(b, (; parallel_tasks)) do i
-        local ids, a
-        ids = vcat(i, (b + 1):(b + m))
+        local a
         # Preserve the old orbital exactly when removing near-dependent tangent
         # directions; truncating the joint Gram eigenvectors can discard it.
         xnorm = sqrt(real(S_xx[i, i]))
@@ -1161,6 +799,11 @@ function coefficients(
         other = [j for j = 1:b if j != i]
         orthogonalizer = orthogonalizers[i]
         constraints = orthogonalizer' * (G[ids, :] * coef[:, other])
+        # Keep the current iterate feasible to the accuracy of its existing Gram matrix.
+        # Near-dependent constraints must not amplify small QTT overlap errors.
+        current_coordinates = orthogonalizer' * G[ids, ids] * coef[ids, i]
+        current_coordinates ./= norm(current_coordinates)
+        constraints -= current_coordinates * (current_coordinates' * constraints)
         s = checked_svd(constraints; full = true)
         constraint_rank = count(
             >(
@@ -1224,27 +867,82 @@ function block_green(orbitals, energies, H, green, cfg, rec; potential = nothing
     potential_samples_shared =
         synchronized(potential === nothing ? potential_samples(H, rec) : potential)
     recorded_map(QTT, length(orbitals), cfg, rec) do i, localrec
-        rhs = green_rhs(
-            H,
-            orbitals[i],
-            energies[i],
-            cfg,
-            localrec;
-            potential = potential_samples_shared,
-            label = "block_green_$i",
-        )
+        rhs = timed(localrec, "green_rhs"; item = string(i)) do
+            green_rhs(
+                H,
+                orbitals[i],
+                energies[i],
+                cfg,
+                localrec;
+                potential = potential_samples_shared,
+                label = "block_green_$i",
+            )
+        end
         # Truncated MPO action establishes its own QR gauge when needed.
-        normalize(
-            apply_mpo(
-                green,
-                rhs;
-                tol = min(cfg.algebra_tolerance, cfg.orbital_tolerance),
-                cap = cfg.orbital_cap,
-                rec = localrec,
-            ),
-        )
+        timed(localrec, "green_mpo_action"; item = string(i)) do
+            normalize(
+                apply_mpo(
+                    green,
+                    rhs;
+                    tol = min(cfg.algebra_tolerance, cfg.orbital_tolerance),
+                    cap = cfg.orbital_cap,
+                    rec = localrec,
+                ),
+            )
+        end
     end
 end
+function lrrap_space(psi::QTT, cfg; work_tol)
+    base =
+        work_tol > 0 ?
+        rounded(psi; tol = min(work_tol, cfg.green_rhs_tolerance), cap = cfg.work_cap) : psi
+    tangent_space(base; cfg), rank(base)
+end
+lrrap_dimension(space::TangentSpace, orbitals) = space.offsets[end]
+
+function reconstruct_lrrap(
+    tangent_basis::TangentSpace,
+    orbitals,
+    c,
+    correction_coordinates,
+    history_coordinates,
+    cfg,
+    rec;
+    state_tol,
+    algebra_tol,
+)
+    b = length(orbitals)
+    results = recorded_map(Tuple{QTT,Union{Nothing,QTT}}, b, cfg, rec) do i, localrec
+        t = tangent_vector(tangent_basis, view(correction_coordinates, :, i))
+        y = normalize(
+            reconstruct_expression(
+                linear_expression((orbitals[i], t), (c[i], 1));
+                tol = state_tol,
+                cap = cfg.orbital_cap,
+                absolute_tolerance = get(cfg, :adaptive_accuracy, false) ? state_tol : nothing,
+            ),
+        )
+        p = if history_coordinates === nothing
+            nothing
+        else
+            with_svd_context(;
+                orbital = i,
+                role = "history_direction",
+                coordinates = view(history_coordinates, :, i),
+            ) do
+                rounded(
+                    tangent_vector(tangent_basis, view(history_coordinates, :, i));
+                    tol = algebra_tol,
+                    cap = cfg.orbital_cap,
+                )
+            end
+        end
+        y, p
+    end
+    first.(results),
+    history_coordinates === nothing ? nothing : QTT[last(result) for result in results]
+end
+
 function lrrap_step(orbitals, previous, H, green, cfg, rec; work_tol = 0.0, potential = nothing)
     isfinite(work_tol) && work_tol >= 0 ||
         throw(ArgumentError("work_tol must be finite and nonnegative"))
@@ -1272,25 +970,20 @@ function lrrap_step(orbitals, previous, H, green, cfg, rec; work_tol = 0.0, pote
         end
         first.(results), last.(results)
     end
-    # Cycle the tangent-space base point through the occupied orbitals.
+    # QTT cycles its tangent-space base; dense orbitals use the full spatial grid.
     tangent_orbital = mod((rec.scf - 1) * cfg.inner_steps + rec.inner - 1, b) + 1
     tangent_basis, tangent_base_rank = timed(rec, "L2") do
-        base = orbitals[tangent_orbital]
-        if work_tol > 0
-            # The trial tangent space uses the work budget; stored orbitals retain
-            # their finer representation and enter S_xx/H_vx without this rounding.
-            base = rounded(base; tol = min(work_tol, cfg.green_rhs_tolerance), cap = cfg.work_cap)
-        end
-        tangent_space(base; cfg), rank(base)
+        lrrap_space(orbitals[tangent_orbital], cfg; work_tol)
     end
     # L3: project orbitals, Green-preconditioned residuals, and prior directions into one tangent space.
     DX, DZ, DP = timed(rec, "L3") do
-        rows = tangent_basis.offsets[end]
+        rows = lrrap_dimension(tangent_basis, orbitals)
         dx = independent_columns(i -> project(tangent_basis, orbitals[i]), rows, b, cfg)
         # G*(H-epsilon)*psi = psi - G*(mu+epsilon-V)*psi.
         # Fit the smooth source before applying G, avoiding a noisy FD2 intermediate.
         shared_field = synchronized(field)
-        preconditioned = recorded_map(Vector{ComplexF64}, b, cfg, rec) do i, localrec
+        dz = Matrix{ComplexF64}(undef, rows, b)
+        recorded_map(Nothing, b, cfg, rec) do i, localrec
             rhs = green_rhs(
                 H,
                 orbitals[i],
@@ -1300,9 +993,9 @@ function lrrap_step(orbitals, previous, H, green, cfg, rec; work_tol = 0.0, pote
                 potential = shared_field,
                 label = "green_direction_rhs_$i",
             )
-            view(dx, :, i) - project(tangent_basis, rhs, green)
+            view(dz, :, i) .= view(dx, :, i) .- project(tangent_basis, rhs, green)
+            nothing
         end
-        dz = reduce(hcat, preconditioned)
         dp = independent_columns(
             i -> project(tangent_basis, previous[i]),
             rows,
@@ -1311,10 +1004,15 @@ function lrrap_step(orbitals, previous, H, green, cfg, rec; work_tol = 0.0, pote
         )
         dx, dz, dp
     end
-    # Only tangent coordinates are needed beyond this point.
+    green_update =
+        (cfg.green_update_interval > 0 && rec.scf % cfg.green_update_interval == 0) ||
+        maximum(residual_norms) < cfg.green_update_residual_threshold
+    history_reset = !green_update && get(cfg, :extra_orbitals, 0) > 0
+    retain_history = !green_update && !history_reset
+    # Form the small coefficient problem in these trial-space coordinates.
     D, W, H_vv, S_vx, H_vx, S_xx = timed(rec, "L4") do
         raw = hcat(DX, DZ, DP)
-        # Orthonormalize the tangent coordinates with SVD. X retains diagonal coefficients.
+        # Orthonormalize the coordinates with SVD. X retains diagonal coefficients.
         column_norms = [max(norm(view(raw, :, j)), 1e-14) for j = 1:size(raw, 2)]
         raw ./= transpose(column_norms)
         # Overwrite the normalized coordinate buffer and retain a view of U.
@@ -1324,7 +1022,9 @@ function lrrap_step(orbitals, previous, H, green, cfg, rec; work_tol = 0.0, pote
             >(max(maximum(fac.S) * cfg.tangent_relative_cutoff, cfg.tangent_absolute_cutoff)),
             fac.S,
         )
-        W = Diagonal(1 ./ column_norms) * fac.V[:, good] * Diagonal(1 ./ fac.S[good])
+        W =
+            retain_history ?
+            Diagonal(1 ./ column_norms) * fac.V[:, good] * Diagonal(1 ./ fac.S[good]) : nothing
         D = view(fac.U, :, 1:length(good))
         projected_actions = independent_columns(size(D, 1), size(D, 2), cfg) do j
             h_project_tangent(tangent_basis, view(D, :, j), H)
@@ -1348,32 +1048,33 @@ function lrrap_step(orbitals, previous, H, green, cfg, rec; work_tol = 0.0, pote
     coefficient_metric_cutoff < 1 || error("Grid exceeds the Float64 coefficient resolution budget")
     # L5: optimize the small coefficient problem under the orbital orthogonality constraints.
     coefficient_solution = timed(rec, "L5") do
-        debug_snapshot(
-            rec,
-            "coefficient_debug.jls",
-            (S_xx = S_xx, S_vx = S_vx, H_vx = H_vx, H_vv = H_vv, energies = energies),
-        )
-        coefficients(
-            S_xx,
-            S_vx,
-            H_vx,
-            H_vv,
-            energies;
-            parallel_tasks = get(cfg, :parallel_tasks, 1),
-            nsweeps = cfg.coefficient_sweeps,
-            metric_relative_cutoff = coefficient_metric_cutoff,
-            metric_absolute_cutoff = cfg.metric_absolute_cutoff,
-            constraint_relative_cutoff = cfg.constraint_relative_cutoff,
-            constraint_absolute_cutoff = cfg.constraint_absolute_cutoff,
-        )
+        try
+            coefficients(
+                S_xx,
+                S_vx,
+                H_vx,
+                H_vv,
+                energies;
+                parallel_tasks = get(cfg, :parallel_tasks, 1),
+                nsweeps = cfg.coefficient_sweeps,
+                metric_relative_cutoff = coefficient_metric_cutoff,
+                metric_absolute_cutoff = cfg.metric_absolute_cutoff,
+                constraint_relative_cutoff = cfg.constraint_relative_cutoff,
+                constraint_absolute_cutoff = cfg.constraint_absolute_cutoff,
+            )
+        catch
+            # Preserve the small failed problem without writing it every iteration.
+            rec.dir === nothing || serialize(
+                joinpath(rec.dir, "coefficient-failure.jls"),
+                (; S_xx, S_vx, H_vx, H_vv, energies, scf = rec.scf, inner = rec.inner),
+            )
+            rethrow()
+        end
     end
-    green_update =
-        (cfg.green_update_interval > 0 && rec.scf % cfg.green_update_interval == 0) ||
-        maximum(residual_norms) < cfg.green_update_residual_threshold
     # L6: reconstruct orbitals. A Green update resets the previous search directions.
     updated_orbitals, search_directions = timed(rec, "L6") do
         correction_coordinates = D * coefficient_solution.C
-        history_coordinates = if green_update
+        history_coordinates = if !retain_history
             nothing
         else
             basis_coefficients = W * coefficient_solution.C
@@ -1381,38 +1082,20 @@ function lrrap_step(orbitals, previous, H, green, cfg, rec; work_tol = 0.0, pote
             previous !== nothing && (directions .+= DP * basis_coefficients[(2b + 1):end, :])
             directions
         end
-        results = recorded_map(Tuple{QTT,QTT}, b, cfg, rec) do i, localrec
-            t = tangent_vector(tangent_basis, view(correction_coordinates, :, i))
-            y = normalize(
-                reconstruct_expression(
-                    linear_expression((orbitals[i], t), (coefficient_solution.c[i], 1));
-                    tol = state_tol,
-                    cap = cfg.orbital_cap,
-                    absolute_tolerance = get(cfg, :adaptive_accuracy, false) ? state_tol : nothing,
-                ),
-            )
-            p = if green_update
-                constant_tt(cfg.R, 0.0)
-            else
-                with_svd_context(;
-                    orbital = i,
-                    role = "history_direction",
-                    coordinates = view(history_coordinates, :, i),
-                ) do
-                    rounded(
-                        tangent_vector(tangent_basis, view(history_coordinates, :, i));
-                        tol = algebra_tol,
-                        cap = cfg.orbital_cap,
-                    )
-                end
-            end
-            y, p
-        end
-        first.(results), last.(results)
+        reconstruct_lrrap(
+            tangent_basis,
+            orbitals,
+            coefficient_solution.c,
+            correction_coordinates,
+            history_coordinates,
+            cfg,
+            rec;
+            state_tol,
+            algebra_tol,
+        )
     end
     if green_update
-        # Accepted orbitals keep the original tight Green output accuracy;
-        # the looser work budget applies to search directions, not this state.
+        # Green-updated orbitals use the tight output accuracy.
         updated_orbitals = timed(rec, "L6G") do
             # The coefficient solve already supplies Rayleigh values for these updated orbitals.
             block_green(
@@ -1432,31 +1115,42 @@ function lrrap_step(orbitals, previous, H, green, cfg, rec; work_tol = 0.0, pote
             H,
             cfg,
             rec;
-            ritz = green_update,
+            ritz = green_update || get(cfg, :extra_orbitals, 0) > 0,
             work_tol,
             potential = field,
+            reference_orbitals = orbitals,
+            residual_scale = get(cfg, :extra_orbitals, 0) > 0 ?
+                             maximum(
+                view(residual_norms, (cfg.occupied_count):(cfg.occupied_count + 1)),
+            ) : 0.0,
         )
     end
+    output_rank = orbital_max_rank(updated_orbitals)
     metrics = (
-        tangent_orbital = tangent_orbital,
+        tangent_orbital = tangent_basis === nothing ? nothing : tangent_orbital,
         tangent_base_rank = tangent_base_rank,
-        tangent_dimension = size(D, 2),
+        tangent_dimension = tangent_basis === nothing ? nothing : size(D, 2),
+        trial_dimension = size(D, 2),
         residual_max = maximum(residual_norms),
         residual_rms = sqrt(sum(abs2, residual_norms) / b),
+        orbital_residuals = residual_norms,
+        orbital_energies = energies,
+        residual_scope = "incoming working orbitals under the fixed SCF input-density Hamiltonian",
         trace_before = sum(energies),
         trace_after = coefficient_solution.trace_after,
         coefficient_metric_cutoff,
         coefficient_gram_defect = coefficient_solution.gram_defect,
         gram_defect = gramdef,
         green_update = green_update,
+        ritz_direction_history_reset = history_reset,
         green_energy_update_max_Ha = maximum(
             abs.(coefficient_solution.orbital_energies .- energies),
         ),
         ritz_offdiagonal_before = ritz_offdiag,
-        max_rank = maximum(rank.(updated_orbitals)),
-        inner_output_max_rank = maximum(rank.(updated_orbitals)),
+        max_rank = output_rank,
+        inner_output_max_rank = output_rank,
         orbital_bytes = sum(storage, updated_orbitals),
-        history_bytes = sum(storage, search_directions),
+        history_bytes = search_directions === nothing ? 0 : sum(storage, search_directions),
         work_tolerance = work_tol,
         work_rank_cap = cfg.work_cap,
     )
@@ -1465,9 +1159,95 @@ end
 
 # Density mixing and output compression use separate working and storage tolerances.
 
-function mix_density(previous_density, orbital_density, inputs, residuals, cfg, rec)
+"Solve (I + s*K_H) delta_rho = r with zero charge and a fresh stored-state residual."
+function dielectric_update(residual, interaction, cfg, rec)
+    timed(rec, "density_dielectric_solve") do
+        ngrid = 2^cfg.R
+        constant = constant_tt(cfg.R)
+        charge_mean(x::QTT) = real(sum(tensortrain(x))) / ngrid
+        charge_mean(x::QTTExpression) =
+            sum(real(c * sum(tensortrain(t))) for (t, c) in zip(x.terms, x.coefficients)) / ngrid
+        zero_charge(x) = linear_expression((x, constant), (1, -charge_mean(x)))
+        tol = min(cfg.algebra_tolerance, cfg.dielectric_tolerance / 100)
+        cap = cfg.density_cap
+        reconstruct(x) = reconstruct_expression(x; tol, cap)
+        rhs = zero_charge(residual)
+        rhs_norm = ttnorm(rhs)
+        rhs_norm <= eps(Float64) && return rhs
+        action(x) = begin
+            potential = apply_mpo(interaction, x; tol, cap = cfg.hartree_cap)
+            zero_charge(
+                linear_expression(
+                    (x, potential),
+                    (1, cfg.dielectric_susceptibility * cfg.volume_element),
+                ),
+            )
+        end
+        delta = constant_tt(cfg.R, 0)
+        r = reconstruct(rhs)
+        p = r
+        squared = ttnorm(r)^2
+        relative_residual = Inf
+        for iteration = 1:(cfg.dielectric_max_iterations)
+            Ap = action(p)
+            curvature = real(inner(p, Ap))
+            isfinite(curvature) && curvature > 0 || error("Nonpositive dielectric CG curvature")
+            step = squared / curvature
+            delta = reconstruct(zero_charge(linear_expression((delta, p), (1, step))))
+            next_r = reconstruct(linear_expression((r, Ap), (1, -step)))
+            next_squared = ttnorm(next_r)^2
+            if sqrt(next_squared) <= cfg.dielectric_tolerance * rhs_norm
+                # Recurrence convergence alone does not certify the compressed update.
+                fresh = linear_expression((rhs, action(delta)), (1, -1))
+                relative_residual = ttnorm(fresh) / rhs_norm
+                if relative_residual <= cfg.dielectric_tolerance
+                    result = zero_charge(delta)
+                    event!(
+                        rec.stage_io,
+                        (;
+                            scf = rec.scf,
+                            inner = rec.inner,
+                            stage = "density_dielectric_residual",
+                            event = "dielectric_solve",
+                            seconds = 0.0,
+                            iterations = iteration,
+                            relative_residual,
+                            susceptibility = cfg.dielectric_susceptibility,
+                            requested_tolerance = cfg.dielectric_tolerance,
+                            max_rank = rank(delta),
+                            rank_cap = cap,
+                            charge_update = cfg.volume_element * ngrid * charge_mean(result),
+                        ),
+                    )
+                    return result
+                end
+                next_r = reconstruct(fresh)
+                next_squared = ttnorm(next_r)^2
+                p = next_r
+            else
+                p = reconstruct(linear_expression((next_r, p), (1, next_squared / squared)))
+            end
+            r = next_r
+            squared = next_squared
+        end
+        relative_residual = ttnorm(linear_expression((rhs, action(delta)), (1, -1))) / rhs_norm
+        error("Dielectric solve missed its residual tolerance: $relative_residual")
+    end
+end
+
+function mix_density(
+    previous_density,
+    orbital_density,
+    inputs,
+    residuals,
+    cfg,
+    rec;
+    preconditioner = nothing,
+)
     previous_density === nothing && return orbital_density, "initial"
     residual = linear_expression((orbital_density, previous_density), (1, -1))
+    # Anderson fits the preconditioned residual when the update map uses it.
+    preconditioner === nothing || (residual = preconditioner(residual))
     push!(inputs, previous_density)
     push!(residuals, residual)
     length(inputs) > cfg.anderson_history && (popfirst!(inputs); popfirst!(residuals))
@@ -1490,8 +1270,7 @@ function mix_density(previous_density, orbital_density, inputs, residuals, cfg, 
     active = findall(c -> abs(c) >= 1e-15, coeff)
     terms = vcat(inputs[active], residuals[active])
     weights = vcat(coeff[active], cfg.mixing .* coeff[active])
-    # Flatten n_i + alpha*(rho_i-n_i); history holds only original QTT
-    # terms, so expression depth stays one and at most 2*history terms live.
+    # Keep input densities and residual corrections in one flat expression.
     linear_expression(terms, weights), method
 end
 
@@ -1511,18 +1290,26 @@ function reconstruct_density(rho::QTTExpression, cfg, rec)
 end
 
 "Compress stored orbitals at their requested accuracy; internal operator algebra keeps its tighter tolerance."
-function compress_orbitals(orbitals, cfg; tol = cfg.orbital_tolerance, input_gram_defect = nothing)
+function compress_orbitals(
+    orbitals,
+    cfg;
+    tol = cfg.orbital_tolerance,
+    input_gram_defect = nothing,
+    occupied_count = length(orbitals),
+)
     isfinite(tol) && tol >= 0 || throw(ArgumentError("orbital_tol must be finite and nonnegative"))
     before = sum(storage, orbitals)
     input_defect = input_gram_defect === nothing ? norm(gram(orbitals; cfg) - I) : input_gram_defect
     tol == 0 && return orbitals,
     (
         orbital_storage_tolerance = 0.0,
-        orbital_rank_before_compression = maximum(rank.(orbitals)),
-        stored_max_rank = maximum(rank.(orbitals)),
+        orbital_rank_before_compression = orbital_max_rank(orbitals),
+        compressed_max_rank = orbital_max_rank(orbitals),
         orbital_bytes_before_compression = before,
         orbital_compression_attempts = 0,
         stored_gram_defect = input_defect,
+        stored_occupied_gram_defect = occupied_count == length(orbitals) ? input_defect :
+                                      norm(gram(orbitals[1:occupied_count]; cfg) - I),
     )
     for attempt = 1:(cfg.storage_compression_attempts)
         actual = tol / 10^(attempt - 1)
@@ -1532,7 +1319,8 @@ function compress_orbitals(orbitals, cfg; tol = cfg.orbital_tolerance, input_gra
                 normalize(rounded(orbitals[i]; tol = actual, cap = cfg.orbital_cap))
         end
         # Compression must not sacrifice occupied-space orthogonality.
-        defect = norm(gram(updated_orbitals; cfg) - I)
+        metric = gram(updated_orbitals; cfg)
+        defect = norm(metric - I)
         representation_error =
             get(cfg, :adaptive_accuracy, false) ?
             maximum(
@@ -1548,11 +1336,14 @@ function compress_orbitals(orbitals, cfg; tol = cfg.orbital_tolerance, input_gra
             return updated_orbitals,
             (
                 orbital_storage_tolerance = actual,
-                orbital_rank_before_compression = maximum(rank.(orbitals)),
-                stored_max_rank = maximum(rank.(updated_orbitals)),
+                orbital_rank_before_compression = orbital_max_rank(orbitals),
+                compressed_max_rank = orbital_max_rank(updated_orbitals),
                 orbital_bytes_before_compression = before,
                 orbital_compression_attempts = attempt,
                 stored_gram_defect = defect,
+                stored_occupied_gram_defect = norm(
+                    view(metric, 1:occupied_count, 1:occupied_count) - I,
+                ),
                 storage_orbital_error_max = representation_error,
             )
         end
@@ -1602,17 +1393,22 @@ function VI.add(y::QTTVector, x::QTTVector, a::Number, b::Number)
 end
 VI.add!!(y::QTTVector, x::QTTVector, a::Number, b::Number) = VI.add(y, x, a, b)
 
-function lanczos_orbitals(factorization, norbitals, cfg, rec; tol)
+function lanczos_orbitals(factorization, norbitals, cfg, rec; tol, reference_orbitals = nothing)
     dimension = length(factorization)
-    projected =
-        factorization isa KrylovKit.LanczosFactorization ?
-        KrylovKit.rayleighquotient(factorization) :
-        Hermitian(view(factorization.H, 1:dimension, 1:dimension))
+    projected = Hermitian(view(factorization.H, 1:dimension, 1:dimension))
     spectrum = eigen(projected)
     basis = reconstruct_orbital!.(KrylovKit.basis(factorization))
+    coefficients = Matrix{ComplexF64}(spectrum.vectors[:, 1:norbitals])
+    align_occupation_boundary!(
+        coefficients,
+        view(spectrum.values, 1:norbitals),
+        () -> gram(basis, reference_orbitals[1:(cfg.occupied_count)]; cfg),
+        cfg;
+        rec,
+    )
     orbitals = combine_orbitals(
         basis,
-        spectrum.vectors[:, 1:norbitals],
+        coefficients,
         cfg,
         rec;
         tol,
@@ -1623,26 +1419,21 @@ function lanczos_orbitals(factorization, norbitals, cfg, rec; tol)
     orthogonalize(orbitals, cfg, rec)
 end
 
-"Advance Lanczos; reconstruct Ritz orbitals only when a caller or restart needs them."
-function lanczos_step(
+"Advance block Lanczos; reconstruct Ritz orbitals when a caller or restart needs them."
+function block_lanczos_step(
     orbitals,
     subspace,
     H,
     cfg,
     rec;
-    solver = :lanczos,
     work_tol,
     ritz_tol,
     potential,
     extract_ritz = true,
 )
-    solver in (:lanczos, :block_lanczos) || throw(ArgumentError("Unknown Lanczos method"))
     norbitals = length(orbitals)
-    block_recurrence = solver == :block_lanczos || norbitals > 1
     limit = min(2^cfg.R, max(16, 4norbitals))
-    width =
-        subspace === nothing ? norbitals :
-        block_recurrence ? length(KrylovKit.residual(subspace.factorization)) : 1
+    width = subspace === nothing ? norbitals : length(KrylovKit.residual(subspace.factorization))
     residual_floor = max(work_tol, 100eps(Float64))
     breakdown =
         subspace !== nothing &&
@@ -1650,7 +1441,14 @@ function lanczos_step(
     restarted = subspace !== nothing && !breakdown && length(subspace.factorization) + width > limit
     initialized = subspace === nothing || restarted
     if restarted && subspace.ritz_dimension != length(subspace.factorization)
-        orbitals, _ = lanczos_orbitals(subspace.factorization, norbitals, cfg, rec; tol = ritz_tol)
+        orbitals, _ = lanczos_orbitals(
+            subspace.factorization,
+            norbitals,
+            cfg,
+            rec;
+            tol = ritz_tol,
+            reference_orbitals = orbitals,
+        )
     end
     if initialized
         action =
@@ -1670,24 +1468,20 @@ function lanczos_step(
             )
         initial = [QTTVector(psi, work_tol, cfg.work_cap, rec) for psi in orbitals]
         # A block preserves independent directions within degenerate eigenspaces.
-        iterator = if !block_recurrence
-            KrylovKit.LanczosIterator(action, only(initial), KrylovKit.ModifiedGramSchmidt2())
-        else
-            KrylovKit.BlockLanczosIterator(
-                action,
-                KrylovKit.Block(initial),
-                limit,
-                KrylovKit.ModifiedGramSchmidt2(),
-                residual_floor,
-            )
-        end
+        iterator = KrylovKit.BlockLanczosIterator(
+            action,
+            KrylovKit.Block(initial),
+            limit,
+            KrylovKit.ModifiedGramSchmidt2(),
+            residual_floor,
+        )
         factorization = KrylovKit.initialize(iterator)
         length(factorization) >= norbitals || error("The initial Lanczos block lost occupied rank")
         subspace = (; iterator, factorization, gram_defect = nothing, ritz_dimension = 0)
     end
     factorization = subspace.factorization
     previous_dimension = length(factorization)
-    width = block_recurrence ? length(KrylovKit.residual(factorization)) : 1
+    width = length(KrylovKit.residual(factorization))
     # Do not normalize a numerically zero residual at an invariant subspace.
     breakdown_tolerance = sqrt(width) * residual_floor
     breakdown = KrylovKit.normres(factorization) <= breakdown_tolerance
@@ -1695,16 +1489,25 @@ function lanczos_step(
         KrylovKit.expand!(subspace.iterator, factorization)
     end
     dimension = length(factorization)
-    basis = reconstruct_orbital!.(KrylovKit.basis(factorization))
     if extract_ritz && subspace.ritz_dimension != dimension
-        orbitals, gram_defect = lanczos_orbitals(factorization, norbitals, cfg, rec; tol = ritz_tol)
+        orbitals, gram_defect = lanczos_orbitals(
+            factorization,
+            norbitals,
+            cfg,
+            rec;
+            tol = ritz_tol,
+            reference_orbitals = orbitals,
+        )
         subspace = (; subspace.iterator, factorization, gram_defect, ritz_dimension = dimension)
     end
-    width = block_recurrence ? length(KrylovKit.residual(factorization)) : 1
+    width = length(KrylovKit.residual(factorization))
     breakdown = KrylovKit.normres(factorization) <= sqrt(width) * residual_floor
+    # Rank logging must not reconstruct deferred expressions solely for diagnostics.
+    basis = KrylovKit.basis(factorization)
+    max_trial_bond = all(x -> x.psi isa QTT, basis) ? maximum(x -> rank(x.psi), basis) : nothing
     metrics = (;
-        solver,
-        recurrence = block_recurrence ? :block : :scalar,
+        solver = :block_lanczos,
+        recurrence = :block,
         trial_dimension = dimension,
         appended_directions = dimension - previous_dimension,
         restarted,
@@ -1713,7 +1516,7 @@ function lanczos_step(
         gram_defect = subspace.ritz_dimension == dimension ? subspace.gram_defect : nothing,
         work_tolerance = work_tol,
         work_rank_cap = cfg.work_cap,
-        max_trial_bond = maximum(rank, basis),
+        max_trial_bond,
     )
     orbitals, subspace, metrics
 end
@@ -1745,7 +1548,16 @@ function combine_orbitals(basis, coefficients, cfg, rec; tol, cap, label)
     end
 end
 
-function subspace_ritz(basis, keep, project_matrices, cfg, rec; tol)
+function subspace_ritz(
+    basis,
+    keep,
+    project_matrices,
+    cfg,
+    rec;
+    tol,
+    reference_orbitals = nothing,
+    residual_scale = 0.0,
+)
     hamiltonian, overlap = timed(() -> project_matrices(basis), rec, "subspace_projection")
     orthogonalizer =
         canonical_orthogonalizer(overlap, cfg.metric_relative_cutoff, cfg.metric_absolute_cutoff)
@@ -1753,6 +1565,16 @@ function subspace_ritz(basis, keep, project_matrices, cfg, rec; tol)
     projected = orthogonalizer' * hamiltonian * orthogonalizer
     spectrum = eigen(Hermitian((projected + projected') / 2))
     coefficients = orthogonalizer * spectrum.vectors[:, 1:keep]
+    align_occupation_boundary!(
+        coefficients,
+        view(spectrum.values, 1:keep),
+        () ->
+            reference_orbitals === nothing ? view(overlap, :, 1:(cfg.occupied_count)) :
+            gram(basis, view(reference_orbitals, 1:(cfg.occupied_count)); cfg),
+        cfg;
+        residual_scale,
+        rec,
+    )
     orbitals = combine_orbitals(
         basis,
         coefficients,
@@ -1803,7 +1625,7 @@ function extend_subspace(basis, directions, room, cfg, rec; tol, metric = gram(b
     reconstruct_orbital!.(appended)
 end
 
-function davidson_directions(solver, orbitals, energies, H, green, cfg, rec, potential; tol)
+function davidson_directions(orbitals, energies, H, green, cfg, rec, potential; tol)
     residuals = recorded_map(QTT, length(orbitals), cfg, rec) do i, localrec
         h_residual(
             H,
@@ -1819,7 +1641,6 @@ function davidson_directions(solver, orbitals, energies, H, green, cfg, rec, pot
     end
     norms = ttnorm.(residuals)
     selected = findall(>(max(cfg.eigen_tolerance, tol, 100eps(Float64))), norms)
-    solver == :davidson && !isempty(selected) && (selected = [argmax(norms)])
     candidates = recorded_map(QTT, length(selected), cfg, rec) do j, localrec
         i = selected[j]
         # Normalize the inverse's input so its work budget is independent of residual size.
@@ -1834,9 +1655,8 @@ function davidson_directions(solver, orbitals, energies, H, green, cfg, rec, pot
     candidates, maximum(norms), norm(norms) / sqrt(length(norms))
 end
 
-"Generalized Davidson: expand with preconditioned residuals and retain the lowest Ritz orbitals."
-function davidson_step(
-    solver,
+"Block generalized Davidson: expand with preconditioned residuals and extract the requested block."
+function block_davidson_step(
     orbitals,
     subspace,
     H,
@@ -1848,27 +1668,23 @@ function davidson_step(
     potential,
     project_matrices = basis -> (h_gram(basis, H; cfg), gram(basis; cfg)),
 )
-    solver in (:davidson, :block_davidson) || throw(ArgumentError("Unknown Davidson method"))
     norbitals = length(orbitals)
     if subspace === nothing
         basis = orbitals
-        orbitals, energies, gram_defect, metric =
-            subspace_ritz(basis, norbitals, project_matrices, cfg, rec; tol = ritz_tol)
+        orbitals, energies, gram_defect, metric = subspace_ritz(
+            basis,
+            norbitals,
+            project_matrices,
+            cfg,
+            rec;
+            tol = ritz_tol,
+            reference_orbitals = orbitals,
+        )
         subspace = (; basis, energies, gram_defect, metric)
     end
     limit = min(2^cfg.R, max(16, 4norbitals))
     directions, residual_max, residual_rms = timed(rec, "subspace_expansion") do
-        davidson_directions(
-            solver,
-            orbitals,
-            subspace.energies,
-            H,
-            green,
-            cfg,
-            rec,
-            potential;
-            tol = work_tol,
-        )
+        davidson_directions(orbitals, subspace.energies, H, green, cfg, rec, potential; tol = work_tol)
     end
     # Converged orbitals do not consume expansion slots or trigger a restart.
     restarted =
@@ -1889,12 +1705,20 @@ function davidson_step(
     end
     if !isempty(appended)
         basis = vcat(basis, appended)
-        orbitals, energies, gram_defect, metric =
-            subspace_ritz(basis, norbitals, project_matrices, cfg, rec; tol = ritz_tol)
+        orbitals, energies, gram_defect, metric = subspace_ritz(
+            basis,
+            norbitals,
+            project_matrices,
+            cfg,
+            rec;
+            tol = ritz_tol,
+            reference_orbitals = orbitals,
+            residual_scale = residual_max,
+        )
         subspace = (; basis, energies, gram_defect, metric)
     end
     metrics = (;
-        solver,
+        solver = :block_davidson,
         trial_dimension = length(subspace.basis),
         appended_directions = length(appended),
         restarted = restarted && !isempty(appended),

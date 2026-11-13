@@ -25,7 +25,6 @@ xc_table_points = 128
 
 [scf]
 parallel_tasks = 0
-criterion = "energy"
 energy_tolerance = 1e-7
 max_iterations = 60
 seed = 20261030

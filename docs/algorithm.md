@@ -63,22 +63,74 @@ the actual box lengths. Nuclear grid points seed TCI sampling. The occupied
 functions are normalized and orthogonalized before entering the shared SCF loop.
 Custom initial orbitals can be supplied with `state_from_functions`.
 
-1. Construct static external and interaction operators and initialize orbitals.
+1. Construct static external and interaction operators. Initialize the occupied
+   orbitals and any configured extra unoccupied orbitals as one solver block.
 2. Fit the initial orbital density and normalize its integral to the electron
    number. Later iterations reuse the density already computed from the previous
-   stored output orbitals. Apply linear or Anderson density mixing.
+   stored occupied orbitals. Extra orbitals have no occupation and do not
+   contribute to density or total energy. Apply linear or Anderson density mixing.
 3. Build the Hamiltonian from the mixed density. Keep it fixed during the
    configured inner orbital updates.
 4. Round orbitals to the storage budget and check their Gram matrix. Recompute
    density from the stored orbitals.
-5. Evaluate total energy, the change from the previous iteration, and the
-   difference between output and mixed input densities. Apply the stopping
-   criterion and audit the final state. In `strict` mode, only an iterate that
-   meets the energy, density, and Gram gates becomes a final-state candidate.
-   Rotate that candidate with the output-density Hamiltonian, compress it,
-   recompute its density and energy, and audit the resulting stored orbitals.
-   Accept the candidate only when all conditions pass; otherwise retain the
-   original iterate and search directions and continue SCF.
+5. Evaluate total energy and the relative difference between output and mixed
+   input densities. Once energy and density have settled at the final fitting
+   budgets, form a canonical candidate. Rotate the occupied orbitals with their
+   output-density Hamiltonian, compress them, and recompute density and energy.
+   An independent audit supplies the single acceptance decision. A rejected
+   candidate leaves the working state, histories, sampling RNG, and solver pivots
+   intact. At an iteration limit or requested stop, canonicalize and check the
+   actual saved state regardless of the scheduling trigger.
+
+### Extra orbitals and final canonical orbitals
+
+`scf.extra_orbitals` enlarges the inner eigensolver block without changing the
+electron number. Keeping empty states above the occupied boundary is an
+established way to help iterative eigensolvers converge the occupied states;
+see [VASP's NBANDS guidance](https://vasp.at/wiki/NBANDS) and
+[DFTK's AdaptiveBands](https://docs.dftk.org/dev/api/#DFTK.AdaptiveBands).
+For 50 occupied states, six extra states give a working block of 56. This count
+is a numerical choice requiring convergence evidence, not a prescribed optimum
+or a guarantee of lower runtime. The published H100 input requests six extra
+states; the general constructor default remains zero.
+
+Ritz extraction selects the lowest occupied states outside an unresolved
+occupation-boundary cluster. The cluster span is limited by
+`max(degeneracy_tolerance, 2 * residual_resolution)`. The residual resolution
+is at least the existing inner `eigen_tolerance`; LRRAP also uses the larger
+incoming residual norm of the occupied boundary state and its first empty
+partner. Generalized Davidson uses its available incoming residual estimate.
+This is a numerical resolution policy inspired by [Hermitian residual bounds][residual-bounds],
+not a certified eigenvalue enclosure for inexact QTT actions or a relaxed
+physical acceptance threshold. The cluster shrinks as the solve resolves the spectrum.
+
+Within this cluster, an SVD selects the principal vectors with maximum overlap
+with the occupied space before the orbital update. LRRAP uses the incoming
+orbitals, not its already changed Green-update output, as this reference.
+This follows the occupation-continuity idea of [maximum-overlap selection][mom],
+with a project adaptation for unresolved subspaces. The occupied and empty
+parts are then diagonalized separately and their Rayleigh values are updated.
+Their projectors and integer occupations remain unchanged by this final
+within-part rotation. A finite cluster span permits a departure from full
+diagonal form across the occupation boundary; independent residuals still
+measure that departure. Resolved gaps retain ordinary energy ordering.
+LRRAP applies a Ritz rotation whenever extra states are present and discards
+unrotated direction history when that additional rotation would invalidate it.
+Green updates and these mandatory rotations skip history reconstruction and
+its coefficient map. The next iteration receives no history block, so it does
+not project zero placeholder directions.
+
+For a final candidate, let `X` contain only the occupied orbitals, `S = X'X`,
+and `A = X'H[rho_out]X`. The final rotation solves `A C = S C epsilon` with
+`C'SC = I`, then reconstructs `X C` under the existing orbital rank and
+accuracy controls. Equal occupations make an exact unitary occupied rotation
+leave density and total energy invariant. This is the canonical-orbital freedom
+described by [Cancès et al., Eqs. (12)–(13)](https://who.rocq.inria.fr/Martin.Vohralik/Files/Pub_JCP_15.pdf).
+It removes mixing inside the represented occupied space; it cannot remove
+residual components outside that space. Compression can perturb invariance, so
+the candidate's density, energy, Gram defect, and independent residual are
+recomputed. This operation is occupied-space canonicalization, not the
+perturbative basis correction developed later in that paper.
 
 The total energy includes occupied kinetic energy, external energy, half the
 Hartree integral, XC energy, and nuclear repulsion. The XC potential itself is
@@ -89,45 +141,72 @@ If cancellation obscures the kinetic numerator, an exact low-rank gradient
 contraction supplies it. Hartree energy contracts `rho' * K * rho` directly,
 with prefactor `dV^2/2`; it does not construct a second Hartree field for energy.
 
-## Standard Block LOBPCG at fixed H
+### Dielectric density preconditioning
 
-`block_lobpcg` uses the same LOBPCGEigensolver.jl iteration for dense arrays and
-QTT orbital blocks. The search space contains the current orbitals, the
-preconditioned residuals, and retained history directions. Rayleigh–Ritz allows
-full mixing of the old orbital columns. The inverse preconditioner is an
-optional block callback; omission applies the identity. No Block Green
-fixed-point update is added to this iteration.
+For periodic 1D soft Coulomb, an optional constant susceptibility model uses
+`chi0 = -s I` on the zero-charge density subspace. The density correction solves
 
-The QTT adapter keeps orthogonalization updates as linear expressions, fits
-the final orbital combinations with shared block evaluators, and evaluates
-Hamiltonian actions through the existing sampled numerical operations. It
-keeps orthogonalized search directions as coefficient expressions when only
-their projections are needed. A shared block evaluator samples the complete
-Hamiltonian action before TCI fitting; independently fitted basis actions are
-not combined across a cancellation. It
-does not assemble a grid-sized orbital matrix. Its Ritz problem uses the actual
-search Gram. The Duersch history update uses that same metric in the
-coefficient overlap; exact arithmetic recovers the library's identity-metric
-formula. Physical residuals are refreshed from stored orbitals instead
-of trusting linear combinations of cached Hamiltonian actions after truncation.
-The final residual audit uses the independent residual-norm path and checks
-the stored Gram. Inexact QTT operations can change the trajectory and do not
-inherit exact-arithmetic monotonicity or convergence guarantees.
+$$ (I+sK_H)\,\delta\rho = \rho_{\mathrm{out}}-\rho_{\mathrm{in}}, $$
 
-The implementation reuses [LOBPCGEigensolver.jl](https://github.com/JuliaMolSim/LOBPCGEigensolver.jl)
-for the stabilized LOBPCG iteration and locking workflow, described by
-[Nottoli et al.](https://arxiv.org/abs/2305.06668).
-This interface solves a fixed Hamiltonian; it does not establish SCF convergence.
+where `K_H` is the same discrete periodic Hartree convolution, including the
+grid weight, as in the Hamiltonian. The constant component is removed from the
+correction. The model neglects the XC derivative only in the preconditioner;
+the physical Hamiltonian retains its configured XC term. It neither changes
+occupations nor introduces a temperature or spatial symmetry constraint.
+
+This adapts the susceptibility approach of
+[Herbst and Levitt](https://arxiv.org/abs/2009.01665) and
+[DFTK's mixing interface](https://github.com/JuliaMolSim/DFTK.jl/blob/master/src/scf/mixing.jl).
+Its nonzero-mode multiplier is `1/(1+s*K_H_hat(q))`, using the actual 1D kernel.
+Truncated QTT conjugate gradients use the existing Hartree and density caps.
+A fresh residual of the stored update must satisfy `dielectric_tolerance`;
+recurrence convergence alone is insufficient. The QTT SCF route does not
+construct full-grid Fourier arrays.
+
+Anderson uses the preconditioned corrections both in its residual Gram fit and
+its update combinations, following
+[DFTK's acceleration convention](https://github.com/JuliaMolSim/DFTK.jl/blob/master/src/scf/anderson.jl).
+The fit metric is the Euclidean norm of the preconditioned residual. Choosing
+that metric and changing the update direction are distinct decisions.
+The existing regularization, coefficient limit and cancellation-aware Gram
+contraction are retained. The susceptibility stays fixed during a solve;
+SCF diagnostics and stopping use the unpreconditioned density residual.
+
+## Dense LRRAP counterpart
+
+Both representations call the same `ground_state` loop and `lrrap_step`.
+Dense LRRAP replaces the TT tangent projection by the identity on the spatial
+grid. It forms `DX=X`, `DZ=X-G*((mu+epsilon-V).*X)`, and `DP=P`, where
+`G=(T+mu*I)^(-1)` is the inverse of the same discrete FD2 kinetic operator.
+The common SVD selects independent columns from `[DX,DZ,DP]`, and the existing
+constrained coefficient solver updates each orbital as `c[i]*X[:,i]+D*C[:,i]`.
+The Green update uses the updated coefficient energies and retains the same
+schedule, normalization, Ritz rotation, and direction-history rules.
+
+This is the full-space counterpart of the project's LRRAP update, not a
+standard LOBPCG replacement. A rank-limited TT tangent space generally spans
+fewer directions, so dense and QTT trajectories need not coincide. When the
+TT tangent projector is the identity and truncation errors are negligible,
+the updates should agree up to roundoff and numerical subspace cutoffs.
+
+Dense physics reuses the scalar external, Coulomb voxel-average, and XC
+functions. SparseArrays supplies periodic 1D and zero-exterior 3D FD2 matrices
+and the shifted Cholesky solve. FFTW evaluates cyclic 1D Hartree convolution
+and zero-padded 3D convolution with the same volume weights. The dense path
+does not build QTT orbitals, fit fields, or assemble a full spatial Hamiltonian
+matrix. Its full-grid arrays and sparse operators still limit feasible sizes.
+The shared final audit rebuilds the output-density Hamiltonian and evaluates
+the stored-orbital residuals, charge, Gram defect, and density residual.
 
 ## LRRAP orbital update
 
 | Stage | Operation |
 |---|---|
 | L1 | Contract Rayleigh values and physical residual norms. The 1D norm combines the kinetic core action with a fitted potential term. |
-| L2 | Build a common tangent space from a rotating occupied orbital; adaptive runs use its working-accuracy approximation as the trial-space base. |
+| L2 | Build a common tangent space from a rotating working orbital; adaptive runs use its working-accuracy approximation as the trial-space base. |
 | L3 | Project orbitals, the Green correction from its smooth source, and history directions into that tangent space. |
 | L4 | Remove small singular directions and contract the reduced Hamiltonian, retaining orbital-direction coupling. |
-| L5 | Solve the small coefficient problem with occupied-orbital orthogonality constraints. |
+| L5 | Solve the small coefficient problem with working-orbital orthogonality constraints. |
 | L6 | Reconstruct QTT orbitals from the correction. Clear history when a Green update is scheduled. |
 | L6G | Optionally apply `(T + mu*I)^-1` to `(mu + epsilon_i - V)*u_i` and normalize. |
 | L7 | Restore orthogonality and apply the required Ritz rotation. |
@@ -135,6 +214,10 @@ This interface solves a fixed Hamiltonian; it does not establish SCF convergence
 Tangent projection contracts the operator directly into tangent coordinates.
 L4 reuses the orbital projections from L3 and forms the projected Hamiltonian
 with one matrix multiplication after collecting its tangent action columns.
+For each represented tangent direction, the FD2 center is contracted from its
+cores. Normalizing nearly dependent coordinate columns can amplify violations
+of the tangent gauge identities; substituting the coordinate vector itself
+would then introduce an error divided by the squared grid spacing.
 For `G=(T+mu*I)^(-1)`, L3 evaluates
 `G*(H-epsilon)*psi = psi - G*((mu+epsilon-V)*psi)` directly in tangent
 coordinates. This avoids fitting a large differential residual before applying
@@ -157,6 +240,16 @@ eigenvalues. It is a conditioning policy; the independent physical audit still
 determines acceptance. L6 reconstructs the two available QTT terms directly
 in a common QR basis and checks the absolute truncation error before normalization.
 
+The QTT input Gram matrix can differ slightly from the identity. Before the
+constraint SVD, L5 also keeps the current coefficient vector feasible: for
+normalized current coordinates `z` and constraint matrix `A`, it replaces
+`A` by `A - z*(z'*A)`. Thus nearly dependent constraints cannot amplify the
+existing overlap defect and exclude the current iterate from its own
+minimization. This correction vanishes for exactly feasible coordinates and
+retains the incoming overlap accuracy. L7 restores the stored block's
+orthogonality. This is a numerical adaptation for inexact QTT overlaps;
+the physical acceptance thresholds are unchanged.
+
 For 1D residual sampling, shift differences are first
 contracted into QTT cores; subtracting nearly equal point values would otherwise
 inject roundoff divided by `h^2` at every sample. Cancellation-prone tangent
@@ -178,28 +271,18 @@ The Green iteration samples the complete FD2 action and its vector updates,
 without constructing the six shifted QTT states. Acceptance still contracts
 the untruncated discrete residual independently of these sampled updates.
 
-## Lanczos and Davidson solvers
+## Block Lanczos and block generalized Davidson
 
-`lanczos` and `block_lanczos` share KrylovKit's
-[Lanczos factorization iterators][lanczos]. `lanczos` selects the scalar
-recurrence for one orbital and the block recurrence for several orbitals.
-`block_lanczos` selects the block recurrence even for a one-orbital block.
-In the scalar case, the normalized basis vectors obey the three-term recurrence
-
-$$
-Hq_j=\beta_{j-1}q_{j-1}+\alpha_jq_j+\beta_jq_{j+1}.
-$$
-
-The Ritz problem uses the real symmetric tridiagonal matrix with diagonal
-`alpha` and off-diagonal `beta`. For several orbitals, `BlockLanczosIterator`
-uses the block recurrence
+`block_lanczos` uses KrylovKit's
+[BlockLanczosIterator][lanczos], including for a one-orbital block. Its basis
+blocks obey the three-term recurrence
 
 $$
 HQ_j=Q_{j-1}B_{j-1}^{\dagger}+Q_jA_j+Q_{j+1}B_j,
 $$
 
-and a Hermitian block tridiagonal Ritz matrix. Both methods share
-`lanczos_step`, Ritz reconstruction, and explicit restart. The starting block retains
+with a Hermitian block tridiagonal Ritz matrix. `block_lanczos_step` owns
+Ritz reconstruction and explicit restart. The starting block retains
 independent components in degenerate eigenspaces. KrylovKit performs modified
 Gram-Schmidt reorthogonalization and deflates dependent residual directions.
 An invariant subspace ends expansion before a zero residual is normalized;
@@ -212,7 +295,7 @@ state at the effective working tolerance and `work_cap`. A single active term
 uses direct scaling; multiple terms use TCI. This avoids
 constructing and compressing a separate QTT for every Gram-Schmidt subtraction.
 Hamiltonian actions use the same sampled FD2 expression as the physical residual.
-Within SCF, both Lanczos choices sample the frozen local potential without
+Within SCF, block Lanczos samples the frozen local potential without
 fitting its combined cores first. If every initial action sample is zero,
 the core-algebra fallback constructs and caches the diagonal potential MPO on
 demand. Zero samples alone never establish a globally zero action.
@@ -220,7 +303,7 @@ QTT fitting and truncation make these actions inexact, so the recurrence residua
 criterion. The solver checks the residuals of the reconstructed orbitals
 separately.
 
-`davidson` and `block_davidson` implement [generalized Davidson][davidson],
+`block_davidson` implements block [generalized Davidson][davidson],
 with the shifted kinetic inverse as the preconditioner:
 
 $$r_i=H\psi_i-\epsilon_i\psi_i,\qquad
@@ -231,7 +314,6 @@ The original Davidson method uses a diagonal approximation to
 for both 1D and 3D. No Jacobi-Davidson correction equation is solved.
 The sign of `t_i` does not change the expanded subspace.
 
-`davidson` adds the correction for the largest unconverged residual;
 `block_davidson` adds corrections for every unconverged requested orbital.
 Residuals below `eigen_tolerance` do not generate corrections. The retained
 space is removed using `LinearAlgebra.pinv` of its full Gram matrix, since
@@ -289,7 +371,8 @@ The 1D initial orbitals share an envelope and differ by Fourier phases. Their
 orthogonalization contracts the original QTT Gram matrix, then samples each
 final coefficient combination as the common envelope times its weighted phase
 sum. This reuses one envelope cache without evaluating all occupied tensor
-trains at every query. Per-orbital normalization, rank limits, fitting tolerance,
+trains at every query. Unit-modulus phases share the envelope normalization.
+Rank limits, fitting tolerance,
 and the stored-orbital Gram check remain part of the shared reconstruction.
 
 Canonicalization uses `ITensorMPS.orthogonalize!` without truncation. Default
@@ -313,17 +396,25 @@ SCF iterations and dependent tensor sweeps remain sequential.
 
 ## Stopping and physical acceptance
 
-`energy` stops when the total-energy change meets `energy_tolerance`. `strict`
-also requires the density and Gram conditions and the independent physical audit.
-The audit reconstructs density and Hamiltonian from the final stored orbitals
-and checks eigen-residuals, orthogonality, charge, density consistency, and energy
-consistency with separate numerical budgets. `status.json` records solver
-stopping and physical acceptance independently.
+The canonical saved state has one `accepted` decision. It requires:
+
+- maximum normalized orbital residual plus the kinetic-action error budget below
+  `scf.orbital_residual_tolerance` (or `scf.eigen_tolerance` when unset);
+- relative density residual `norm(rho_out-rho_in)/norm(rho_out)` at most
+  `scf.density_tolerance`;
+- Gram defect and absolute electron-number error below the audit thresholds;
+- independent total energy agreeing with the reported candidate energy within
+  `scf.energy_tolerance`.
+
+The audit reconstructs density and Hamiltonian with its own numerical budgets.
+One Gram calculation supplies both orbital norms and charge. Consecutive SCF
+energy change schedules candidate checks and records progress; it is not another
+physical acceptance condition. Dense-reference comparisons remain diagnostics.
 
 Optional adaptive precision starts with loose fitting budgets and tightens them
 as density feedback settles. The FD2 bound `2/m * sum(1/h_axis^2)` sets the
 orbital representation budget on the current grid. Precision changes reset the
-energy comparison, and strict stopping is available only at the final budgets.
+energy comparison; candidate checks use the final budgets.
 Optional grid continuation first solves the same physical system on coarser
 grids, refines the stored orbitals, and applies the requested thresholds on the
 target grid. Neither policy replaces the unfiltered physical residual with a
@@ -331,12 +422,14 @@ preconditioned residual or changes the FD2 Hamiltonian.
 
 ## Fixed-potential spectra and propagation
 
-The 1D `fixed_spectrum` interface defaults to Block Green. Block Green,
-residual-subspace, and LRRAP updates retain band-energy stopping. The
-restarted subspace solvers check the maximum residual of all requested states
-and the Gram defect against `scf.eigen_tolerance` and `scf.gram_tolerance`,
-respectively. Use `solver=:block_davidson` to select a method and
-`scf=SCFOptions(...)` to supply numerical controls.
+The 1D `fixed_spectrum` interface defaults to Block Green. Every method checks
+the maximum residual of all reconstructed requested states and their Gram defect
+against `scf.eigen_tolerance` and `scf.gram_tolerance`. Occupied band-energy change
+is a progress measurement. Fixed-field fits are reused across iterations;
+matching projection and diagnostic budgets share their fit. Full-grid residual
+evaluation retains two bounded-memory passes so small residuals are evaluated
+directly after the Rayleigh energies are known. Use `solver=:block_davidson` to
+select a method and `scf=SCFOptions(...)` to supply numerical controls.
 
 The 1D `propagate` interface applies a potential half step, an FD2 Cayley kinetic
 step, and a second potential half step. Each potential step uses the density of
@@ -362,8 +455,8 @@ the implementation to its sources.
 | Tangent space, tangent vector, tangent projection | Variations at a fixed TT, represented by left/right orthogonal cores and gauge-constrained core variations. `TangentSpace` stores those bases and coordinate offsets. | [LRRAP, Sec. 3][lrrap-paper] |
 | LRRAP | The implementation adapts the paper's common tangent-space and constrained coefficient update to Kohn-Sham SCF. | [LRRAP, Eqs. (23)-(29)][lrrap-paper] |
 | Gram/overlap matrix, canonical orthogonalization | `S = X'X`; `canonical_orthogonalizer` returns retained overlap eigenvectors scaled by inverse square roots. Its columns satisfy `W'SW = I`. Orbital symmetric orthogonalization instead uses the full `S^(-1/2)`. | [PySCF orthogonalization][orthogonalization] |
-| Rayleigh quotient, Ritz values/vectors, Krylov subspace, Davidson correction | Projected eigenproblems and trial-space expansion. The Davidson methods use kinetic-inverse preconditioned residuals and belong to generalized Davidson. | [SLEPc eigensolver guide][eigensolvers], [generalized Davidson][davidson] |
-| Lanczos recurrence, block Lanczos, reorthogonalization | Three-term scalar or block recurrence; the projected Ritz matrix is tridiagonal or block tridiagonal. Explicit restart uses the retained Ritz orbitals. | [KrylovKit factorizations][lanczos] |
+| Rayleigh quotient, Ritz values/vectors, Krylov subspace, Davidson correction | Projected eigenproblems and trial-space expansion. Block Davidson uses kinetic-inverse preconditioned residuals and belongs to generalized Davidson. | [SLEPc eigensolver guide][eigensolvers], [generalized Davidson][davidson] |
+| Block Lanczos recurrence, reorthogonalization | Three-term block recurrence with a block tridiagonal Ritz matrix, including for one orbital. Explicit restart uses the retained Ritz orbitals. | [KrylovKit factorizations][lanczos] |
 | Rounding, compression, truncation | Approximation at a specified TT rank/tolerance. `compress_orbitals` also checks the Gram matrix after compression. | [TT arithmetic][tt-arithmetic] |
 
 `psi` denotes an orbital, `rho` a density, `H` the Hamiltonian, and `V` a
@@ -402,3 +495,5 @@ organization, while this project's kinetic discretization is stated above.
 [pz81]: https://doi.org/10.1103/PhysRevB.23.5048
 [cg]: https://petsc.org/release/manualpages/KSP/KSPCG/
 [strang]: https://doi.org/10.1137/0705041
+[mom]: https://manual.q-chem.com/6.2/topic_mom.html
+[residual-bounds]: https://doi.org/10.1137/0612016

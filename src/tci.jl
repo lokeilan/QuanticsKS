@@ -248,8 +248,9 @@ function (f::TensorSamples)(left, right, middle::Val{M}) where {M}
         ir, jr = i:min(i + rows - 1, length(left)), j:min(j + columns - 1, length(right))
         reserve = length(ir) * nl + length(jr) * nr
         trim_tt_cache!(tt_cache, capacity - reserve)
-        cache_endpoint_tables!(f, left[ir], right[jr])
-        values = TCI.batchevaluate(tt_cache, left[ir], right[jr], middle)
+        left_slice, right_slice = left[ir], right[jr]
+        cache_endpoint_tables!(f, left_slice, right_slice)
+        values = TCI.batchevaluate(tt_cache, left_slice, right_slice, middle)
         view_result[ir, :, jr] = reshape(values, length(ir), 1 << M, length(jr))
     end
     result
@@ -291,17 +292,18 @@ function (f::ShiftedSamples)(left, right, ::Val{M}) where {M}
     out = Array{ComplexF64}(undef, length(left), 1 << M, length(right))
     # A periodic shift only couples the three index groups through a carry.
     # Partition by that carry and retain a rectangular matrix contraction.
+    left_indices, right_indices = indexof.(left), indexof.(right)
+    shifted_left = bits.(mod.(left_indices .+ f.offset, 1 << nl), nl)
     groups = Dict{Int,Vector{Int}}()
     for i in eachindex(left)
-        carry = fld(indexof(left[i]) + f.offset, 1 << nl)
+        carry = fld(left_indices[i] + f.offset, 1 << nl)
         push!(get!(() -> Int[], groups, carry), i)
     end
     for (carry, rows) in groups, m = 0:((1 << M) - 1)
         rightcarry, center = fldmod(m + carry, 1 << M)
-        l = [
-            vcat(bits(mod(indexof(left[i]) + f.offset, 1 << nl), nl), bits(center, M)) for i in rows
-        ]
-        r = [bits(mod(indexof(q) + rightcarry, 1 << nr), nr) for q in right]
+        center_bits = bits(center, M)
+        l = [vcat(shifted_left[i], center_bits) for i in rows]
+        r = [bits(mod(q + rightcarry, 1 << nr), nr) for q in right_indices]
         values = f.input(l, r, Val(0))
         for j in eachindex(right), (ii, i) in enumerate(rows)
             out[i, m + 1, j] = values[ii, j]
@@ -458,53 +460,54 @@ function BlockEvaluator(
         max_bytes,
     )
 end
-uses_scalar_evaluation(o::BlockEvaluator) = o.uses_endpoint_contraction
-function (o::BlockEvaluator)(j::Int)
-    o.requests += 1
-    value = cache_get(o.cache, j)
+uses_scalar_evaluation(evaluator::BlockEvaluator) = evaluator.uses_endpoint_contraction
+function (evaluator::BlockEvaluator)(j::Int)
+    evaluator.requests += 1
+    value = cache_get(evaluator.cache, j)
     if value === nothing
-        value = cache_put!(o.cache, j, [e(j) for e in o.evaluators])
-        o.evaluations += 1
+        value = cache_put!(evaluator.cache, j, [e(j) for e in evaluator.evaluators])
+        evaluator.evaluations += 1
     end
     value
 end
-function evaluate_block_slice(o::BlockEvaluator, left, right, middle::Val{M}) where {M}
+function evaluate_block_slice(evaluator::BlockEvaluator, left, right, middle::Val{M}) where {M}
     shape = (length(left), ntuple(_ -> 2, M)..., length(right))
     out = Array{Vector{ComplexF64}}(undef, shape)
     for i in eachindex(out)
-        out[i] = Vector{ComplexF64}(undef, length(o.samples))
+        out[i] = Vector{ComplexF64}(undef, length(evaluator.samples))
     end
-    for k in eachindex(o.samples)
-        column = o.samples[k](left, right, middle)
+    for k in eachindex(evaluator.samples)
+        column = evaluator.samples[k](left, right, middle)
         for i in eachindex(out)
             out[i][k] = column[i]
         end
     end
     out
 end
-function (o::BlockEvaluator)(left, right, middle::Val{M}) where {M}
-    R = sample_length(first(o.samples))
-    uses_scalar_evaluation(o) && return map_slice(o, Vector{ComplexF64}, R, left, right, middle)
-    o.requests += length(left) * (1 << M) * length(right)
-    result, evaluations, _ = cached_slice!(o.cache, R, left, right, middle) do l, r, m
+function (evaluator::BlockEvaluator)(left, right, middle::Val{M}) where {M}
+    R = sample_length(first(evaluator.samples))
+    uses_scalar_evaluation(evaluator) &&
+        return map_slice(evaluator, Vector{ComplexF64}, R, left, right, middle)
+    evaluator.requests += length(left) * (1 << M) * length(right)
+    result, evaluations, _ = cached_slice!(evaluator.cache, R, left, right, middle) do l, r, m
         # Partially cached requests use matrix sub-batches with m = Val(0).
-        evaluate_block_slice(o, l, r, m)
+        evaluate_block_slice(evaluator, l, r, m)
     end
-    o.evaluations += evaluations
+    evaluator.evaluations += evaluations
     result
 end
-block_cache_stats(o::BlockEvaluator) = (;
-    block_cache_mode = isempty(o.cache.values) ? "bounded_clock" : "dense_addressed",
-    block_cache_capacity = o.cap,
-    block_cache_evictions = o.cache.evictions,
-    block_sample_requests = o.requests,
-    block_sample_evaluations = o.evaluations,
-    endpoint_bytes = o.endpoint_bytes,
-    block_buffer_bytes = o.buffer_bytes,
-    endpoint_prefix = first(o.evaluators).prefix,
-    endpoint_suffix = first(o.evaluators).suffix,
-    block_workspace_bytes = o.workspace_bytes,
-    block_budget_bytes = o.budget_bytes,
+block_cache_stats(evaluator::BlockEvaluator) = (;
+    block_cache_mode = isempty(evaluator.cache.values) ? "bounded_clock" : "dense_addressed",
+    block_cache_capacity = evaluator.cap,
+    block_cache_evictions = evaluator.cache.evictions,
+    block_sample_requests = evaluator.requests,
+    block_sample_evaluations = evaluator.evaluations,
+    endpoint_bytes = evaluator.endpoint_bytes,
+    block_buffer_bytes = evaluator.buffer_bytes,
+    endpoint_prefix = first(evaluator.evaluators).prefix,
+    endpoint_suffix = first(evaluator.evaluators).suffix,
+    block_workspace_bytes = evaluator.workspace_bytes,
+    block_budget_bytes = evaluator.budget_bytes,
 )
 
 struct LinearSamples{O} <: SampledFunction
@@ -545,6 +548,7 @@ struct SynchronizedBlockEvaluator
     mutex::ReentrantLock
 end
 synchronized(f::SampledFunction) = SynchronizedSamples(f, ReentrantLock())
+synchronized(values::AbstractVector{<:Number}) = values
 synchronized(f::BlockEvaluator) = SynchronizedBlockEvaluator(f, ReentrantLock())
 synchronized(f::Union{SynchronizedSamples,SynchronizedBlockEvaluator}) = f
 sample_length(f::Union{SynchronizedSamples,SynchronizedBlockEvaluator}) = sample_length(f.input)
@@ -783,8 +787,6 @@ end
 
 # Recorder tracks the stages, samples, and timings of TCI fits.
 
-using JSON3, Dates, Printf
-
 mutable struct Recorder
     options::NamedTuple
     dir::Union{Nothing,String}
@@ -904,9 +906,6 @@ function Base.close(r::Recorder)
         close(r.tci_io)
     end
 end
-debug_snapshot(r::Recorder, name, data) =
-    r.dir === nothing ? nothing : serialize(joinpath(r.dir, name), data)
-
 evaluate(x, r::Recorder) = Evaluator(x; max_bytes = r.options.environment_cache_max_bytes)
 block_evaluator(xs, r::Recorder) = BlockEvaluator(
     xs;
@@ -919,7 +918,7 @@ block_evaluator(xs, r::Recorder) = BlockEvaluator(
 # TCI construction and post-fit SVD rounding have separate tolerances and timings.
 
 function cross(
-    r::Recorder,
+    rec::Recorder,
     R,
     fn;
     tol = 1e-9,
@@ -928,36 +927,37 @@ function cross(
     pivots = Int[],
     shared_pivots = "",
     initial_zero_fallback = nothing,
-    require_convergence = r.options.require_convergence,
-    rounding_tolerance = iszero(r.options.post_rounding_factor) ? nothing :
-                         tol * r.options.post_rounding_factor,
+    require_convergence = rec.options.require_convergence,
+    rounding_tolerance = iszero(rec.options.post_rounding_factor) ? nothing :
+                         tol * rec.options.post_rounding_factor,
 )
     validate_truncation(tol, cap)
     rounding_tolerance === nothing || validate_truncation(rounding_tolerance, cap)
     1 <= R <= 60 || throw(ArgumentError("Binary grid must have 1:60 sites"))
-    evaluator = RecordedSamples(sampled(fn, R), r.options)
+    evaluator = RecordedSamples(sampled(fn, R), rec.options)
     key = (String(label), Int(R))
     shared_key = (String(shared_pivots), Int(R))
     saved =
-        get(r.options, :reuse_pivots, true) && !isempty(label) ?
-        get(r.cross_states, key, get(r.cross_states, shared_key, nothing)) : nothing
+        get(rec.options, :reuse_pivots, true) && !isempty(label) ?
+        get(rec.cross_states, key, get(rec.cross_states, shared_key, nothing)) : nothing
     saved !== nothing && maximum(length, saved.left) > cap && (saved = nothing)
     reuse_source =
-        saved === nothing ? "none" : haskey(r.cross_states, key) ? "previous_fit" : "orbital_group"
-    all(j -> 0 <= j < 2^R, r.options.initial_pivots) || throw(
+        saved === nothing ? "none" :
+        haskey(rec.cross_states, key) ? "previous_fit" : "orbital_group"
+    all(j -> 0 <= j < 2^R, rec.options.initial_pivots) || throw(
         ArgumentError("TCI initial_pivots must be zero-based indices inside the current grid"),
     )
     pts = unique(
         vcat(
             pivots,
-            r.options.initial_pivots,
+            rec.options.initial_pivots,
             [0, 2^R - 1],
-            rand(0:(2^R - 1), r.options.initial_random_pivots),
+            rand(0:(2^R - 1), rec.options.initial_random_pivots),
         ),
     )
     all(j -> 0 <= j < 2^R, pts) || throw(ArgumentError("Initial pivot outside the grid"))
-    r.calls += 1
-    call = r.calls
+    rec.calls += 1
+    call = rec.calls
     tic = time_ns()
     initial_max = maximum(j -> abs(evaluator(j)), pts; init = 0.0)
     old_max =
@@ -969,19 +969,19 @@ function cross(
         if initial_zero_fallback !== nothing
             # Zero initial samples do not establish global cancellation.
             # The caller supplies a reconstruction from the original cores.
-            previous_tci_time = r.tci_time
+            previous_tci_time = rec.tci_time
             x = initial_zero_fallback()
             dt = (time_ns() - tic) / 1e9
-            nested_tci_seconds = r.tci_time - previous_tci_time
-            r.samples += evaluator.evaluations
-            r.tci_time += max(0.0, dt - nested_tci_seconds)
+            nested_tci_seconds = rec.tci_time - previous_tci_time
+            rec.samples += evaluator.evaluations
+            rec.tci_time += max(0.0, dt - nested_tci_seconds)
             event!(
-                r.tci_io,
+                rec.tci_io,
                 (;
                     call,
-                    scf = r.scf,
-                    inner = r.inner,
-                    stage = r.stage,
+                    scf = rec.scf,
+                    inner = rec.inner,
+                    stage = rec.stage,
                     label,
                     seconds = dt,
                     nested_tci_seconds,
@@ -994,16 +994,16 @@ function cross(
         end
         # TCI cannot initialize a zero pivot. Prove zero on bounded small grids;
         # never infer a globally zero function merely from a few zero samples.
-        2^R <= r.options.zero_check_limit || error(
+        2^R <= rec.options.zero_check_limit || error(
             "All initial TCI pivots are zero for $label. Supply informative pivots, an analytic constant potential, or increase zero_check_limit for a full scalar scan.",
         )
         nonzero = findfirst(j -> !iszero(evaluator(bits(j, R))), 0:(2^R - 1))
         if nonzero === nothing
             dt = (time_ns() - tic) / 1e9
-            r.samples += evaluator.evaluations
-            r.tci_time += dt
+            rec.samples += evaluator.evaluations
+            rec.tci_time += dt
             event!(
-                r.tci_io,
+                rec.tci_io,
                 (
                     call = call,
                     label = label,
@@ -1039,36 +1039,36 @@ function cross(
             evaluator;
             tolerance = Float64(tol),
             maxbonddim = cap,
-            maxiter = r.options.max_iterations,
-            ncheckhistory = r.options.check_history,
-            nsearchglobalpivot = r.options.global_pivot_search,
-            maxnglobalpivot = r.options.max_global_pivots,
+            maxiter = rec.options.max_iterations,
+            ncheckhistory = rec.options.check_history,
+            nsearchglobalpivot = rec.options.global_pivot_search,
+            maxnglobalpivot = rec.options.max_global_pivots,
         )
         train = QTT(TCI.TensorTrain(tci).sitetensors)
     end
     dt = (time_ns() - tic) / 1e9
-    r.samples += evaluator.evaluations
-    r.tci_time += dt
+    rec.samples += evaluator.evaluations
+    rec.tci_time += dt
     rounding_start = time_ns()
     x =
         rounding_tolerance === nothing ? train :
         with_svd_context(;
-            scf = r.scf,
-            inner = r.inner,
-            stage = r.stage,
+            scf = rec.scf,
+            inner = rec.inner,
+            stage = rec.stage,
             label,
-            diagnostic_dir = r.dir === nothing ? nothing : joinpath(r.dir, "numerics-failures"),
+            diagnostic_dir = rec.dir === nothing ? nothing : joinpath(rec.dir, "numerics-failures"),
         ) do
             rounded(train; tol = rounding_tolerance, cap)
         end
     rounding_seconds = rounding_tolerance === nothing ? 0.0 : (time_ns() - rounding_start) / 1e9
     event!(
-        r.tci_io,
+        rec.tci_io,
         (
             call = call,
-            scf = r.scf,
-            inner = r.inner,
-            stage = r.stage,
+            scf = rec.scf,
+            inner = rec.inner,
+            stage = rec.stage,
             label = label,
             construction = rounding_tolerance === nothing ? "tci_prrlu" :
                            "tci_prrlu_with_svd_rounding",
@@ -1107,7 +1107,7 @@ function cross(
         (isempty(err) || last(err) > tol) &&
         error("TCI did not meet tolerance: $label")
     if tci !== nothing
-        remember_cross!(r, isempty(shared_pivots) ? (key,) : (key, shared_key), tci, rs, err)
+        remember_cross!(rec, isempty(shared_pivots) ? (key,) : (key, shared_key), tci, rs, err)
     end
     x
 end
@@ -1223,6 +1223,17 @@ function merge_recorder!(parent, child; sampling_seed = nothing, group = nothing
         end
     end
     nothing
+end
+
+"Record candidate measurements without changing the solver's sampling RNG or pivot history."
+function recorded_diagnostic(f, rec::Recorder)
+    child = fork_recorder(rec)
+    try
+        with_sampling_seed(() -> f(child), 0)
+    finally
+        empty!(child.cross_updates)
+        merge_recorder!(rec, child)
+    end
 end
 
 "Fit independent groups from one pivot snapshot and merge logs in input order."

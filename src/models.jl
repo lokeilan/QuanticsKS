@@ -383,8 +383,7 @@ Base.@kwdef struct PhysicsNumerics
     green_relative_tolerance::Float64 = 1e-8
     green_max_iterations::Int = 300
 end
-const LANCZOS_SOLVERS = (:lanczos, :block_lanczos)
-const SUBSPACE_SOLVERS = (LANCZOS_SOLVERS..., :davidson, :block_davidson)
+const SUBSPACE_SOLVERS = (:block_lanczos, :block_davidson)
 
 Base.@kwdef struct SCFOptions
     initial_spacing::Union{Nothing,Float64} = nothing
@@ -396,16 +395,22 @@ Base.@kwdef struct SCFOptions
     energy_tolerance::Float64 = 1e-6
     max_iterations::Int = 100
     inner_steps::Int = 1
+    # Extra unoccupied orbitals enlarge the eigensolver block, not the density.
+    extra_orbitals::Int = 0
+    degeneracy_tolerance::Float64 = 1e-6
     coefficient_sweeps::Int = 2
     mixing::Float64 = 0.3
     adaptive_mixing::Bool = false
+    # Constant susceptibility on the zero-charge density subspace; zero disables it.
+    dielectric_susceptibility::Float64 = 0.0
+    dielectric_tolerance::Float64 = 1e-4
+    dielectric_max_iterations::Int = 40
     anderson::Bool = true
     green_shift::Float64 = 0.5
     eigen_tolerance::Float64 = 1e-4
     # Final stored-state acceptance can differ from the inner eigensolver target.
     orbital_residual_tolerance::Union{Nothing,Float64} = nothing
     density_tolerance::Float64 = 1e-4
-    criterion::Symbol = :energy
     seed::Int = 20261030
     anderson_history::Int = 5
     anderson_regularization::Float64 = 1e-6
@@ -505,23 +510,19 @@ function solver_config(problem, accuracy, scf = SCFOptions())
             cell = cell_volume(problem.grid),
             volume_element = volume_element(problem.grid),
             electrons = sum(problem.occupations),
+            occupied_count = length(problem.occupations),
             orbital_cap = accuracy.orbital_cap,
             adaptive_accuracy = accuracy.adaptive,
             kinetic_spectral_bound = kinetic_bound(problem),
             effective_potential_cap = field_caps(accuracy).effective_potential_cap,
             density_cap = field_caps(accuracy).density_cap,
+            hartree_cap = field_caps(accuracy).hartree_cap,
             work_cap = accuracy.work_cap,
             orbital_tolerance = something(accuracy.orbital_tolerance, accuracy.field_tolerance),
             algebra_tolerance = accuracy.algebra_tolerance,
             kinetic_action_tolerance = accuracy.kinetic_action_tolerance,
-            eigen_tolerance = scf.eigen_tolerance,
-            inner_steps = scf.inner_steps,
-            coefficient_sweeps = scf.coefficient_sweeps,
-            green_shift = scf.green_shift,
-            mixing = scf.mixing,
-            anderson = scf.anderson,
         ),
-        (; (k => getfield(scf, k) for k in fieldnames(SCFOptions))...),
+        option_tuple(scf),
         (;
             orthogonalization_tolerance = accuracy.orthogonalization_tolerance,
             green_rhs_tolerance = accuracy.green_rhs_tolerance,

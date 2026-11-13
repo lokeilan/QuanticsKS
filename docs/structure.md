@@ -14,6 +14,7 @@ README.md
 inputs/
     h4.toml
     helium.toml
+    h100-r16.toml
     propagation.toml
 docs/
     algorithm.md
@@ -68,24 +69,24 @@ operations used by every model. Its files are loaded by `QuanticsKS.jl`.
 TensorCrossInterpolation supplies fitting, tensor addition, compression, and
 contraction environments, including the signed 3D kernel suffix. ITensorMPS
 supplies MPO matrix elements, canonical forms, compression recovery, and ordinary
-MPO application through TCI's conversion extension. KrylovKit supplies scalar
-and block Lanczos recurrences and modified Gram-Schmidt for Davidson as well.
+MPO application through TCI's conversion extension. KrylovKit supplies block Lanczos recurrences and modified Gram-Schmidt for Davidson as well.
 Their shared `QTTVector` adapter in `solvers.jl` implements VectorInterface
 with QTT working tolerances and rank caps. It accumulates linear expressions
 during orthogonalization and reconstructs a state when its consumer needs QTT
 cores; a single active term uses direct scaling.
-The `lanczos` and `block_lanczos` workflows call the shared `lanczos_step`.
-Both Davidson variants call `davidson_step` directly.
-`block_lobpcg` calls LOBPCGEigensolver.jl for both dense and QTT orbitals.
-`QTTBlock` supplies block algebra, deferred linear combinations, sampled
-Hamiltonian actions and residuals, and reconstruction under the caller's rank
-controls. Its scalar indexing rejects implicit grid traversal. The library owns
-the iteration; the adapter accounts for the actual QTT metric in Ritz and
-history coefficients, and audits residuals after reconstruction.
-`DeferredPotentialMPO` caches potential cores when a sampled Hamiltonian first
-needs a core-algebra fallback or projection.
-Hamiltonian projection reuses converted orbitals and operators within a call.
-Checkpoints store QTT cores and retain their package type identities.
+SCF and fixed-potential workflows call the same `block_lanczos_step` and
+`block_davidson_step` functions. A single requested orbital still uses the
+block implementation. LRRAP remains the default SCF solver.
+SCF keeps extra unoccupied orbitals in its working block. `OrbitalState` and its
+checkpoints retain only occupied orbitals. Initial modes remain in `states.jl`;
+occupation-boundary alignment and Ritz algebra remain in `solvers.jl`.
+Periodic initialization shares its envelope and wavevector ordering between
+dense and QTT representations in `states.jl`.
+The shared SCF loop owns final-candidate acceptance and reuses its existing
+output-density canonicalization for the single final-state acceptance decision.
+`hamiltonian.jl` selects the model-specific Hartree operator for optional density
+preconditioning. `solvers.jl` owns its QTT linear solve and Anderson update;
+the same SCF loop supplies their unpreconditioned residual diagnostics.
 
 Local tensor loops implement the grid's carry and borrow rules, bounded sample
 caches, and cancellation-sensitive expressions. Dependent SCF, Green, and
@@ -94,6 +95,15 @@ tangent-coordinate updates remain explicit in the solver.
 Read `scf.jl` for the ground-state workflow, `hamiltonian.jl` for its physical
 operators, and `solvers.jl` for orbital updates and their shared numerical
 functions. Dimension-specific methods sit with the operation they implement.
+
+Dense LRRAP stays in these same responsibility-based files. `states.jl` owns
+full-grid orbital initialization and checkpoint storage; `hamiltonian.jl`
+owns `DenseOperators`, `DenseHamiltonian`, FFT convolution, and the shifted
+sparse solve. `solvers.jl` shares LRRAP's SVD, constrained coefficients, Green
+schedule, and orbital transforms, with representation-specific projection
+and reconstruction. Dense arrays use the full orbital space. The existing
+QTT methods continue to use tangent coordinates, evaluators, and TCI fits.
+`scf.jl` owns one common density-feedback and acceptance workflow.
 
 ## Naming
 
@@ -113,3 +123,9 @@ Sampling functions use `evaluator` or `samples`; cached contractions use
 separately. Comments explain a physical quantity, equation, numerical choice,
 or library constraint. A project adaptation must be described as such, with
 its equation or source, rather than presented as a published algorithm name.
+
+Grid refinement uses one workflow for both representations and dimensions;
+sampling dispatch owns periodic or zero-exterior interpolation. Observables also
+share one workflow and reuse propagation's already computed overlap matrix.
+Candidate diagnostics use a temporary recorder: measurements are merged into the
+run log, while the solver's random stream and pivot history remain unchanged.

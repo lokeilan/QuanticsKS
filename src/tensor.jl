@@ -23,6 +23,22 @@ function QTT(psi::ITensorMPS.MPS)
 end
 rank(x::QTT) = length(x) == 1 ? 1 : TCI.rank(tensortrain(x))
 storage(x::QTT) = sum(sizeof, x.c)
+orbital_max_rank(orbitals) = maximum(rank, orbitals)
+orbital_max_rank(::AbstractVector{<:AbstractVector{<:Number}}) = nothing
+storage(x::AbstractVector{<:Number}) = sizeof(x)
+inner(x::AbstractVector{<:Number}, y::AbstractVector{<:Number}; cfg = (;)) = dot(x, y)
+ttnorm(x::AbstractVector{<:Number}; cfg = (;)) = norm(x)
+difference_norm(x::AbstractVector{<:Number}, y::AbstractVector{<:Number}; kwargs...) = norm(x - y)
+function gram(xs::AbstractVector{<:AbstractVector{<:Number}}; cfg = (;))
+    X = reduce(hcat, xs)
+    X' * X
+end
+gram(
+    xs::AbstractVector{<:AbstractVector{<:Number}},
+    ys::AbstractVector{<:AbstractVector{<:Number}};
+    cfg = (;),
+) = reduce(hcat, xs)' * reduce(hcat, ys)
+expression_gram(xs::AbstractVector{<:AbstractVector{<:Number}}; rec = nothing) = gram(xs)
 scale(x::QTT, a) = QTT(TCI.multiply(tensortrain(x), a).sitetensors)
 "Contract <bra|ket> through TCI without fitting or truncating a product state."
 function inner(bra::QTT, ket::QTT; cfg = (;))
@@ -60,8 +76,8 @@ function inner_mpo(x::QTT, w, y::QTT)
     length(x) == length(y) == length(w) || throw(DimensionMismatch("MPO expectation lengths"))
     # Random index IDs must not advance the TCI sampling stream.
     with_sampling_seed(0) do
-        bras, kets, operators = mpo_basis((x, y), (w,))
-        ITensorMPS.inner(bras[1], only(operators), kets[2]; make_inds_match = false)
+        bras, kets, operators = mpo_basis(x === y ? (x,) : (x, y), (w,))
+        ITensorMPS.inner(first(bras), only(operators), last(kets); make_inds_match = false)
     end
 end
 normalize(x::QTT; cfg = (;)) = scale(x, 1 / ttnorm(x; cfg))
@@ -79,7 +95,8 @@ function rounded(x::QTT; tol = 1e-11, cap = 64)
         rank_cap = cap,
     ) do
         check_compression_shapes(x.c)
-        result = deepcopy(tensortrain(x))
+        # TCI's nonmutating SVD replaces every core for multi-site trains.
+        result = TCI.TensorTrain(length(x) == 1 ? [copy(only(x.c))] : copy(x.c))
         compress_with_recovery!(result; tolerance = Float64(tol), maxbonddim = cap)
         result
     end
@@ -211,15 +228,12 @@ function endpoint_plan(xs, max_bytes)
     for x in xs
         left_sizes = [16 * (1 << k) * (k == 0 ? 1 : size(x.c[k], 3)) for k = 0:limit]
         right_sizes = [16 * (1 << k) * (k == 0 ? 1 : size(x.c[R - k + 1], 1)) for k = 0:limit]
+        left_peak, right_peak = 0, 0
         for k = 1:limit
-            left_extra[k + 1] = max(
-                left_extra[k + 1],
-                maximum(left_sizes[j] + left_sizes[j + 1] for j = 1:k) - left_sizes[k + 1],
-            )
-            right_extra[k + 1] = max(
-                right_extra[k + 1],
-                maximum(right_sizes[j] + right_sizes[j + 1] for j = 1:k) - right_sizes[k + 1],
-            )
+            left_peak = max(left_peak, left_sizes[k] + left_sizes[k + 1])
+            right_peak = max(right_peak, right_sizes[k] + right_sizes[k + 1])
+            left_extra[k + 1] = max(left_extra[k + 1], left_peak - left_sizes[k + 1])
+            right_extra[k + 1] = max(right_extra[k + 1], right_peak - right_sizes[k + 1])
         end
     end
     best = (
@@ -302,6 +316,9 @@ end
 Base.length(x::QTTExpression) = x.R
 
 function linear_expression(xs, weights)
+    if !isempty(xs) && first(xs) isa AbstractVector{<:Number}
+        return reduce(hcat, xs) * collect(weights)
+    end
     isempty(xs) && throw(ArgumentError("A linear expression needs a grid"))
     length(xs) == length(weights) || throw(DimensionMismatch("Expression coefficients"))
     R = length(first(xs))
@@ -687,12 +704,21 @@ end
 # Interpolate neighboring periodic samples to evaluate a QTT on a finer grid.
 
 "Periodic degree-five interpolation of normalized grid amplitudes, using six TT point queries."
-struct PeriodicRefinement
-    evaluate::Evaluator
+struct PeriodicRefinement{E}
+    evaluate::E
     coarse_size::Int
     ratio::Int
     nodes::Vector{Int}
     weights::Matrix{Float64}
+end
+function PeriodicRefinement(x::AbstractVector{<:Number}, target_R::Int; degree = 5, kwargs...)
+    q, remainder = divrem(1 << target_R, length(x))
+    q > 1 && remainder == 0 || throw(ArgumentError("Refinement requires a finer binary grid"))
+    nodes = collect((-(degree ÷ 2)):(degree ÷ 2 + 1))
+    weights = [
+        prod((s / q - b) / (a - b) for b in nodes if b != a) / sqrt(q) for a in nodes, s = 0:(q - 1)
+    ]
+    PeriodicRefinement(j -> x[j + 1], length(x), q, nodes, weights)
 end
 function PeriodicRefinement(x::QTT, target_R::Int; degree = 5, max_bytes = 8 * 1024^2)
     target_R > length(x) || throw(ArgumentError("Refinement requires a finer grid"))
@@ -713,8 +739,6 @@ function (p::PeriodicRefinement)(j::Int)
 end
 
 # SVD failure records and recovery; diagnostic context belongs to the current task.
-
-using Serialization, Dates, JSON3
 
 const SVD_CONTEXT_KEY = :quanticsks_svd_context
 const SVD_EVENT_ID = Threads.Atomic{Int}(0)

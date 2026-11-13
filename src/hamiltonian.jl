@@ -1,5 +1,228 @@
 # Build QTT operators from the model and density, then evaluate density and total energy.
 
+build_operators(problem, accuracy, rec, physics, ::Val{:qtt}) =
+    build_operators(problem, accuracy, rec, physics)
+
+"Full-grid fields with sparse FD2 kinetics and FFT convolution."
+struct DenseOperators{K,T,O}
+    external::Vector{Float64}
+    kinetic::SparseMatrixCSC{Float64,Int}
+    interaction::K
+    xc_table::T
+    cartesian_order::O
+    nuclear::Float64
+end
+
+struct DenseHamiltonian
+    kinetic::SparseMatrixCSC{Float64,Int}
+    potential::Vector{Float64}
+end
+
+function dense_kinetic(grid::PeriodicGrid1D, mass)
+    n = length(grid)
+    coefficient = 1 / (2mass * spacing(grid)^2)
+    T = spdiagm(
+        -1 => fill(-coefficient, n - 1),
+        0 => fill(2coefficient, n),
+        1 => fill(-coefficient, n - 1),
+    )
+    T[1, n] = T[n, 1] = -coefficient
+    T
+end
+
+function dense_kinetic(grid::BoxGrid3D, mass)
+    n = grid_shape(grid)
+    rows, columns, values = Int[], Int[], Float64[]
+    weights = 1 ./ (2mass .* spacing(grid) .^ 2)
+    for j = 0:(length(grid) - 1)
+        index = grid_indices(grid, j)
+        push!(rows, j + 1)
+        push!(columns, j + 1)
+        push!(values, 2sum(weights))
+        for a = 1:3, direction in (-1, 1)
+            0 <= index[a] + direction < n[a] || continue
+            neighbor = ntuple(b -> index[b] + (a == b ? direction : 0), 3)
+            push!(rows, j + 1)
+            push!(columns, grid_index(grid, neighbor) + 1)
+            push!(values, -weights[a])
+        end
+    end
+    sparse(rows, columns, values, length(grid), length(grid))
+end
+
+function build_operators(problem, accuracy, rec, physics, ::Val{:dense})
+    validate(physics)
+    grid, model = problem.grid, problem.model
+    external = [
+        external_value(model, grid_position(grid, j), grid isa PeriodicGrid1D ? grid.L : grid)
+        for j = 0:(length(grid) - 1)
+    ]
+    interaction = if model isa SoftCoulombLSDA1D
+        fft([kernel_value(model, grid_position(grid, j), grid.L) for j = 0:(length(grid) - 1)])
+    elseif model isa AllElectronLDA3D
+        n, h = grid_shape(grid), spacing(grid)
+        kernel = map(CartesianIndices(2 .* n)) do index
+            displacement = ntuple(a -> begin
+                q = index[a] - 1
+                (q < n[a] ? q : q - 2n[a]) * h[a]
+            end, 3)
+            coulomb_cell_average(displacement, h)
+        end
+        fft(kernel)
+    else
+        nothing
+    end
+    xc_table = if has_xc(model)
+        Q.XCTable(
+            npoints = physics.xc_table_points,
+            density_min = physics.xc_density_min,
+            density_max = physics.xc_density_max,
+            rtol = physics.exchange_quadrature_rtol,
+            parallel_tasks = get(rec.options, :parallel_tasks, 1),
+        )
+    elseif model isa AllElectronLDA3D && model.xc == :pz81
+        PZ81Table()
+    else
+        nothing
+    end
+    order =
+        grid isa BoxGrid3D ?
+        map(index -> grid_index(grid, Tuple(index) .- 1) + 1, CartesianIndices(grid_shape(grid))) :
+        nothing
+    DenseOperators(
+        external,
+        dense_kinetic(grid, problem.mass),
+        interaction,
+        xc_table,
+        order,
+        nuclear_energy(model, grid isa PeriodicGrid1D ? grid.L : grid),
+    )
+end
+
+function dense_hartree(rho, problem, ops::DenseOperators)
+    ops.interaction === nothing && return zeros(length(rho))
+    dV = volume_element(problem.grid)
+    ops.cartesian_order === nothing && return dV .* real.(ifft(ops.interaction .* fft(rho)))
+    n = grid_shape(problem.grid)
+    padded = zeros(ComplexF64, 2 .* n)
+    region = ntuple(a -> 1:n[a], 3)
+    padded[region...] .= rho[ops.cartesian_order]
+    potential = real.(ifft(ops.interaction .* fft(padded)))[region...]
+    result = zeros(length(rho))
+    result[vec(ops.cartesian_order)] .= dV .* vec(potential)
+    result
+end
+
+function density(
+    problem,
+    orbitals::AbstractVector{<:AbstractVector{<:Number}},
+    accuracy,
+    rec;
+    renormalize = false,
+    label = "density",
+)
+    rho = zeros(length(problem.grid))
+    for (psi, occupation) in zip(orbitals, problem.occupations)
+        @. rho += occupation * abs2(psi)
+    end
+    rho ./= volume_element(problem.grid)
+    if renormalize
+        charge = volume_element(problem.grid) * sum(rho)
+        charge > 0 || error("Nonpositive density integral")
+        rho .*= sum(problem.occupations) / charge
+    end
+    rho
+end
+
+function effective_hamiltonian(
+    problem,
+    rho,
+    ops::DenseOperators,
+    accuracy,
+    rec;
+    fit_potential = true,
+    time = 0.0,
+    drive = NoDrive(),
+)
+    drive isa NoDrive || throw(ArgumentError("Dense orbitals currently support SCF only"))
+    potential = ops.external + dense_hartree(rho, problem, ops)
+    ops.xc_table === nothing || (potential .+= map(r -> Q.xc(ops.xc_table, r)[2], rho))
+    DenseHamiltonian(ops.kinetic, potential)
+end
+
+green_operator(problem, accuracy, scf, physics, ops::DenseOperators) =
+    cholesky(Hermitian(ops.kinetic + scf.green_shift * I))
+
+function density_preconditioner(problem, ops::DenseOperators, accuracy, scf, rec)
+    iszero(scf.dielectric_susceptibility) && return nothing
+    problem.grid isa PeriodicGrid1D && problem.model isa SoftCoulombLSDA1D ||
+        throw(ArgumentError("Dielectric density preconditioning requires periodic 1D soft Coulomb"))
+    denominator =
+        1 .+ scf.dielectric_susceptibility * volume_element(problem.grid) .* real.(ops.interaction)
+    minimum(denominator) > 0 || error("Nonpositive dielectric eigenvalue")
+    residual -> begin
+        rhs = residual .- sum(residual) / length(residual)
+        transformed = fft(rhs) ./ denominator
+        transformed[1] = 0
+        real.(ifft(transformed))
+    end
+end
+
+function total_energy(
+    problem,
+    orbitals,
+    rho,
+    ops::DenseOperators,
+    accuracy,
+    rec;
+    time = 0.0,
+    drive = NoDrive(),
+)
+    drive isa NoDrive || throw(ArgumentError("Dense orbitals currently support SCF only"))
+    dV = volume_element(problem.grid)
+    kinetic = sum(
+        occupation * real(dot(psi, ops.kinetic, psi)) for
+        (psi, occupation) in zip(orbitals, problem.occupations)
+    )
+    external = dV * dot(rho, ops.external)
+    hartree = dV / 2 * dot(rho, dense_hartree(rho, problem, ops))
+    xc = ops.xc_table === nothing ? 0.0 : dV * sum(r -> Q.xc(ops.xc_table, r)[1], rho)
+    nuclear = ops.nuclear
+    (;
+        total = kinetic + external + hartree + xc + nuclear,
+        kinetic,
+        external,
+        hartree,
+        xc,
+        nuclear,
+        drive = 0.0,
+    )
+end
+
+Q.potential_samples(H::DenseHamiltonian, rec) = H.potential
+Q.h_action(H::DenseHamiltonian, psi, cfg, rec; kwargs...) = H.kinetic * psi + H.potential .* psi
+Q.h_residual(H::DenseHamiltonian, psi, energy, cfg, rec; kwargs...) =
+    H.kinetic * psi + (H.potential .- energy) .* psi
+Q.h_expectation(H::DenseHamiltonian, psi) = real(dot(psi, H.kinetic * psi + H.potential .* psi))
+Q.h_residual_norm(H::DenseHamiltonian, psi, energy, cfg, rec; kwargs...) =
+    norm(Q.h_residual(H, psi, energy, cfg, rec))
+Q.h_project(::Nothing, psi, H::DenseHamiltonian; kwargs...) = Q.h_action(H, psi, nothing, nothing)
+Q.h_project_tangent(::Nothing, psi, H::DenseHamiltonian) = Q.h_action(H, psi, nothing, nothing)
+function Q.h_gram(orbitals, H::DenseHamiltonian; cfg = (;))
+    X = reduce(hcat, orbitals)
+    projected = X' * (H.kinetic * X + H.potential .* X)
+    (projected + projected') / 2
+end
+Q.ritz_projection(orbitals, H::DenseHamiltonian, cfg, rec; kwargs...) = Q.h_gram(orbitals, H)
+Q.green_rhs(H::DenseHamiltonian, psi, energy, cfg, rec; kwargs...) =
+    (cfg.green_shift + energy .- H.potential) .* psi
+function Q.block_green(orbitals, energies, H::DenseHamiltonian, green, cfg, rec; kwargs...)
+    rhs = (cfg.green_shift .+ transpose(energies) .- H.potential) .* reduce(hcat, orbitals)
+    updated = green \ rhs
+    updated ./= sqrt.(sum(abs2, updated; dims = 1))
+    collect.(eachcol(updated))
+end
+
 # Model-specific interactions supply the shared SCF and propagation workflows.
 kernel_value(model::SoftCoulombLSDA1D, x, L) =
     model.coupling * Q.periodic_soft_coulomb(x / model.softening, L / model.softening) /
@@ -98,6 +321,15 @@ end
 
 green_operator(p, a, s, physics, ops) =
     Q.green_mpo(p.grid.R, spacing(p.grid) * sqrt(p.mass), s.green_shift)
+
+"Build the density update from the same discrete Hartree operator as the Hamiltonian."
+function density_preconditioner(problem, ops, accuracy, scf, rec)
+    iszero(scf.dielectric_susceptibility) && return nothing
+    problem.grid isa PeriodicGrid1D && problem.model isa SoftCoulombLSDA1D ||
+        throw(ArgumentError("Dielectric density preconditioning requires periodic 1D soft Coulomb"))
+    cfg = solver_config(problem, accuracy, scf)
+    residual -> Q.dielectric_update(residual, ops.interaction, cfg, rec)
+end
 
 # Cores store sqrt(dV)*psi, so divide by the volume element to recover density.
 function density(problem, orbitals, accuracy, rec; renormalize = false, label = "density")
@@ -559,7 +791,7 @@ Q.potential_samples(H::CartesianHamiltonian, rec) = H.samples
 function effective_hamiltonian(
     problem::Problem{<:AbstractModel3D},
     rho,
-    ops,
+    ops::CartesianOperators,
     accuracy,
     rec;
     fit_potential = true,
@@ -611,7 +843,7 @@ function Q.h_core_fallback(H::CartesianHamiltonian, psi, energy; tol, cap, rec =
         cap,
     )
 end
-function Q.hamiltonian_samples(H::CartesianHamiltonian, ev, v, R; energy = 0.0)
+function hamiltonian_samples(H::CartesianHamiltonian, ev, v, R; energy = 0.0)
     n, h = grid_shape(H.grid), spacing(H.grid)
     fn =
         j -> begin
@@ -644,7 +876,7 @@ function Q.h_residual(
 )
     Q.validate_truncation(tol, cap)
     isfinite(energy) || throw(ArgumentError("Nonfinite orbital energy"))
-    fn = Q.hamiltonian_samples(
+    fn = hamiltonian_samples(
         H,
         Q.evaluate(psi, rec),
         potential === nothing ? H.samples : potential,
@@ -683,25 +915,25 @@ function Q.h_gram(orbitals, H::CartesianHamiltonian; cfg = (;))
     Q.with_sampling_seed(0) do
         bras, kets, operators = Q.mpo_basis(orbitals, (Q.potential_mpo(H), H.plus..., H.minus...))
         potential, plus, minus = operators[1], operators[2:4], operators[5:7]
-        overlaps = Q.gram(orbitals; cfg)
         # Build gradients only when direct FD2 contractions lose significant digits.
         gradients = Dict{Tuple{Int,Int},Q.QTT}()
         gradient(i, a) =
             get!(gradients, (i, a)) do
                 Q.shift_difference(H.plus[a], orbitals[i])
             end
-        faces = ntuple(
-            a -> axis_mpo(
-                Q.diagonal(Q.delta_tt(axis_bits(H.grid)[a], grid_shape(H.grid)[a] - 1)),
-                a,
-                grid_axes(H.grid),
-            ),
-            3,
-        )
+        faces = Dict{Int,Vector{Array{ComplexF64,4}}}()
+        face(a) =
+            get!(faces, a) do
+                axis_mpo(
+                    Q.diagonal(Q.delta_tt(axis_bits(H.grid)[a], grid_shape(H.grid)[a] - 1)),
+                    a,
+                    grid_axes(H.grid),
+                )
+            end
         out = zeros(ComplexF64, length(orbitals), length(orbitals))
         for j in eachindex(orbitals), i = 1:j
             value = Q.ITensorMPS.inner(bras[i], potential, kets[j]; make_inds_match = false)
-            overlap = overlaps[i, j]
+            overlap = Q.ITensorMPS.inner(kets[i], kets[j]; make_inds_match = false)
             for a = 1:3
                 terms = (
                     overlap,
@@ -715,7 +947,7 @@ function Q.h_gram(orbitals, H::CartesianHamiltonian; cfg = (;))
                     numerator =
                         (
                             Q.inner(gradient(i, a), gradient(j, a)) +
-                            Q.inner_mpo(orbitals[i], faces[a], orbitals[j])
+                            Q.inner_mpo(orbitals[i], face(a), orbitals[j])
                         ) / 2
                 end
                 value += numerator / (H.mass * spacing(H.grid)[a]^2)
@@ -736,15 +968,29 @@ struct CartesianGreen
     max_iterations::Int
     cap::Int
 end
-function green_operator(p::Problem{<:AbstractModel3D}, a, s, physics, ops)
-    zero = Q.constant_tt(nsites(p.grid), 0)
-    h = CartesianHamiltonian(zero, Q.diagonal(zero), ops.plus, ops.minus, p.grid, p.mass, nothing)
+function green_operator(
+    problem::Problem{<:AbstractModel3D},
+    accuracy,
+    scf,
+    physics,
+    ops::CartesianOperators,
+)
+    zero = Q.constant_tt(nsites(problem.grid), 0)
+    H = CartesianHamiltonian(
+        zero,
+        Q.diagonal(zero),
+        ops.plus,
+        ops.minus,
+        problem.grid,
+        problem.mass,
+        nothing,
+    )
     CartesianGreen(
-        h,
-        s.green_shift,
+        H,
+        scf.green_shift,
         physics.green_relative_tolerance,
         physics.green_max_iterations,
-        a.work_cap,
+        accuracy.work_cap,
     )
 end
 
@@ -830,7 +1076,7 @@ function total_energy(
     problem::Problem{<:AbstractModel3D},
     orbitals,
     rho,
-    ops,
+    ops::CartesianOperators,
     accuracy,
     rec;
     time = 0.0,

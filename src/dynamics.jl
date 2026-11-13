@@ -11,11 +11,11 @@ function potential_half_step(problem, orbitals, ops, accuracy, rec, t, drive, op
     potential = local_potential_samples(problem, rho, ops, accuracy, rec; time = t, drive)
     potential = Q.synchronized(potential)
     Q.recorded_map(Q.QTT, length(orbitals), options, rec) do i, localrec
-        e = Q.evaluate(orbitals[i], localrec)
+        evaluator = Q.evaluate(orbitals[i], localrec)
         Q.cross(
             localrec,
             problem.grid.R,
-            j -> cis(-options.dt * real(potential(j)) / 2) * e(j);
+            j -> cis(-options.dt * real(potential(j)) / 2) * evaluator(j);
             tol = options.phase_tolerance,
             cap = options.phase_cap,
             label = "potential_phase_$i",
@@ -49,6 +49,7 @@ function propagate(
 )
     initial.problem.grid isa BoxGrid3D &&
         throw(ArgumentError("3D real-time propagation is not implemented; use ground_state"))
+    representation(initial) == :qtt || throw(ArgumentError("Propagation requires QTT orbitals"))
     validate(time)
     validate(drive)
     validate(accuracy)
@@ -69,7 +70,7 @@ function propagate(
         observations = Any[]
         S0 = Q.gram(initial.orbitals; cfg = time)
         norm0 = real.(diag(S0))
-        row = observe_state(state, ops, accuracy, rec; drive)
+        row = observe_state(state, ops, accuracy, rec; drive, overlap = S0)
         push!(observations, merge((step = 0,), row))
         Q.event!(io, last(observations))
         dir === nothing || save_checkpoint(joinpath(dir, "snapshots", "step-000000.jls"), state)
@@ -92,7 +93,7 @@ function propagate(
             if k % time.observe_every == 0 || k == time.steps
                 row = merge(
                     (step = k, norm_drift = nd, gram_drift = gd),
-                    observe_state(state, ops, accuracy, rec; drive),
+                    observe_state(state, ops, accuracy, rec; drive, overlap = S),
                 )
                 push!(observations, row)
                 Q.event!(io, row)

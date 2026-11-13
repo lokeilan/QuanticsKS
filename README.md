@@ -25,13 +25,20 @@ constructing orbitals. `solve` requires a new output directory.
 | [propagation.toml](inputs/propagation.toml) | Short 1D evolution in a cosine potential |
 
 These examples demonstrate the workflow. Physical accuracy requires grid, box,
-rank, and tolerance convergence. SCF stopping and the final physical audit are
-reported separately.
+rank, and tolerance convergence. A saved SCF state is accepted only when its independent physical checks pass.
 
-The [periodic 1D H100 input](inputs/h100-r16.toml) records the recommended
-fixed tolerance profile for 50 occupied orbitals, with orbital, work and Green
-right-hand-side caps of 64. Energy stopping and the subsequent residual audit
-have separate meanings; see the
+The [periodic 1D H100 input](inputs/h100-r16.toml) defines the current baseline
+at R16; change `[grid].R` for another resolution. It uses 50 occupied orbitals
+and six auxiliary empty states, with orbital, algebra, orthogonalization and
+storage tolerances of `1e-12`, and orbital, work and Green right-hand-side caps
+of 64. The inner solve follows
+the preceding occupied space within numerically unresolved boundary clusters.
+The density update uses a constant-susceptibility dielectric inverse before
+Anderson mixing. Acceptance requires a relative density residual of `1e-6`,
+an orbital residual below `3e-4 Ha` including its action-error budget, and
+consistent Gram, charge, and independently recomputed energy. The general
+`scf.extra_orbitals` default remains zero. An occupied-space Rayleigh–Ritz
+rotation produces the saved orbitals. See the
 [configuration guide](docs/configuration.md#periodic-1d-h100-profile).
 
 ## Use from Julia
@@ -41,6 +48,7 @@ using QuanticsKS
 
 problem = hydrogen_chain(R=6, natoms=4)
 result = ground_state(problem; output="results/h4-library")
+println("Accepted: ", result.accepted)
 state = load_checkpoint("results/h4-library/checkpoint.jls")
 observables = observe(state)
 postprocess("results/h4-library")
@@ -51,23 +59,26 @@ directory. `fixed_spectrum`, `propagate`, and `refine_state` use the same proble
 and orbital-state types.
 
 Select an orbital solver with `ground_state(problem; solver=:block_davidson)`.
-The choices are `:lrrap` (default), `:lanczos`, `:block_lanczos`, `:davidson`, and
-`:block_davidson`. The subspace methods are also available as
-`fixed_spectrum(state, potential; solver=:lanczos, spectrum=options)`.
-`block_lanczos` explicitly selects KrylovKit's block three-term recurrence,
-including for a single orbital. `lanczos` selects the scalar recurrence for one
-orbital and the block recurrence for several orbitals. Both use
-reorthogonalization and explicit restart from the retained Ritz orbitals.
-The Davidson choices use generalized Davidson with a shifted kinetic-inverse
-preconditioner and share KrylovKit's direction orthogonalization.
+The choices are `:lrrap` (default), `:block_lanczos`, and `:block_davidson`.
+The subspace methods are also available as
+`fixed_spectrum(state, potential; solver=:block_lanczos, spectrum=options)`.
+Block Lanczos uses KrylovKit's block three-term recurrence, including for a
+single orbital, with reorthogonalization and explicit restart from the retained
+Ritz orbitals. Block generalized Davidson uses a shifted kinetic-inverse
+preconditioner and KrylovKit's direction orthogonalization.
 
-For a fixed Hermitian Hamiltonian, `block_lobpcg(H, X; tolerance=1e-6)`
-uses LOBPCGEigensolver.jl's standard block iteration. `X` can be a dense orbital
-matrix or an `OrbitalState` with QTT orbitals. The optional
-`preconditioner=apply_inverse` callback acts on a whole residual block;
-omitting it uses the identity. Dense `H` can also be a block-action callback.
-The returned `converged` flag requires freshly evaluated orbital residuals and
-the stored-state Gram tolerance. This fixed-H interface does not run SCF.
+LRRAP also supports full-grid dense orbitals:
+
+```julia
+result = ground_state(problem; representation=:dense, solver=:lrrap)
+```
+
+Dense and QTT LRRAP share the SCF loop, constrained coefficient solve, Green
+updates, occupation selection, and final physical audit. Dense directions use
+the full grid space; QTT directions use the current TT tangent space. The
+dense path uses SparseArrays, FFTW, and LinearAlgebra without TCI fits. Set
+`representation = "dense"` in `[run]` to select it from TOML. Dense support is
+limited to LRRAP ground-state SCF in 1D and 3D.
 
 ## Documentation
 

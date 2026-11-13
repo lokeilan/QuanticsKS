@@ -1,4 +1,4 @@
-# Periodic 1D H100: fixed recommended tolerances; energy stopping, then residual audit.
+# Periodic 1D H100 baseline: tight orbital output and dielectric density mixing.
 # Use Julia --threads=4,1 and one BLAS thread.
 [run]
 kind = "scf"
@@ -15,16 +15,16 @@ distance = 4.0
 
 [accuracy]
 adaptive = false
-field_tolerance = 5e-07
-orbital_tolerance = 1e-10
-orthogonalization_tolerance = 1e-10
-storage_tolerance = 1e-10
+field_tolerance = 5e-09
+orbital_tolerance = 1e-12
+orthogonalization_tolerance = 1e-12
+storage_tolerance = 1e-12
 storage_compression_attempts = 1
-work_tolerance = 0.0001
-algebra_tolerance = 1e-10
-kinetic_action_tolerance = 3e-06
-green_rhs_tolerance = 1e-06
-mixing_tolerance = 1e-06
+work_tolerance = 1e-06
+algebra_tolerance = 1e-12
+kinetic_action_tolerance = 3e-08
+green_rhs_tolerance = 1e-08
+mixing_tolerance = 1e-08
 density_tolerance = 5e-09
 xc_energy_tolerance = 5e-08
 external_tolerance = 1e-08
@@ -41,16 +41,19 @@ density_cap = 72
 xc_energy_cap = 72
 
 [scf]
+extra_orbitals = 6
 parallel_tasks = 4
-criterion = "energy"
 energy_tolerance = 5e-06
 max_iterations = 60
-mixing = 0.3
+mixing = 0.7
 adaptive_mixing = true
+dielectric_susceptibility = 2.0
+dielectric_tolerance = 1e-4
+dielectric_max_iterations = 40
 eigen_tolerance = 0.0005
 orbital_residual_tolerance = 0.0003
-density_tolerance = 0.0003
-metric_relative_cutoff = 0.0001
+density_tolerance = 1e-6
+metric_relative_cutoff = 1e-08
 seed = 20261030
 green_update_interval = 1
 inner_steps = 1

@@ -2,14 +2,14 @@
 
 module QuanticsKS
 
-using LinearAlgebra, Random, Serialization, JSON3, Dates, Printf, SHA, TOML
+using LinearAlgebra, Random, Serialization, JSON3, Dates, Printf, TOML
+using SparseArrays, FFTW
 
 module Numerics
-using LinearAlgebra, Random, Serialization, TensorOperations
+using LinearAlgebra, Random, Serialization, Dates, JSON3, TensorOperations
 import TensorCrossInterpolation as TCI
 import ITensors, ITensorMPS
 import KrylovKit
-import LOBPCGEigensolver
 import VectorInterface as VI
 
 include("tensor.jl")
@@ -18,7 +18,6 @@ include("physics.jl")
 include("solvers.jl")
 end
 const Q = Numerics
-using .Numerics: block_lobpcg
 
 include("models.jl")
 include("states.jl")
@@ -38,7 +37,6 @@ export save_checkpoint, load_checkpoint, postprocess, run_config
 export configuration_plan
 export NoDrive, CosinePulse, FunctionDrive
 export FixedSpectrumOptions, FixedSpectrumResult, fixed_spectrum
-export block_lobpcg
 export BoxGrid3D, AllElectronLDA3D, LocalPotential3D
 export grid_index, grid_indices, grid_position, nsites, volume_element
 
