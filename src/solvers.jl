@@ -859,16 +859,35 @@ function green_rhs(H, psi, energy, cfg, rec; potential, label)
         );
         tol = cfg.green_rhs_tolerance,
         cap = get(cfg, :green_rhs_cap, cfg.work_cap),
+        scalar_cache_capacity = H isa Hamiltonian ?
+                                rec.options.green_rhs_cache_capacity : rec.options.scalar_cache_capacity,
         label,
     )
 end
 
+green_potential_samples(H, field) = synchronized(field)
+green_potential_samples(::Hamiltonian, field) = synchronized(without_scalar_cache(field))
+
+"Use the existing fitted local potential for a complete 1D Green update."
+function fitted_green_rhs(H::Hamiltonian, psi, energy, cfg, rec)
+    field = add(
+        constant_tt(cfg.R, cfg.green_shift + energy), H.potential;
+        b = -1, tol = min(cfg.algebra_tolerance, cfg.green_rhs_tolerance) / 100,
+        cap = rank(H.potential) + 1,
+    )
+    apply_mpo(diagonal(field), psi; tol = cfg.green_rhs_tolerance,
+              cap = get(cfg, :green_rhs_cap, cfg.work_cap), algorithm = :fit, rec)
+end
+
 function block_green(orbitals, energies, H, green, cfg, rec; potential = nothing)
+    fitted_source = H isa Hamiltonian && H.potential !== nothing &&
+                    (potential === nothing || potential === H.samples)
     potential_samples_shared =
-        synchronized(potential === nothing ? potential_samples(H, rec) : potential)
+        fitted_source ? nothing :
+        green_potential_samples(H, potential === nothing ? potential_samples(H, rec) : potential)
     recorded_map(QTT, length(orbitals), cfg, rec) do i, localrec
         rhs = timed(localrec, "green_rhs"; item = string(i)) do
-            green_rhs(
+            fitted_source ? fitted_green_rhs(H, orbitals[i], energies[i], cfg, localrec) : green_rhs(
                 H,
                 orbitals[i],
                 energies[i],
@@ -981,7 +1000,7 @@ function lrrap_step(orbitals, previous, H, green, cfg, rec; work_tol = 0.0, pote
         dx = independent_columns(i -> project(tangent_basis, orbitals[i]), rows, b, cfg)
         # G*(H-epsilon)*psi = psi - G*(mu+epsilon-V)*psi.
         # Fit the smooth source before applying G, avoiding a noisy FD2 intermediate.
-        shared_field = synchronized(field)
+        shared_field = green_potential_samples(H, field)
         dz = Matrix{ComplexF64}(undef, rows, b)
         recorded_map(Nothing, b, cfg, rec) do i, localrec
             rhs = green_rhs(

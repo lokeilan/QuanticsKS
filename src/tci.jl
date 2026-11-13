@@ -322,11 +322,11 @@ mutable struct RecordedSamples{F} <: SampledFunction
     computed_batches::Int
     batch_evaluations::Int
 end
-function RecordedSamples(f::SampledFunction, options)
+function RecordedSamples(f::SampledFunction, options; capacity = options.scalar_cache_capacity)
     R = sample_length(f)
     cache = SampleCache{ComplexF64}(
         R;
-        capacity = options.scalar_cache_capacity,
+        capacity,
         dense_limit = get(options, :dense_cache_max_points, 1 << 18),
     )
     RecordedSamples(f, cache, R, 0, 0, 0, 0, 0)
@@ -551,6 +551,13 @@ synchronized(f::SampledFunction) = SynchronizedSamples(f, ReentrantLock())
 synchronized(values::AbstractVector{<:Number}) = values
 synchronized(f::BlockEvaluator) = SynchronizedBlockEvaluator(f, ReentrantLock())
 synchronized(f::Union{SynchronizedSamples,SynchronizedBlockEvaluator}) = f
+
+"Keep contraction environments while removing nested scalar caches from a Green source."
+without_scalar_cache(f) = f
+without_scalar_cache(f::RecordedSamples) = without_scalar_cache(f.input)
+without_scalar_cache(f::PointwiseSamples) =
+    pointwise(f.f, map(without_scalar_cache, f.arguments)...)
+without_scalar_cache(f::SynchronizedSamples) = synchronized(without_scalar_cache(f.input))
 sample_length(f::Union{SynchronizedSamples,SynchronizedBlockEvaluator}) = sample_length(f.input)
 uses_batch_contraction(f::SynchronizedSamples) = uses_batch_contraction(f.input)
 uses_scalar_evaluation(f::Union{SynchronizedSamples,SynchronizedBlockEvaluator}) =
@@ -927,6 +934,7 @@ function cross(
     pivots = Int[],
     shared_pivots = "",
     initial_zero_fallback = nothing,
+    scalar_cache_capacity = rec.options.scalar_cache_capacity,
     require_convergence = rec.options.require_convergence,
     rounding_tolerance = iszero(rec.options.post_rounding_factor) ? nothing :
                          tol * rec.options.post_rounding_factor,
@@ -934,7 +942,7 @@ function cross(
     validate_truncation(tol, cap)
     rounding_tolerance === nothing || validate_truncation(rounding_tolerance, cap)
     1 <= R <= 60 || throw(ArgumentError("Binary grid must have 1:60 sites"))
-    evaluator = RecordedSamples(sampled(fn, R), rec.options)
+    evaluator = RecordedSamples(sampled(fn, R), rec.options; capacity = scalar_cache_capacity)
     key = (String(label), Int(R))
     shared_key = (String(shared_pivots), Int(R))
     saved =

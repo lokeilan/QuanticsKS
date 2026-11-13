@@ -8,6 +8,7 @@ function validate(t::TCIOptions)
         t.max_iterations,
         t.check_history,
         t.scalar_cache_capacity,
+        t.green_rhs_cache_capacity,
         t.orbital_cache_capacity,
         t.slice_cache_capacity,
         t.pivot_cache_capacity,

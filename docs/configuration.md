@@ -1,5 +1,13 @@
 # Configuration
 
+`[tci].green_rhs_cache_capacity` defaults to `262144` scalar entries for the
+outer source fit of periodic 1D Green directions. It is separate from
+`scalar_cache_capacity`, which still controls other scalar caches. Tensor
+environment byte budgets remain unchanged. Complete 1D Green updates use two
+ITensorMPS fit sweeps on an existing fitted potential; they retain
+`accuracy.green_rhs_tolerance` and `accuracy.green_rhs_cap` for the source and
+the existing orbital/algebra controls for the subsequent Green action.
+
 Inputs are TOML files. Unknown sections and options raise an error. Start from
 [h4.toml](../inputs/h4.toml), [helium.toml](../inputs/helium.toml), or
 [propagation.toml](../inputs/propagation.toml).

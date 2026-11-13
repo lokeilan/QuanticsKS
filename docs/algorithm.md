@@ -1,7 +1,21 @@
 # Algorithm
 
-All calculations use atomic units. Orbitals and fields are represented as QTTs;
-the solver does not assemble a dense spatial Hamiltonian.
+For periodic 1D QTT Green directions, the original frozen local potential is
+evaluated with one scalar cache around each source and shared tensor-contraction
+environments. Nested scalar field caches are bypassed only for this consumer.
+Independent residuals continue to use the original potential expression.
+
+Complete 1D Green updates reuse an already fitted local potential when available:
+the shifted diagonal field acts on each orbital through two two-site ITensorMPS
+fit sweeps, without normalization inside the source action. The Green inverse
+still uses the existing zipup action and final normalization. A deferred potential
+or an explicitly different sampled field retains the evaluate/TCI source path.
+The source tolerance and cap, final Green-action controls, and physical acceptance
+criteria remain independent. Dense and 3D dispatches retain their existing paths.
+
+All calculations use atomic units. The QTT route represents orbitals and fields
+as tensor trains without assembling a dense spatial Hamiltonian. The dense
+LRRAP route uses full-grid vectors in the shared SCF workflow.
 
 ## Grid and orbital normalization
 

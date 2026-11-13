@@ -340,6 +340,7 @@ Base.@kwdef struct TCIOptions
     # Zero keeps the prrLU result; a positive value explicitly requests SVD rounding.
     post_rounding_factor::Float64 = 0.0
     scalar_cache_capacity::Int = 16384
+    green_rhs_cache_capacity::Int = 262144
     dense_cache_max_points::Int = 262144
     orbital_cache_capacity::Int = 8192
     orbital_cache_max_bytes::Int = 128 * 1024^2

@@ -628,7 +628,7 @@ function apply_mpo(w, x::QTT; tol = 1e-11, cap = 64, algorithm = :zipup, rec = n
         )
         return QTT(product.sitetensors)
     end
-    algorithm in (:zipup, :naive) || throw(ArgumentError("Unknown MPO algorithm: $algorithm"))
+    algorithm in (:zipup, :naive, :fit) || throw(ArgumentError("Unknown MPO algorithm: $algorithm"))
     result = with_sampling_seed(0) do
         psi = ITensorMPS.MPS(tensortrain(x))
         sites = ITensorMPS.siteinds(psi)
@@ -639,6 +639,11 @@ function apply_mpo(w, x::QTT; tol = 1e-11, cap = 64, algorithm = :zipup, rec = n
             ITensorMPS.apply(operator, psi; alg = "naive", truncate = false)
         elseif algorithm === :naive
             ITensorMPS.apply(operator, psi; alg = "naive", cutoff = tol^2, maxdim = cap)
+        elseif algorithm === :fit
+            ITensorMPS.apply(
+                operator, psi; alg = "fit", nsweeps = 2, nsite = 2,
+                normalize = false, cutoff = tol^2, maxdim = cap, outputlevel = 0,
+            )
         else
             # ITensor cutoffs bound discarded squared weight, not amplitude error.
             # zip-up canonicalizes both operands and owns the final truncation.
