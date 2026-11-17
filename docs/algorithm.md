@@ -26,15 +26,17 @@ the negative charge. Energy with a nuclear constant is
 `<A|H_e|A>+E_NN*norm(A)^2`, retaining the raw norm.
 
 Dense and QTT explicit-grid propagation share VTV/TVT Strang composition.
-Kinetic `pade4` is the `[2/2]` rational exponential, factored into sparse
-solves. Cayley uses one such factor. The native QTT resolvent constructs
+The complete symmetric split update is called a **Trotter step (Strang
+splitting)**. Cayley and Padé name approximations to its kinetic exponential,
+not the complete update. Kinetic `pade4` is the `[2/2]` rational exponential,
+factored into sparse solves. Cayley uses one such factor. The native QTT resolvent constructs
 `B^-1=C^-1-C^-1*P*(I+delta*G)^-1*delta*P'*C^-1`, where `B=I+sigma*T`,
 `C` is its periodic binary-grid counterpart, `P` selects boundary sites,
 `delta` is the boundary correction and `G=P'*C^-1*P`. The periodic inverse
 comes from its Fourier kernel; periodic FD2 reuses the analytic Green MPO
 when its shift is admissible. Otherwise, already sampled one-dimensional
 kernels and boundary vectors use library MPS factorization. The circulant
-automaton preserves translation structure, and explicit outer-product MPOs
+MPO construction preserves translation structure, and explicit outer-product MPOs
 represent the boundary correction; `TCI.add` combines these with SVD truncation.
 A failed operator sum is retried from its original cores using ITensorMPS
 direct-sum addition and SVD truncation, with the failure and recovery recorded.
@@ -65,6 +67,84 @@ Autonomous Yoshida composition uses three signed Strang substeps and rejects
 time-dependent drives or absorption. CAP damping surrounds each source step;
 no propagated state is renormalized. State and density errors remain necessary
 in addition to norm and Gram diagnostics.
+
+### Trotter step and kinetic approximations
+
+In atomic units, the fixed-field VTV step is
+
+```math
+\psi(t+\Delta t)\approx
+e^{-iV\Delta t/2}e^{-iT\Delta t}e^{-iV\Delta t/2}\psi(t).
+```
+
+Here `T` is the discrete kinetic operator, `V` is the local potential operator,
+and `Delta t` is the physical time step. This symmetric composition has local
+error of order three and global error of order two for smooth evolution on a
+fixed grid with sufficiently accurate subflows. The input density determines
+each potential substep: multiplication by a real local phase preserves its
+pointwise probability, whereas the kinetic substep changes the density.
+Rebuild the second potential from that changed state. Evaluate an explicit
+drive at the physical step midpoint. TVT exchanges the roles of the subflows.
+See [Strang][strang] and the [splitting-methods review][splitting-review].
+
+Implicit midpoint applied to kinetic-only evolution gives the Cayley transform,
+also the diagonal Padé `[1/1]` approximation:
+
+```math
+\frac{\psi'-\psi}{\Delta t}=-iT\frac{\psi'+\psi}{2},\qquad
+\psi'=(I+i\Delta tT/2)^{-1}(I-i\Delta tT/2)\psi.
+```
+
+The prime marks the updated state and `I` is the identity. On a kinetic
+eigenmode with energy `epsilon`, this replaces the exact phase `Delta t*epsilon`
+by `2*atan(Delta t*epsilon/2)`. For Hermitian `T` and exact solves, it preserves
+norm while retaining a phase error. Thus norm conservation is not an accuracy
+test by itself. The kinetic approximation is second order.
+
+The diagonal Padé `[2/2]` approximation matches the exponential through degree
+four. With `z=Delta t*T`, its polynomial form and implemented factorization are
+
+```math
+R_{22}(-iz)=(I-iz/2-z^2/12)(I+iz/2-z^2/12)^{-1}
+=\prod_{s=\pm}(I-\sigma_sT)(I+\sigma_sT)^{-1},\qquad
+\sigma_\pm=i\Delta t\left(\frac14\pm\frac{i}{4\sqrt3}\right).
+```
+
+Each factor applies `y=(I+sigma*T)^(-1)*psi`, then reconstructs `2*y-psi`.
+The pair is norm preserving for Hermitian `T` in exact arithmetic; the
+individual complex factors need not be. Its kinetic local error is order
+five. Using it inside VTV does not raise the full Trotter step above global
+order two. These rational approximations use the standard [Padé definition
+for the matrix exponential][pade-exponential].
+
+The periodic `fft` route exponentiates the eigenvalues of the chosen discrete
+kinetic operator, not a different continuum dispersion. QTT kernel fitting
+adds its own error. Yoshida composition combines three signed copies of the
+complete symmetric second-order step and cancels its third-order local error.
+This includes a symmetric VTV step with Cayley kinetics when inverse actions
+are exact; QTT errors must be small enough to resolve the fourth-order time
+convergence. The current interface restricts Yoshida to autonomous evolution
+without absorption.
+
+### Dynamics convergence and observables
+
+Compare trajectories at the same final time, grid, initial state, Hamiltonian
+and drive. Run `dt`, `dt/2`, and `dt/4`; for second-order time error, successive
+state differences approach a ratio of four. Tighten QTT tolerances and raise
+bond-dimension limits separately at fixed `dt`. Then test spatial discretization,
+domain and boundary errors. Saturation in one refinement can come from another
+error source. These are convergence procedures, not an automatic SCF-style
+`accepted` verdict for a trajectory.
+
+The KS diagnostics use `S_ij(t)=psi_i(t)'*psi_j(t)`, the maximum change of its
+diagonal from the initial norms, and `norm(S(t)-S(0))` for Gram drift. Electron
+number is `sum_i occupations[i]*S_ii(t)`. The electronic dipole is the negative
+first spatial moment of the physical density. Correlated propagation instead
+uses the joint-state norm and the density from its two coordinate marginals.
+Compare state, density and observables independently of these drift checks.
+For an autonomous system without absorption, monitor energy conservation;
+a drive exchanges energy, and a complex absorbing potential removes probability.
+The propagated state is never renormalized to hide those changes.
 
 Correlated eigenstate preparation minimizes the Rayleigh quotient in a declared
 exchange-even inversion sector. The shared numerical solver uses the amplitude,
@@ -483,6 +563,13 @@ SCF iterations and dependent tensor sweeps remain sequential.
 
 ## Stopping and physical acceptance
 
+At the final accuracy budgets, consecutive energy change below
+`scf.energy_tolerance` together with the raw relative density residual at most
+`scf.density_tolerance` schedules a candidate check. An iteration limit or a
+requested stop also checks the actual returned state. Inner eigensolver,
+dielectric linear-solve, TCI sampling and SVD truncation tolerances control
+their own operations; they do not replace the saved-state conditions below.
+
 The canonical saved state has one `accepted` decision. It requires:
 
 - maximum normalized orbital residual plus the kinetic-action error budget below
@@ -493,6 +580,8 @@ The canonical saved state has one `accepted` decision. It requires:
 - independent total energy agreeing with the reported candidate energy within
   `scf.energy_tolerance`.
 
+All orbital residuals must be finite. Residual, Gram, charge and energy bounds
+are strict inequalities in the implementation; the density bound is inclusive.
 The audit reconstructs density and Hamiltonian with its own numerical budgets.
 One Gram calculation supplies both orbital norms and charge. Consecutive SCF
 energy change schedules candidate checks and records progress; it is not another
@@ -536,7 +625,7 @@ the implementation to its sources.
 |---|---|---|
 | Tensor train (TT), matrix product state (MPS), core or site tensor | A chain of tensors with contracted bond indices. `QTT.c` stores the cores; this stored field retains its name for checkpoint compatibility. | [TCI paper][tci-paper], [ITensorMPS][itensor] |
 | Quantics tensor train (QTT), binary site | Binary digits encode grid coordinates. `grid.R` is bits per axis; `nsites(grid)` counts all binary sites. | [Quantics TCI][qtt-paper] |
-| Bond dimension, TT rank | Size of an internal tensor index. `cap` limits that size; it is separate from an error tolerance. | [TCI paper][tci-paper], [ITensorMPS][itensor] |
+| Bond dimension, TT rank | Size of an internal tensor index. The report label **bonddim cutoff** means a maximum allowed bond dimension, separate from an error tolerance; code keeps its existing `*_cap` names. | [TCI paper][tci-paper], [ITensorMPS][itensor] |
 | Tensor cross interpolation (TCI), pivot index sets, prrLU | Adaptive entry sampling and partially rank-revealing LU. Cached pivot indices are reused, while function values are reevaluated. | [TCI paper][tci-paper] |
 | Function evaluation, batch evaluation, contraction environment | Values at selected indices and partial tensor contractions used to compute them. `BlockEvaluator` evaluates several trains; `tt_cache` is a library `TTCache`. | [TCI library][tci-library] |
 | Canonical form, orthogonality center, gauge condition | Tensor representation properties. Moving the orthogonality center is distinct from rank truncation. | [ITensorMPS][itensor], [TT geometry][tt-geometry] |
@@ -546,6 +635,20 @@ the implementation to its sources.
 | Rayleigh quotient, Ritz values/vectors, Krylov subspace, Davidson correction | Projected eigenproblems and trial-space expansion. Block Davidson uses kinetic-inverse preconditioned residuals and belongs to generalized Davidson. | [SLEPc eigensolver guide][eigensolvers], [generalized Davidson][davidson] |
 | Block Lanczos recurrence, reorthogonalization | Three-term block recurrence with a block tridiagonal Ritz matrix, including for one orbital. Explicit restart uses the retained Ritz orbitals. | [KrylovKit factorizations][lanczos] |
 | Rounding, compression, truncation | Approximation at a specified TT rank/tolerance. `compress_orbitals` also checks the Gram matrix after compression. | [TT arithmetic][tt-arithmetic] |
+| Trotter step (Strang splitting) | Complete symmetric VTV or TVT update; global order two with sufficiently accurate subflows. | [Strang][strang], [splitting review][splitting-review] |
+| Cayley transform; Padé `[1/1]` and `[2/2]` | Rational approximations to the kinetic exponential inside the split step. `pade4` is the code option for `[2/2]`. | [Matrix exponential][pade-exponential] |
+
+The tensor routes have separate responsibilities. TCI constructs a train by
+sampling a function. [`TCI.add`][tci-library] adds existing cores and recompresses
+the result without sampling that function again. ITensorMPS [`naive` and
+`zipup`][itensor-contraction] form an MPO action with different truncation
+placements: `naive` forms the complete core bond product first, whereas `zipup`
+contracts and truncates progressively. Standard [variational fitting][itensor-fit]
+approximates an MPO action through local sweeps. The measured Green-source
+optimization variant used this approach; `fit` is not a supported value in the
+current main-branch `apply_mpo` interface. Fitting minimizes representation
+error for a specified action; LRRAP instead optimizes orbital energy. These
+names do not imply interchangeable approximation errors or performance.
 
 `psi` denotes an orbital, `rho` a density, `H` the Hamiltonian, and `V` a
 potential when used in a physical expression. In the LRRAP coefficient problem,
@@ -561,8 +664,11 @@ gradient iterations][cg] with TT compression and a separately evaluated residual
 `FD2` means second-order central finite differences; displacement operators
 are named `shift_mpo`. These are spatial discretization choices, independent
 of QTT encoding. Density feedback uses regularized [Anderson mixing][anderson].
-Propagation uses [Strang splitting][strang] with a Cayley approximation to the kinetic
-exponential; the [reference GPE paper][gp-paper] motivates the QTT split-step
+The constrained residual-history combination follows the standard Anderson
+acceleration formulation used in electronic-structure mixing; see also
+[Walker and Ni][anderson-review].
+Propagation uses the Trotter/Strang composition and the selected kinetic
+approximation described above; the [reference GPE paper][gp-paper] motivates the QTT split-step
 organization, while this project's kinetic discretization is stated above.
 
 [davidson]: https://slepc.upv.es/release/manualpages/EPS/EPSGD.html
@@ -585,3 +691,8 @@ organization, while this project's kinetic discretization is stated above.
 [strang]: https://doi.org/10.1137/0705041
 [mom]: https://manual.q-chem.com/6.2/topic_mom.html
 [residual-bounds]: https://doi.org/10.1137/0612016
+[splitting-review]: https://arxiv.org/abs/2401.01722
+[pade-exponential]: https://doi.org/10.1137/090768539
+[itensor-contraction]: https://docs.itensor.org/ITensorMPS/stable/MPSandMPO.html
+[itensor-fit]: https://itensor.org/docs.cgi?page=classes/mps_mpo_algs&vers=cppv3
+[anderson-review]: https://doi.org/10.1137/10078356X

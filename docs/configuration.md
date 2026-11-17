@@ -37,6 +37,17 @@ CAP calculations retain physical norm loss. `exponential_tolerance` and
 `krylov_dimension` control the dense midpoint Hamiltonian exponential.
 `seed` and `parallel_tasks` control reconstruction scheduling.
 
+`method` selects the complete evolution composition; `kinetic_exponential`
+selects its kinetic substep. VTV/TVT are symmetric Trotter steps (Strang
+splitting), of global order two. `cayley` is the Padé `[1/1]` approximation
+with one shifted inverse. `pade4` is Padé `[2/2]` with two shifted inverses;
+its fourth-order kinetic accuracy does not change VTV/TVT splitting order.
+Periodic `fft` exponentiates the selected discrete kinetic operator before
+QTT fitting. Yoshida composes the complete symmetric second-order step,
+including its Cayley kinetic approximation, to obtain fourth-order time
+accuracy in exact arithmetic. QTT approximation errors can hide this order.
+See the derivation in the [algorithm guide](algorithm.md).
+
 QTT controls belong to `Accuracy`: `orbital_tolerance`, `orbital_cap`,
 `algebra_tolerance`, `work_cap`, and `field_tolerance` keep their existing
 meanings. `kinetic_propagator_tolerance=1e-13` and
@@ -47,6 +58,22 @@ with a checked L2 budget, and operator sums use `TCI.add` SVD truncation.
 The periodic FFT exponential uses a one-dimensional TCI kernel fit;
 it does not construct a full propagator matrix. KS feedback fields and
 explicit-grid orbital observations use physical-grid arrays.
+
+In presentation text, **bonddim cutoff** denotes the maximum bond dimension.
+The actual configuration keys remain `orbital_cap`, `work_cap`, and
+`kinetic_propagator_cap`; this label introduces no alias. Keep state storage,
+potential reconstruction and operator construction budgets separate. The
+ITensor SVD cutoff is a discarded squared-weight threshold: the code squares
+its amplitude tolerance before passing it to ITensor. TCI's sampled pivot
+error is a different quantity and does not certify global state error.
+
+For convergence, halve `dt` while keeping the same physical final time (increase
+`steps` accordingly) and compare at matching observation times. Refine the QTT
+tolerances and bonddim cutoffs at fixed `dt`, then the grid and domain. Drift
+limits monitor normalization and overlaps; passing them does not certify state,
+density or observable accuracy. There is no trajectory-level SCF `accepted`
+flag. A nonzero absorber changes the expected norm, so do not apply unitary
+norm-conservation reasoning to absorption.
 
 The Julia `absorber` argument supplies a nonnegative CAP vector. Two half
 damping operations surround each physical source timestep. Propagation keeps
@@ -395,6 +422,16 @@ The solver's `scf.gram_tolerance` controls inner orbital updates. Final Gram and
 charge thresholds belong to `audit.gram_tolerance` and `audit.charge_tolerance`.
 Compression tolerances, TCI pivot errors, and dielectric linear-solve tolerances
 are numerical controls owned by those operations, not additional physical gates.
+
+Keep the reported quantities distinct: the cycle-to-cycle energy change
+schedules a check; the SCF density residual is
+`norm(rho_out-rho_in)/norm(rho_out)`; the final energy agreement compares two
+evaluations of the same candidate. Dense-reference energy and density errors
+compare independently solved states and are separate diagnostics. The final
+residual includes the kinetic-action error budget and must be strictly below
+its threshold. Gram, charge and independent energy inequalities are also
+strict; the density inequality is inclusive. All occupied orbital residuals
+must be finite.
 
 Extra states use the same orbital rank and tolerance controls as occupied
 states. Custom `guess.wavevectors` must cover the full computed block. For a
